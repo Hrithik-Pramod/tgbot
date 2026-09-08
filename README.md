@@ -133,7 +133,7 @@ VALUES ('T...', TRUE, 1, 2, 'Supplier A / Client A');
 pytest -q
 ```
 
-128 tests, of which 17 run against a real PostgreSQL instance and 12 pin the
+220 tests, of which 32 run against a real PostgreSQL instance and 12 pin the
 live TronScan response contract.
 
 The pure-logic tests reproduce a representative settled trade — the six tranches
@@ -209,6 +209,9 @@ rounded parts is not the rounding of a sum.
 | Deal reference | `SUPA1` — continuous per supplier, never resets |
 | Duplicate UTR | Rejected, client told |
 | Tolerance | None — exact figures only; any difference is reported, never absorbed |
+| Payment entry | Free-form paste in any order; auto-recorded, acknowledged with a thumbs up |
+| Deposits | Notified on detection, confirmed separately; unconfirmed after 15 min is alarmed |
+| Near completion | Supplier told to prepare the next batch at ₹300,000 outstanding, once per trade |
 | Number format | Western grouping |
 | Identities | Labels only between counterparties |
 | KYC | Handled outside the bot |

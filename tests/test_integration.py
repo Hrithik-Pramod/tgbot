@@ -575,3 +575,101 @@ class TestNearCompletion:
             n = await conn.fetchval(
                 "SELECT count(*) FROM audit_log WHERE action = 'trade.near_completion'")
         assert n == 1
+
+
+class TestDepositConfirmation:
+    """
+    B4: "notify immediately on detection, then confirm separately." The second
+    half — without it a deposit sits at 'detected' forever and the Bridge has
+    no way to tell a settled transaction from one that never landed.
+    """
+
+    @pytest.mark.asyncio
+    async def test_detected_then_confirmed(self, world, repo):
+        await repo.record_deposit(
+            tx_hash="tx1", wallet_id=world["wallet"], amount_usdt=D("1000"),
+            from_address=None, block_number=None)
+
+        async with repo.pool.acquire() as conn:
+            row = await conn.fetchrow(
+                "SELECT status, confirmed_at FROM deposits WHERE tx_hash='tx1'")
+        assert row["status"] == "detected"
+        assert row["confirmed_at"] is None
+
+        assert await repo.confirm_deposit(
+            tx_hash="tx1", wallet_id=world["wallet"], block_number=99)
+
+        async with repo.pool.acquire() as conn:
+            row = await conn.fetchrow(
+                "SELECT status, confirmed_at, block_number FROM deposits "
+                "WHERE tx_hash='tx1'")
+        assert row["status"] == "confirmed"
+        assert row["confirmed_at"] is not None
+        assert row["block_number"] == 99
+
+    @pytest.mark.asyncio
+    async def test_confirming_twice_transitions_once(self, world, repo):
+        """The caller acts on the transition, so it must happen exactly once."""
+        await repo.record_deposit(
+            tx_hash="tx1", wallet_id=world["wallet"], amount_usdt=D("1000"),
+            from_address=None, block_number=None)
+        assert await repo.confirm_deposit(tx_hash="tx1", wallet_id=world["wallet"])
+        assert not await repo.confirm_deposit(tx_hash="tx1", wallet_id=world["wallet"])
+
+    @pytest.mark.asyncio
+    async def test_already_confirmed_on_arrival(self, world, repo):
+        """TronScan often reports a transaction already confirmed."""
+        await repo.record_deposit(
+            tx_hash="tx1", wallet_id=world["wallet"], amount_usdt=D("1000"),
+            from_address=None, block_number=None, confirmed=True)
+        async with repo.pool.acquire() as conn:
+            row = await conn.fetchrow(
+                "SELECT status, confirmed_at FROM deposits WHERE tx_hash='tx1'")
+        assert row["status"] == "confirmed"
+        assert row["confirmed_at"] is not None
+
+    @pytest.mark.asyncio
+    async def test_fresh_deposits_are_not_reported_as_stale(self, world, repo):
+        await repo.record_deposit(
+            tx_hash="tx1", wallet_id=world["wallet"], amount_usdt=D("1000"),
+            from_address=None, block_number=None)
+        assert await repo.unconfirmed_deposits(15) == []
+
+    @pytest.mark.asyncio
+    async def test_old_unconfirmed_deposit_is_reported(self, world, repo):
+        await repo.record_deposit(
+            tx_hash="tx1", wallet_id=world["wallet"], amount_usdt=D("1000"),
+            from_address=None, block_number=None)
+        async with repo.pool.acquire() as conn:
+            await conn.execute(
+                "UPDATE deposits SET detected_at = now() - interval '30 minutes'")
+
+        stale = await repo.unconfirmed_deposits(15)
+        assert len(stale) == 1
+        assert stale[0]["tx_hash"] == "tx1"
+        assert stale[0]["address"] == "TFLEpkCtXFSCYCvzqgtUENDaSUKcFUX2zb"
+
+    @pytest.mark.asyncio
+    async def test_confirmed_deposits_are_never_reported(self, world, repo):
+        await repo.record_deposit(
+            tx_hash="tx1", wallet_id=world["wallet"], amount_usdt=D("1000"),
+            from_address=None, block_number=None, confirmed=True)
+        async with repo.pool.acquire() as conn:
+            await conn.execute(
+                "UPDATE deposits SET detected_at = now() - interval '30 minutes'")
+        assert await repo.unconfirmed_deposits(15) == []
+
+    @pytest.mark.asyncio
+    async def test_the_bridge_is_warned_only_once(self, world, repo):
+        """Flagging moves it off 'detected' so the next cycle stays quiet."""
+        await repo.record_deposit(
+            tx_hash="tx1", wallet_id=world["wallet"], amount_usdt=D("1000"),
+            from_address=None, block_number=None)
+        async with repo.pool.acquire() as conn:
+            await conn.execute(
+                "UPDATE deposits SET detected_at = now() - interval '30 minutes'")
+
+        stale = await repo.unconfirmed_deposits(15)
+        assert await repo.flag_unconfirmed(stale[0]["id"])
+        assert not await repo.flag_unconfirmed(stale[0]["id"])
+        assert await repo.unconfirmed_deposits(15) == []

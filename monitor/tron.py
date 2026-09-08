@@ -48,6 +48,11 @@ OVERLAP_MS = 120_000  # two minutes
 # Back off after repeated failures rather than hammering a rate-limited API.
 MAX_BACKOFF_SECONDS = 300
 
+# A TRON transaction confirms in well under a minute. Anything still
+# unconfirmed after this is worth telling the Bridge about, because they may
+# already have acted on the detection notice.
+UNCONFIRMED_ALERT_MINUTES = 15
+
 
 def units_to_usdt(raw: Any) -> Decimal:
     """
@@ -129,6 +134,9 @@ class TronClient:
                 "amount": units_to_usdt(item.get("quant", 0)),
                 "timestamp_ms": int(item.get("block_ts") or item.get("block_timestamp") or 0),
                 "block": item.get("block"),
+                # B4: the client chose "notify on detection, confirm separately".
+                # This is what separates the two.
+                "confirmed": bool(item.get("confirmed")),
             })
         out.sort(key=lambda x: x["timestamp_ms"])
         return out
@@ -161,6 +169,11 @@ class TronClient:
                 "amount": units_to_usdt(item.get("value", 0)),
                 "timestamp_ms": int(item.get("block_timestamp") or 0),
                 "block": None,
+                # This endpoint carries no confirmation flag. Treated as
+                # unconfirmed rather than assumed good — the confirmation pass
+                # will settle it, and guessing "confirmed" here would defeat
+                # the whole point of the second check.
+                "confirmed": False,
             })
         out.sort(key=lambda x: x["timestamp_ms"])
         return out
@@ -191,6 +204,39 @@ class DepositMonitor:
         wallets = await self.repo.monitored_wallets()
         for wallet in wallets:
             await self._poll_wallet(wallet)
+        await self._report_unconfirmed()
+
+    async def _report_unconfirmed(self) -> None:
+        """
+        Tell the Bridge about deposits that never confirmed.
+
+        The Bridge is notified the moment a deposit is detected, which is what
+        the client asked for — but that means they can act on a transaction
+        that has not settled. On TRON this is rare and usually means the
+        transaction was dropped. Either way it should not stay silent.
+
+        Each one is reported once; the status moves off 'detected' so the next
+        cycle does not repeat it.
+        """
+        try:
+            stale = await self.repo.unconfirmed_deposits(UNCONFIRMED_ALERT_MINUTES)
+        except Exception:
+            log.exception("could not check for unconfirmed deposits")
+            return
+
+        for d in stale:
+            if not await self.repo.flag_unconfirmed(d["id"]):
+                continue  # another pass got there first
+            log.warning("deposit %s still unconfirmed", d["tx_hash"])
+            await self.notifier.to_bridge(
+                "DEPOSIT NOT CONFIRMED\n\n"
+                f"{d['amount_usdt']} USDT to {d['address']}\n"
+                f"Hash {d['tx_hash']}\n"
+                + (f"Trade {d['reference']}\n" if d["reference"] else "")
+                + f"\nDetected over {UNCONFIRMED_ALERT_MINUTES} minutes ago and "
+                "still not confirmed on-chain. Check the transaction before "
+                "acting on it."
+            )
 
     async def _poll_wallet(self, wallet) -> None:
         wallet_id = wallet["id"]
@@ -238,10 +284,21 @@ class DepositMonitor:
             amount_usdt=transfer["amount"],
             from_address=transfer["from_address"],
             block_number=transfer["block"],
+            confirmed=transfer.get("confirmed", False),
         )
 
         if deposit_id is None:
-            # Already recorded. Normal after a restart or an overlapping window.
+            # Already recorded. Normal after a restart or an overlapping window
+            # — and the opportunity to complete B4's second half: if the chain
+            # now reports it confirmed, promote it.
+            if transfer.get("confirmed"):
+                promoted = await self.repo.confirm_deposit(
+                    tx_hash=transfer["tx_hash"],
+                    wallet_id=wallet["id"],
+                    block_number=transfer["block"],
+                )
+                if promoted:
+                    log.info("deposit %s confirmed on-chain", transfer["tx_hash"])
             return
 
         log.info(

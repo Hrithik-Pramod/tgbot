@@ -237,11 +237,6 @@ class Repo:
                 """
             )
 
-    async def wallet_by_address(self, address: str) -> Optional[asyncpg.Record]:
-        async with self.pool.acquire() as conn:
-            return await conn.fetchrow(
-                "SELECT * FROM wallets WHERE address = $1", address
-            )
 
     async def update_wallet_address(
         self, *, wallet_id: int, new_address: str, actor_party_id: int,
@@ -353,15 +348,6 @@ class Repo:
             raise RuntimeError(f"no deal counter configured for supplier {supplier_id}")
         return f"{row['prefix']}{row['last_number']}"
 
-    async def open_trade_for_wallet(self, wallet_id: int) -> Optional[asyncpg.Record]:
-        async with self.pool.acquire() as conn:
-            return await conn.fetchrow(
-                """
-                SELECT * FROM trades
-                WHERE wallet_id = $1 AND status IN ('open', 'awaiting_payment')
-                """,
-                wallet_id,
-            )
 
     async def open_trade_for_client(self, client_id: int) -> Optional[asyncpg.Record]:
         async with self.pool.acquire() as conn:
@@ -805,9 +791,76 @@ class Repo:
 
     # --------------------------------------------------------------- deposits
 
+    async def confirm_deposit(
+        self, *, tx_hash: str, wallet_id: int, block_number: int | None = None,
+    ) -> bool:
+        """
+        Promote a detected deposit to confirmed.
+
+        B4: the client chose "notify immediately on detection, then confirm
+        separately". This is the second half. Until a deposit is confirmed the
+        Bridge is acting on a transaction that, in principle, could still
+        disappear.
+
+        Returns True only on the transition, so the caller can act once.
+        """
+        async with self.pool.acquire() as conn:
+            row = await conn.fetchrow(
+                """
+                UPDATE deposits
+                SET status = 'confirmed',
+                    confirmed_at = now(),
+                    block_number = COALESCE($3, block_number)
+                WHERE tx_hash = $1 AND wallet_id = $2 AND status = 'detected'
+                RETURNING id
+                """,
+                tx_hash, wallet_id, block_number,
+            )
+            return row is not None
+
+    async def unconfirmed_deposits(self, older_than_minutes: int) -> list[asyncpg.Record]:
+        """
+        Deposits still unconfirmed after a while.
+
+        A transaction that has been sitting unconfirmed for many minutes is
+        unusual on TRON, and the Bridge may already have acted on the
+        notification. Better to say so than to leave it silent.
+        """
+        async with self.pool.acquire() as conn:
+            return await conn.fetch(
+                """
+                SELECT d.id, d.tx_hash, d.amount_usdt, d.detected_at,
+                       t.reference, w.address
+                FROM deposits d
+                JOIN wallets w ON w.id = d.wallet_id
+                LEFT JOIN trades t ON t.id = d.trade_id
+                WHERE d.status = 'detected'
+                  AND d.detected_at < now() - ($1::text || ' minutes')::interval
+                ORDER BY d.detected_at
+                """,
+                str(older_than_minutes),
+            )
+
+    async def flag_unconfirmed(self, deposit_id: int) -> bool:
+        """
+        Mark an unconfirmed deposit as reported, so the Bridge is warned once
+        rather than on every polling cycle.
+        """
+        async with self.pool.acquire() as conn:
+            row = await conn.fetchrow(
+                """
+                UPDATE deposits SET status = 'orphaned'
+                WHERE id = $1 AND status = 'detected'
+                RETURNING id
+                """,
+                deposit_id,
+            )
+            return row is not None
+
     async def record_deposit(
         self, *, tx_hash: str, wallet_id: int, amount_usdt: Decimal,
         from_address: str | None, block_number: int | None,
+        confirmed: bool = False,
     ) -> Optional[int]:
         """
         Insert a detected deposit.
@@ -820,10 +873,15 @@ class Repo:
             return await conn.fetchval(
                 """
                 INSERT INTO deposits (tx_hash, wallet_id, amount_usdt,
-                                      from_address, block_number, status)
-                VALUES ($1, $2, $3, $4, $5, 'detected')
+                                      from_address, block_number, status,
+                                      confirmed_at)
+                VALUES ($1, $2, $3, $4, $5,
+                        CASE WHEN $6 THEN 'confirmed'::deposit_status
+                             ELSE 'detected'::deposit_status END,
+                        CASE WHEN $6 THEN now() ELSE NULL END)
                 ON CONFLICT (tx_hash, wallet_id) DO NOTHING
                 RETURNING id
                 """,
                 tx_hash, wallet_id, amount_usdt, from_address, block_number,
+                confirmed,
             )
