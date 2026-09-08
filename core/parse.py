@@ -1,0 +1,270 @@
+"""
+Free-form payment paste parser.
+
+Client A's team sends payments as a pasted block rather than answering prompts,
+in whatever order and formatting they happen to use (client note, 8 Sep 2026):
+
+    BKIDR12026090800000380      BKIDR12026090800000380      Amount 249000
+    249000                      249 000                     to Ekta traders
+    to Ekta traders             to Ekta traders             UTR BKIDR1202609...
+
+All three are the same payment. Rather than forcing the client to change how
+they work, the bot reads what they already send.
+
+THE APPROACH
+Lines are classified by SHAPE, not by position, so field order does not matter:
+
+  - a run of digits and letters, 8+ characters   -> a UTR
+  - digits only, short                           -> an amount
+  - words                                        -> a beneficiary name
+
+An explicit label ("UTR ...", "Amount ...", "to ...") always wins over the
+shape rule, which is what makes the one genuinely ambiguous case tractable: a
+bank whose UTRs are all digits. See `AMBIGUOUS_DIGIT_LEN`.
+
+Nothing here decides anything on its own. The parser returns what it believes
+it read and the caller confirms it with the client before a single figure
+reaches the ledger.
+"""
+
+from __future__ import annotations
+
+import re
+from dataclasses import dataclass, field
+from decimal import Decimal
+from typing import Optional
+
+from .money import MoneyError, normalise_utr, round_inr, to_decimal
+
+# An all-digit token at least this long is read as a UTR rather than an amount.
+# Indian UTRs run 12-22 characters; a single INR payment of 10^12 is not a
+# realistic trade. Below this, digits are read as money.
+AMBIGUOUS_DIGIT_LEN = 12
+
+# Explicit labels. These beat every shape rule.
+#
+# (?![a-z]) rather than \b: \b needs a word/non-word transition, so "Rs." would
+# fail — the "." and the following space are both non-word, and the match
+# collapses to "Rs" leaving ". 249 000", which reads as ₹0.249. The lookahead
+# just says "not the middle of a longer word", which is what was meant, and it
+# still keeps "to" from matching "total".
+#
+# "." is a separator so "Rs." and "Amt." are consumed with the label.
+_LBL_UTR = re.compile(r"^\s*(?:utr|rrn|ref(?:erence)?|txn|transaction)(?![a-z])[:\-–.\s]*", re.I)
+_LBL_AMT = re.compile(r"^\s*(?:amount|amt|rs|inr|₹)(?![a-z])[:\-–.\s]*", re.I)
+_LBL_BEN = re.compile(r"^\s*(?:to|acc(?:ount)?|beneficiary|benef)(?![a-z])[:\-–.\s]*", re.I)
+
+# Lines that carry no payment data. Pasting alongside a screenshot brings the
+# surrounding chrome with it.
+_NOISE_TIME = re.compile(
+    r"^\s*(?:"
+    r"\d{1,2}[:.]\d{2}\s*(?:am|pm)?"           # 11:04 am
+    r"|\d{1,2}[/-]\d{1,2}[/-]\d{2,4}"          # 08/09/2026
+    r")\s*$",
+    re.I,
+)
+
+# Matched as a vocabulary rather than a pattern, because these arrive in every
+# combination: "Payment Successful", "Transfer complete", "IMPS", "Sent".
+_NOISE_WORDS = {
+    "payment", "payments", "transfer", "transferred", "transaction", "txn",
+    "successful", "success", "completed", "complete", "done", "sent", "paid",
+    "status", "money", "imps", "neft", "rtgs", "upi", "bank", "details",
+}
+
+
+def _is_noise(line: str) -> bool:
+    """
+    True when a line is screenshot furniture rather than payment data.
+
+    A line counts as noise only if it contains no digits and every word in it
+    is a known status word — so "Payment Successful" is dropped while "Ekta
+    traders" is kept. Being conservative here matters: wrongly discarding a
+    line loses a payment, while wrongly keeping one is caught at confirmation.
+    """
+    if _NOISE_TIME.match(line):
+        return True
+    words = re.findall(r"[A-Za-z]+", line)
+    if not words or any(c.isdigit() for c in line):
+        return False
+    return all(w.lower() in _NOISE_WORDS for w in words)
+
+_STRIP = str.maketrans("", "", "   ,'")
+
+
+@dataclass
+class ParsedPayment:
+    utr: str
+    amount_inr: Decimal
+    beneficiary: Optional[str] = None
+
+    @property
+    def complete(self) -> bool:
+        return bool(self.utr) and self.amount_inr > 0
+
+
+@dataclass
+class ParseResult:
+    payments: list[ParsedPayment] = field(default_factory=list)
+    problems: list[str] = field(default_factory=list)
+
+    @property
+    def ok(self) -> bool:
+        return bool(self.payments) and not self.problems
+
+
+def _digits_only(token: str) -> bool:
+    return token.translate(_STRIP).isdigit()
+
+
+def classify(line: str) -> tuple[str, str]:
+    """
+    Work out what one line is.
+
+    Returns (kind, value) where kind is 'utr', 'amount', 'beneficiary' or
+    'noise'. Labels are consumed; the value is what remains.
+    """
+    raw = line.strip()
+    if not raw:
+        return "noise", ""
+
+    # Labels first — they are the client telling us directly.
+    if (m := _LBL_BEN.match(raw)) and raw[m.end():].strip():
+        return "beneficiary", raw[m.end():].strip()
+    if (m := _LBL_AMT.match(raw)) and raw[m.end():].strip():
+        return "amount", raw[m.end():].strip()
+    if (m := _LBL_UTR.match(raw)) and raw[m.end():].strip():
+        return "utr", raw[m.end():].strip()
+
+    if _is_noise(raw):
+        return "noise", raw
+
+    squashed = raw.translate(_STRIP)
+
+    if _digits_only(raw):
+        # The one genuinely ambiguous case. Length decides: an Indian UTR is
+        # 12+ characters, a trade tranche is not 10^12 rupees.
+        if len(squashed) >= AMBIGUOUS_DIGIT_LEN:
+            return "utr", raw
+        return "amount", raw
+
+    # Decimal amounts: "249000.00", "2,49,000.50"
+    if re.fullmatch(r"\d[\d.]*", squashed) and squashed.count(".") <= 1:
+        return "amount", raw
+
+    # Mixed letters and digits with no internal spaces — a reference.
+    if squashed.isalnum() and any(c.isdigit() for c in squashed) and len(squashed) >= 8:
+        return "utr", raw
+
+    # Anything else that reads as words is a name.
+    if re.search(r"[A-Za-z]{2,}", raw):
+        return "beneficiary", raw
+
+    return "noise", raw
+
+
+def parse_payments(text: str) -> ParseResult:
+    """
+    Read one or more payments out of a pasted block.
+
+    Field order does not matter. A new payment starts whenever a field arrives
+    that the current one already has, which is what lets several payments be
+    pasted in a single message without separators.
+    """
+    result = ParseResult()
+    if not text or not text.strip():
+        result.problems.append("Nothing to read.")
+        return result
+
+    current: dict[str, str] = {}
+    records: list[dict[str, str]] = []
+
+    def flush() -> None:
+        if current.get("utr") or current.get("amount"):
+            records.append(dict(current))
+        current.clear()
+
+    for line in text.splitlines():
+        kind, value = classify(line)
+        if kind == "noise":
+            continue
+        if kind in current:
+            # Repeated field means the previous payment is finished.
+            flush()
+        current[kind] = value
+    flush()
+
+    if not records:
+        result.problems.append(
+            "I could not find a UTR and an amount in that message."
+        )
+        return result
+
+    for i, rec in enumerate(records, 1):
+        where = f"Entry {i}: " if len(records) > 1 else ""
+
+        if "utr" not in rec:
+            result.problems.append(f"{where}no UTR found.")
+            continue
+        if "amount" not in rec:
+            result.problems.append(f"{where}no amount found.")
+            continue
+
+        try:
+            utr = normalise_utr(rec["utr"])
+        except MoneyError as exc:
+            result.problems.append(f"{where}{exc}")
+            continue
+
+        try:
+            amount = round_inr(to_decimal(rec["amount"]))
+        except MoneyError:
+            result.problems.append(f"{where}could not read {rec['amount']!r} as an amount.")
+            continue
+
+        if amount <= 0:
+            result.problems.append(f"{where}amount must be greater than zero.")
+            continue
+
+        result.payments.append(
+            ParsedPayment(utr=utr, amount_inr=amount,
+                          beneficiary=rec.get("beneficiary"))
+        )
+
+    return result
+
+
+def match_account(name: Optional[str], accounts) -> Optional[int]:
+    """
+    Match a pasted beneficiary name to a registered account.
+
+    Deliberately forgiving about spacing and case — "Ekta traders", "EKTA
+    TRADERS" and "Ekta  Traders" are the same account to a human and should be
+    to the bot. Deliberately unforgiving about anything else: a wrong match
+    would attribute money to the wrong account, so an uncertain name returns
+    None and the caller asks.
+
+    `accounts` is any iterable of rows with 'id' and 'account_name'.
+    """
+    if not name:
+        return None
+
+    def norm(s: str) -> str:
+        return re.sub(r"[^a-z0-9]", "", s.lower())
+
+    target = norm(name)
+    if not target:
+        return None
+
+    exact = [a for a in accounts if norm(a["account_name"]) == target]
+    if len(exact) == 1:
+        return exact[0]["id"]
+    if len(exact) > 1:
+        return None  # genuinely ambiguous; make the client choose
+
+    # One-sided containment, e.g. "Ekta" against "Ekta Traders Pvt Ltd".
+    partial = [
+        a for a in accounts
+        if target in norm(a["account_name"]) or norm(a["account_name"]) in target
+    ]
+    return partial[0]["id"] if len(partial) == 1 else None

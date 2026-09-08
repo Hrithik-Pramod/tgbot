@@ -21,7 +21,10 @@ from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.types import CallbackQuery, InlineKeyboardButton, InlineKeyboardMarkup, Message
 
-from core.money import MoneyError, fmt_inr, normalise_utr, round_inr, to_decimal
+from core.money import (
+    MoneyError, fmt_inr, fmt_inr_plain, normalise_utr, round_inr, to_decimal,
+)
+from core.parse import match_account, parse_payments
 from core.summary import Payment, render_completion_notice, render_trade_summary
 
 log = logging.getLogger(__name__)
@@ -32,6 +35,11 @@ class AddPayment(StatesGroup):
     amount = State()
     utr = State()
     account = State()
+
+
+class PastedPayment(StatesGroup):
+    account = State()
+    confirm = State()
 
 
 # --------------------------------------------------------------- /accounts
@@ -146,6 +154,133 @@ async def add_account(call: CallbackQuery, state: FSMContext, party, repo) -> No
     await call.message.edit_text(
         f"{msg}\nRunning total: ₹{fmt_inr(total)}"
     )
+    await call.answer()
+
+
+# ------------------------------------------------------- pasted payments
+#
+# Client A's team pastes payments rather than answering prompts, in whatever
+# order and formatting they happen to use (client note, 8 Sep 2026). Rather
+# than asking them to change how they work, the bot reads what they send.
+#
+# Registered last so it only sees messages no command or FSM state claimed.
+
+
+@router.message(F.text)
+async def on_pasted_payment(message: Message, state: FSMContext, party, repo) -> None:
+    if await state.get_state() is not None:
+        return  # mid-conversation; the FSM handlers own this message
+
+    trade = await repo.open_trade_for_client(party["id"])
+    if trade is None:
+        return  # nothing open — stay quiet rather than nagging on small talk
+
+    result = parse_payments(message.text or "")
+
+    if not result.payments:
+        # Almost always ordinary conversation, not a failed paste. Only speak
+        # up if it looked like an attempt.
+        if result.problems and any(c.isdigit() for c in (message.text or "")):
+            await message.answer(
+                "\n".join(["I could not read that as a payment:", *result.problems])
+                + "\n\nSend it as UTR, amount, and the account — or use /add."
+            )
+        return
+
+    accounts = await repo.list_bank_accounts(trade["supplier_id"])
+
+    staged, lines = [], ["Read this as:", ""]
+    for p in result.payments:
+        account_id = match_account(p.beneficiary, accounts)
+        staged.append({
+            "utr": p.utr, "amount": str(p.amount_inr), "account_id": account_id,
+        })
+        name = next((a["account_name"] for a in accounts if a["id"] == account_id), None)
+        lines.append(p.utr)
+        lines.append(fmt_inr_plain(p.amount_inr))
+        lines.append(f"to {name}" if name else "to ?  (account not recognised)")
+        lines.append("")
+
+    if len(staged) > 1:
+        total = sum(to_decimal(s["amount"]) for s in staged)
+        lines.append(f"{len(staged)} payments, total ₹{fmt_inr(total)}")
+        lines.append("")
+
+    for problem in result.problems:
+        lines.append(f"Note: {problem}")
+
+    await state.update_data(staged=staged, supplier_id=trade["supplier_id"],
+                            trade_id=trade["id"])
+
+    unmatched = [s for s in staged if s["account_id"] is None]
+    if unmatched:
+        # Never guess an account. A wrong one attributes money to the wrong
+        # place, and the client is right here to be asked.
+        await state.set_state(PastedPayment.account)
+        kb = InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text=a["account_name"], callback_data=f"pacct:{a['id']}")]
+            for a in accounts
+        ])
+        lines.append("Which account did these go to?")
+        await message.answer("\n".join(lines), reply_markup=kb)
+        return
+
+    await state.set_state(PastedPayment.confirm)
+    kb = InlineKeyboardMarkup(inline_keyboard=[[
+        InlineKeyboardButton(text="Confirm", callback_data="pyes"),
+        InlineKeyboardButton(text="Cancel", callback_data="pno"),
+    ]])
+    lines.append("Correct?")
+    await message.answer("\n".join(lines), reply_markup=kb)
+
+
+@router.callback_query(PastedPayment.account, F.data.startswith("pacct:"))
+async def pasted_pick_account(call: CallbackQuery, state: FSMContext) -> None:
+    account_id = int(call.data.split(":", 1)[1])
+    data = await state.get_data()
+    staged = [
+        {**s, "account_id": s["account_id"] or account_id} for s in data["staged"]
+    ]
+    await state.update_data(staged=staged)
+    await state.set_state(PastedPayment.confirm)
+
+    kb = InlineKeyboardMarkup(inline_keyboard=[[
+        InlineKeyboardButton(text="Confirm", callback_data="pyes"),
+        InlineKeyboardButton(text="Cancel", callback_data="pno"),
+    ]])
+    await call.message.edit_text(
+        call.message.text + "\n\nAccount set. Confirm?", reply_markup=kb
+    )
+    await call.answer()
+
+
+@router.callback_query(PastedPayment.confirm, F.data == "pyes")
+async def pasted_confirm(call: CallbackQuery, state: FSMContext, party, repo) -> None:
+    data = await state.get_data()
+    await state.clear()
+
+    added, rejected = [], []
+    for s in data["staged"]:
+        ok, msg = await repo.add_payment(
+            trade_id=data["trade_id"], utr=s["utr"],
+            amount_inr=to_decimal(s["amount"]),
+            beneficiary_account_id=s["account_id"], added_by=party["id"],
+        )
+        (added if ok else rejected).append(msg)
+
+    total = await repo.trade_paid_total(data["trade_id"])
+    out = [f"Recorded {len(added)} payment(s)."]
+    out += [f"  {m}" for m in rejected]          # E3: duplicates named, not hidden
+    out.append(f"Running total: ₹{fmt_inr(total)}")
+
+    await call.message.edit_text("\n".join(out))
+    await call.answer()
+
+
+@router.callback_query(PastedPayment.confirm, F.data == "pno")
+async def pasted_cancel(call: CallbackQuery, state: FSMContext) -> None:
+    await state.clear()
+    await call.message.edit_text("Discarded. Nothing was recorded.")
     await call.answer()
 
 
