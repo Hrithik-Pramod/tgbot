@@ -61,17 +61,25 @@ Bridge.
 
 Requires Python 3.11+ and PostgreSQL 14+.
 
-**On a server** — one script does everything:
+**On a server with Docker** (recommended) — see
+[`deploy/DEPLOY-DOCKER.md`](deploy/DEPLOY-DOCKER.md):
 
 ```bash
-git clone <repo> /opt/settlement-bot
+git clone https://github.com/Hrithik-Pramod/tgbot.git /opt/settlement-bot
 cd /opt/settlement-bot
+cp .env.example .env && nano .env
+docker compose up -d --build
+```
+
+**On a server without Docker** — one script does everything:
+
+```bash
 sudo bash deploy/setup.sh
 ```
 
 It installs packages, creates the database and system user, applies the schema,
 builds the virtualenv, installs the systemd service, schedules nightly backups,
-and configures the firewall. Then it tells you the three things left to do.
+and configures the firewall.
 
 **Locally**:
 
@@ -125,7 +133,8 @@ VALUES ('T...', TRUE, 1, 2, 'Supplier A / Client A');
 pytest -q
 ```
 
-105 tests, of which 17 run against a real PostgreSQL instance.
+128 tests, of which 17 run against a real PostgreSQL instance and 12 pin the
+live TronScan response contract.
 
 The pure-logic tests reproduce a representative settled trade — the six tranches
 totalling ₹1,499,297 — and assert the summary renders character for character in

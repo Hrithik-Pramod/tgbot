@@ -1,0 +1,63 @@
+# USDT / INR Settlement Bot
+#
+#   cp .env.example .env      # fill in tokens, channel id, DB password
+#   docker compose up -d --build
+#   docker compose logs -f bot
+#
+# The schema is applied automatically the first time the database volume is
+# created. Seeding is deliberately NOT automatic — it needs the real Telegram
+# group ids, and seeding with placeholders would leave a system that starts
+# cleanly and then silently ignores every message.
+
+services:
+
+  db:
+    image: postgres:16-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB:-settlement}
+      POSTGRES_USER: ${POSTGRES_USER:-settlement}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?POSTGRES_PASSWORD must be set in .env}
+      TZ: ${TZ:-UTC}
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+      # Runs once, on an empty volume only. Re-running it later would need the
+      # volume dropped, which is why seeding is a separate manual step.
+      - ./db/schema.sql:/docker-entrypoint-initdb.d/01-schema.sql:ro
+    # No ports published. The database is reachable only from the bot on the
+    # internal network, so it is not exposed to the host or the internet.
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-settlement} -d ${POSTGRES_DB:-settlement}"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 20s
+    logging:
+      driver: json-file
+      options: { max-size: "10m", max-file: "3" }
+
+  bot:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    restart: unless-stopped
+    depends_on:
+      db:
+        # Waits for the database to actually accept connections, not merely for
+        # the container to exist. Without this the bot crash-loops on boot.
+        condition: service_healthy
+    env_file: .env
+    environment:
+      # Overrides whatever DATABASE_URL is in .env: inside the network the host
+      # is "db", never localhost. Set here so a stale .env cannot break it.
+      DATABASE_URL: postgresql://${POSTGRES_USER:-settlement}:${POSTGRES_PASSWORD}@db:5432/${POSTGRES_DB:-settlement}
+      TZ: ${TZ:-UTC}
+    logging:
+      driver: json-file
+      options: { max-size: "10m", max-file: "5" }
+
+volumes:
+  pgdata:
+    # Named, so `docker compose down` does not destroy the ledger.
+    # Only `docker compose down -v` removes it — do not run that on the server.
+    driver: local

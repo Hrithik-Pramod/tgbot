@@ -1,0 +1,32 @@
+# Secrets — must never enter an image layer
+.env
+db/seed.sql
+db/seed.local.sql
+
+# Client-confidential
+docs/
+
+# VCS and local state
+.git/
+.gitignore
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+.pytest_cache/
+
+# Not needed at runtime
+tests/
+deploy/
+*.md
+!README.md
+
+# Editors / OS
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+
+# Backups
+*.sql.gz
+*.dump
