@@ -159,6 +159,13 @@ CREATE TABLE trades (
     -- the Bridge can still override it at confirmation.
     nominated_account_id BIGINT REFERENCES bank_accounts(id),
 
+    -- Set once, the first time the outstanding balance falls to the
+    -- near-completion threshold, so the supplier is told to prepare the next
+    -- batch exactly once (client request, 8 Sep 2026). A flag rather than a
+    -- recomputation: every subsequent payment is also below the threshold, and
+    -- without this the supplier is told on every one of them.
+    nearing_completion_notified BOOLEAN NOT NULL DEFAULT FALSE,
+
     status          trade_status NOT NULL DEFAULT 'open',
     opened_at       TIMESTAMPTZ NOT NULL DEFAULT now(),
     completed_at    TIMESTAMPTZ,

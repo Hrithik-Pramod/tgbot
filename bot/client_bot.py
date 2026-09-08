@@ -144,7 +144,8 @@ async def add_utr(message: Message, state: FSMContext, repo) -> None:
 
 
 @router.callback_query(AddPayment.account, F.data.startswith("acct:"))
-async def add_account(call: CallbackQuery, state: FSMContext, party, repo) -> None:
+async def add_account(call: CallbackQuery, state: FSMContext, party, repo,
+                      notifier) -> None:
     account_id = int(call.data.split(":", 1)[1])
     data = await state.get_data()
 
@@ -163,6 +164,8 @@ async def add_account(call: CallbackQuery, state: FSMContext, party, repo) -> No
         await call.answer()
         return
 
+    await notifier.check_near_completion(data["trade_id"])
+
     total = await repo.trade_paid_total(data["trade_id"])
     await call.message.edit_text(
         f"{msg}\nRunning total: ₹{fmt_inr(total)}"
@@ -180,7 +183,8 @@ async def add_account(call: CallbackQuery, state: FSMContext, party, repo) -> No
 
 
 @router.message(F.text)
-async def on_pasted_payment(message: Message, state: FSMContext, party, repo) -> None:
+async def on_pasted_payment(message: Message, state: FSMContext, party, repo,
+                            notifier) -> None:
     if await state.get_state() is not None:
         return  # mid-conversation; the FSM handlers own this message
 
@@ -263,7 +267,8 @@ async def on_pasted_payment(message: Message, state: FSMContext, party, repo) ->
     # Everything read cleanly and every account matched: record it and
     # acknowledge, no tap required (client decision, 8 Sep 2026).
     await state.clear()
-    await _record(message, trade["id"], staged, party, repo, acknowledge=True)
+    await _record(message, trade["id"], staged, party, repo, acknowledge=True,
+                  notifier=notifier)
 
 
 async def _acknowledge(message: Message) -> None:
@@ -286,7 +291,8 @@ async def _acknowledge(message: Message) -> None:
         await message.reply("Noted.")
 
 
-async def _record(message, trade_id, staged, party, repo, *, acknowledge: bool) -> None:
+async def _record(message, trade_id, staged, party, repo, *, acknowledge: bool,
+                  notifier=None) -> None:
     """Write the staged payments and report anything that was refused."""
     added, rejected = [], []
     for s in staged:
@@ -307,12 +313,16 @@ async def _record(message, trade_id, staged, party, repo, *, acknowledge: bool) 
         )
         return
 
+    if notifier is not None:
+        await notifier.check_near_completion(trade_id)
+
     if acknowledge:
         await _acknowledge(message)
 
 
 @router.callback_query(PastedPayment.account, F.data.startswith("pacct:"))
-async def pasted_pick_account(call: CallbackQuery, state: FSMContext, party, repo) -> None:
+async def pasted_pick_account(call: CallbackQuery, state: FSMContext, party, repo,
+                              notifier) -> None:
     account_id = int(call.data.split(":", 1)[1])
     data = await state.get_data()
     staged = [
@@ -336,7 +346,7 @@ async def pasted_pick_account(call: CallbackQuery, state: FSMContext, party, rep
     await state.clear()
     total_before = await repo.trade_paid_total(data["trade_id"])
     await _record(call.message, data["trade_id"], staged, party, repo,
-                  acknowledge=False)
+                  acknowledge=False, notifier=notifier)
     total = await repo.trade_paid_total(data["trade_id"])
     await call.message.edit_text(
         call.message.text.split("Which account")[0].rstrip()
@@ -346,7 +356,8 @@ async def pasted_pick_account(call: CallbackQuery, state: FSMContext, party, rep
 
 
 @router.callback_query(PastedPayment.confirm, F.data == "pyes")
-async def pasted_confirm(call: CallbackQuery, state: FSMContext, party, repo) -> None:
+async def pasted_confirm(call: CallbackQuery, state: FSMContext, party, repo,
+                         notifier) -> None:
     data = await state.get_data()
     await state.clear()
 
@@ -364,6 +375,7 @@ async def pasted_confirm(call: CallbackQuery, state: FSMContext, party, repo) ->
     out += [f"  {m}" for m in rejected]          # E3: duplicates named, not hidden
     out.append(f"Running total: ₹{fmt_inr(total)}")
 
+    await notifier.check_near_completion(data["trade_id"])
     await call.message.edit_text("\n".join(out))
     await call.answer()
 

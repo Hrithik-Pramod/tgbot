@@ -722,6 +722,45 @@ class Repo:
                 await conn.execute("DELETE FROM payments WHERE id = $1", payment_id)
                 return True, f"Removed {row['utr']} (₹{row['amount_inr']:,.0f}) from {row['reference']}."
 
+    async def claim_near_completion(
+        self, trade_id: int, threshold_inr: Decimal
+    ) -> Optional[asyncpg.Record]:
+        """
+        Claim the right to send the near-completion notice for this trade.
+
+        Returns the trade if this call is the one that should notify, or None if
+        the threshold is not reached or another call already claimed it.
+
+        The check and the flag are set in a single statement. Two payments
+        landing at the same moment would otherwise both see an unnotified trade
+        and the supplier would be told twice — the sort of thing that never
+        shows up in testing and always shows up in production.
+        """
+        async with self.pool.acquire() as conn:
+            async with conn.transaction():
+                row = await conn.fetchrow(
+                    """
+                    UPDATE trades t
+                    SET nearing_completion_notified = TRUE
+                    WHERE t.id = $1
+                      AND NOT t.nearing_completion_notified
+                      AND t.status IN ('open', 'awaiting_payment')
+                      AND t.inr_expected > 0
+                      AND t.inr_expected - COALESCE(
+                            (SELECT SUM(amount_inr) FROM payments WHERE trade_id = t.id), 0
+                          ) <= $2
+                    RETURNING t.id, t.reference, t.supplier_id, t.inr_expected
+                    """,
+                    trade_id, threshold_inr,
+                )
+                if row is not None:
+                    await self.audit(
+                        conn, actor_party_id=None, action="trade.near_completion",
+                        entity_type="trade", entity_id=trade_id,
+                        detail={"threshold_inr": threshold_inr},
+                    )
+                return row
+
     async def trade_payment_rows(self, trade_id: int) -> list[asyncpg.Record]:
         """Payments with ids, for the correction picker."""
         async with self.pool.acquire() as conn:

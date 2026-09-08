@@ -464,3 +464,114 @@ class TestAccountsAndExport:
         assert len(rows) == 1
         assert rows[0]["reference"] == "SUPA1"
         assert rows[0]["utr"] is None
+
+
+class TestNearCompletion:
+    """
+    Client request, 8 September 2026: tell the supplier to prepare the next
+    batch once outstanding INR falls to the threshold. Once per trade, not once
+    per payment.
+    """
+
+    async def _trade(self, world, repo, expected=D("1000000")):
+        async with repo.pool.acquire() as conn:
+            return await conn.fetchval(
+                """
+                INSERT INTO trades (reference, supplier_id, client_id, wallet_id,
+                    rate_id, supply_rate, sell_rate, inr_expected, status)
+                VALUES ('SUPA1',$1,$2,$3,$4,105.50,106.50,$5,'awaiting_payment')
+                RETURNING id
+                """, world["supplier"], world["client"], world["wallet"],
+                world["rate"], expected)
+
+    async def _pay(self, repo, world, trade_id, acct, utr, amount):
+        ok, msg = await repo.add_payment(
+            trade_id=trade_id, utr=utr, amount_inr=amount,
+            beneficiary_account_id=acct, added_by=world["client"])
+        assert ok, msg
+
+    @pytest_asyncio.fixture
+    async def acct(self, world, repo):
+        return await repo.add_bank_account(
+            party_id=world["supplier"], account_name="Ekta Traders",
+            account_number="123456789012345", ifsc="EXBK0001234")
+
+    @pytest.mark.asyncio
+    async def test_silent_while_well_short(self, world, repo, acct):
+        tid = await self._trade(world, repo)
+        await self._pay(repo, world, tid, acct, "UTR00000001", D("500000"))
+        # 500,000 outstanding — above the 300,000 threshold.
+        assert await repo.claim_near_completion(tid, D("300000")) is None
+
+    @pytest.mark.asyncio
+    async def test_fires_at_the_threshold(self, world, repo, acct):
+        tid = await self._trade(world, repo)
+        await self._pay(repo, world, tid, acct, "UTR00000001", D("700000"))
+        claimed = await repo.claim_near_completion(tid, D("300000"))
+        assert claimed is not None, "exactly 300,000 outstanding must trigger it"
+        assert claimed["reference"] == "SUPA1"
+
+    @pytest.mark.asyncio
+    async def test_fires_below_the_threshold(self, world, repo, acct):
+        tid = await self._trade(world, repo)
+        await self._pay(repo, world, tid, acct, "UTR00000001", D("800000"))
+        assert await repo.claim_near_completion(tid, D("300000")) is not None
+
+    @pytest.mark.asyncio
+    async def test_only_once_however_many_payments_follow(self, world, repo, acct):
+        """
+        Without the flag the supplier is told on every payment after the
+        threshold — every one of them is also below it.
+        """
+        tid = await self._trade(world, repo)
+        await self._pay(repo, world, tid, acct, "UTR00000001", D("800000"))
+        assert await repo.claim_near_completion(tid, D("300000")) is not None
+
+        for i in range(2, 6):
+            await self._pay(repo, world, tid, acct, f"UTR0000000{i}", D("10000"))
+            assert await repo.claim_near_completion(tid, D("300000")) is None
+
+    @pytest.mark.asyncio
+    async def test_concurrent_claims_yield_exactly_one_winner(self, world, repo, acct):
+        """
+        Two payments landing together would both see an unnotified trade if the
+        check and the flag were separate statements.
+        """
+        import asyncio
+        tid = await self._trade(world, repo)
+        await self._pay(repo, world, tid, acct, "UTR00000001", D("800000"))
+
+        results = await asyncio.gather(
+            *[repo.claim_near_completion(tid, D("300000")) for _ in range(8)]
+        )
+        assert sum(r is not None for r in results) == 1
+
+    @pytest.mark.asyncio
+    async def test_completed_trade_never_triggers(self, world, repo, acct):
+        tid = await self._trade(world, repo)
+        await self._pay(repo, world, tid, acct, "UTR00000001", D("800000"))
+        await repo.complete_trade(tid, world["client"])
+        assert await repo.claim_near_completion(tid, D("300000")) is None
+
+    @pytest.mark.asyncio
+    async def test_a_trade_with_no_expected_total_is_ignored(self, world, repo):
+        """inr_expected is 0 until a deposit lands — 0 - 0 <= threshold is true."""
+        async with repo.pool.acquire() as conn:
+            tid = await conn.fetchval(
+                """
+                INSERT INTO trades (reference, supplier_id, client_id, wallet_id,
+                    rate_id, supply_rate, sell_rate, status)
+                VALUES ('SUPA1',$1,$2,$3,$4,105.50,106.50,'open') RETURNING id
+                """, world["supplier"], world["client"], world["wallet"],
+                world["rate"])
+        assert await repo.claim_near_completion(tid, D("300000")) is None
+
+    @pytest.mark.asyncio
+    async def test_it_is_written_to_the_audit_log(self, world, repo, acct):
+        tid = await self._trade(world, repo)
+        await self._pay(repo, world, tid, acct, "UTR00000001", D("800000"))
+        await repo.claim_near_completion(tid, D("300000"))
+        async with repo.pool.acquire() as conn:
+            n = await conn.fetchval(
+                "SELECT count(*) FROM audit_log WHERE action = 'trade.near_completion'")
+        assert n == 1

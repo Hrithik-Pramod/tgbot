@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import os
 from dataclasses import dataclass
+from decimal import Decimal
 
 
 def _req(name: str) -> str:
@@ -59,6 +60,10 @@ class Config:
     # C5: warn when the rate in force for a pairing is older than this.
     rate_staleness_hours: int
 
+    # Tell the supplier to prepare the next batch once the outstanding INR on a
+    # trade falls to this (client request, 8 Sep 2026).
+    near_completion_inr: Decimal
+
     @classmethod
     def from_env(cls) -> "Config":
         return cls(
@@ -81,4 +86,5 @@ class Config:
             ),
             poll_interval_seconds=int(_opt("POLL_INTERVAL_SECONDS", "20")),
             rate_staleness_hours=int(_opt("RATE_STALENESS_HOURS", "24")),
+            near_completion_inr=Decimal(_opt("NEAR_COMPLETION_INR", "300000")),
         )

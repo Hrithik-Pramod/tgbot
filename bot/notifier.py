@@ -13,7 +13,7 @@ from decimal import Decimal
 
 from aiogram import Bot
 
-from core.money import inr_to_usdt, margin_usdt, usdt_to_inr
+from core.money import fmt_inr, inr_to_usdt, margin_usdt, usdt_to_inr
 from core.summary import render_deposit_notification
 
 log = logging.getLogger(__name__)
@@ -62,6 +62,42 @@ class Notifier:
             )
         except Exception:
             log.exception("failed to notify party %s", party_id)
+
+    # ------------------------------------------------ near-completion notice
+
+    async def check_near_completion(self, trade_id: int) -> None:
+        """
+        Tell the supplier to prepare the next batch when a trade is nearly paid.
+
+        Client request, 8 September 2026: "when we are 300,000 or less remaining
+        on trade, can we notify in bot to Supplier — Prepare next batch, close to
+        completion". The point is lead time: the supplier can have the next
+        deposit ready rather than starting from cold once this trade closes.
+
+        Called after every payment. The claim is atomic, so it fires once per
+        trade however many payments land together.
+        """
+        trade = await self.repo.claim_near_completion(
+            trade_id, self.config.near_completion_inr
+        )
+        if trade is None:
+            return
+
+        paid = await self.repo.trade_paid_total(trade_id)
+        outstanding = trade["inr_expected"] - paid
+
+        await self.to_party(
+            trade["supplier_id"],
+            "Prepare next batch — close to completion\n\n"
+            f"Transaction {trade['reference']}\n"
+            f"Outstanding: ₹{fmt_inr(outstanding)} of ₹{fmt_inr(trade['inr_expected'])}",
+        )
+        await self.to_bridge(
+            f"{trade['reference']} is close to completion "
+            f"(₹{fmt_inr(outstanding)} outstanding). Supplier has been asked to "
+            "prepare the next batch."
+        )
+        log.info("near-completion notice sent for trade %s", trade["reference"])
 
     # ------------------------------------------------- deposit → trade flow
 
