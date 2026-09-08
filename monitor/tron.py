@@ -118,6 +118,11 @@ class TronClient:
                 continue  # outgoing, or an unrelated leg
             if item.get("finalResult") not in (None, "SUCCESS"):
                 continue
+            if item.get("revert"):
+                # Live responses carry this flag. A reverted transfer moved no
+                # money, so counting it would open a trade against a deposit
+                # that never actually landed.
+                continue
             out.append({
                 "tx_hash": item.get("transaction_id") or item.get("hash"),
                 "from_address": item.get("from_address"),
