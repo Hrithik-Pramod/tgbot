@@ -1,0 +1,50 @@
+# systemd unit for the settlement bot.
+#
+# Install:
+#   sudo cp deploy/settlement-bot.service /etc/systemd/system/
+#   sudo systemctl daemon-reload
+#   sudo systemctl enable --now settlement-bot
+#
+# Watch it:
+#   sudo systemctl status settlement-bot
+#   sudo journalctl -u settlement-bot -f
+
+[Unit]
+Description=USDT/INR Settlement Bot
+After=network-online.target postgresql.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=settlement
+Group=settlement
+WorkingDirectory=/opt/settlement-bot
+
+# Secrets live in the environment file, never in this unit and never in git.
+EnvironmentFile=/opt/settlement-bot/.env
+
+ExecStart=/opt/settlement-bot/.venv/bin/python main.py
+
+# The monitor must come back on its own. A crash that stayed down would stop
+# deposit detection silently, which is the worst failure this system has.
+Restart=always
+RestartSec=10
+
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=settlement-bot
+
+# Hardening. The process needs the network and its own directory, nothing else.
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/opt/settlement-bot
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+RestrictSUIDSGID=true
+LockPersonality=true
+
+[Install]
+WantedBy=multi-user.target

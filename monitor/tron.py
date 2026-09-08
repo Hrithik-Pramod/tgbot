@@ -1,0 +1,263 @@
+"""
+TRC20 USDT deposit monitor.
+
+Polls each monitored wallet for incoming USDT transfers, opens or extends the
+matching trade, and notifies the Bridge.
+
+Design notes, because this is the part that goes wrong in production:
+
+  * At-least-once, never at-most-once. A restart, an overlapping poll window or
+    a retried request will re-deliver transactions already seen. Correctness
+    comes from the UNIQUE (tx_hash, wallet_id) constraint in the database, not
+    from the poller being careful. Losing a deposit is unrecoverable; seeing one
+    twice is free.
+
+  * The cursor is stored per wallet and only ever moves forward. After downtime
+    the monitor resumes from the last transaction it recorded rather than
+    rescanning from zero or, worse, skipping the gap.
+
+  * The cursor is deliberately rewound by OVERLAP_MS on each poll. Block
+    timestamps are not perfectly ordered, and a strict "greater than last seen"
+    filter drops transactions that land on the boundary.
+
+  * TronScan is primary (answer B7 - free, and the client has used it before);
+    TronGrid is the fallback so a rate-limit or outage does not blind us.
+
+  * Amounts are converted from the contract's integer units to Decimal via
+    string, never through float.
+"""
+
+from __future__ import annotations
+
+import asyncio
+import logging
+from decimal import Decimal
+from typing import Any, Optional
+
+import httpx
+
+log = logging.getLogger(__name__)
+
+# USDT on TRON has 6 decimals.
+USDT_DECIMALS = 6
+_SCALE = Decimal(10) ** USDT_DECIMALS
+
+# Re-scan this far back each poll so boundary transactions are not missed.
+OVERLAP_MS = 120_000  # two minutes
+
+# Back off after repeated failures rather than hammering a rate-limited API.
+MAX_BACKOFF_SECONDS = 300
+
+
+def units_to_usdt(raw: Any) -> Decimal:
+    """
+    Convert the contract's integer units to USDT.
+
+    Via str() so that a float never enters the ledger: Decimal(0.1) is
+    0.1000000000000000055511151231257827, Decimal("0.1") is 0.1.
+    """
+    return Decimal(str(raw)) / _SCALE
+
+
+class TronClient:
+    """Thin API client with an automatic fallback."""
+
+    def __init__(
+        self,
+        *,
+        tronscan_base: str,
+        trongrid_base: str,
+        trongrid_key: str,
+        usdt_contract: str,
+        timeout: float = 20.0,
+    ):
+        self.tronscan_base = tronscan_base.rstrip("/")
+        self.trongrid_base = trongrid_base.rstrip("/")
+        self.trongrid_key = trongrid_key
+        self.usdt_contract = usdt_contract
+        self._client = httpx.AsyncClient(timeout=timeout)
+
+    async def close(self) -> None:
+        await self._client.aclose()
+
+    async def incoming_transfers(
+        self, address: str, since_ms: Optional[int]
+    ) -> list[dict]:
+        """
+        Return incoming USDT transfers for `address`, newest last.
+
+        Tries TronScan, falls back to TronGrid. If both fail the exception
+        propagates so the caller can back off - returning an empty list here
+        would look identical to "no deposits", which would silently hide a
+        broken monitor.
+        """
+        try:
+            return await self._tronscan(address, since_ms)
+        except Exception as exc:
+            log.warning("TronScan failed for %s (%s), trying TronGrid", address, exc)
+            return await self._trongrid(address, since_ms)
+
+    async def _tronscan(self, address: str, since_ms: Optional[int]) -> list[dict]:
+        params: dict[str, Any] = {
+            "relatedAddress": address,
+            "limit": 50,
+            "start": 0,
+            "contract_address": self.usdt_contract,
+            "sort": "-timestamp",
+        }
+        if since_ms:
+            params["start_timestamp"] = max(0, since_ms - OVERLAP_MS)
+
+        resp = await self._client.get(f"{self.tronscan_base}/token_trc20/transfers", params=params)
+        resp.raise_for_status()
+        payload = resp.json()
+
+        out = []
+        for item in payload.get("token_transfers", []):
+            if (item.get("to_address") or "").strip() != address:
+                continue  # outgoing, or an unrelated leg
+            if item.get("finalResult") not in (None, "SUCCESS"):
+                continue
+            out.append({
+                "tx_hash": item.get("transaction_id") or item.get("hash"),
+                "from_address": item.get("from_address"),
+                "amount": units_to_usdt(item.get("quant", 0)),
+                "timestamp_ms": int(item.get("block_ts") or item.get("block_timestamp") or 0),
+                "block": item.get("block"),
+            })
+        out.sort(key=lambda x: x["timestamp_ms"])
+        return out
+
+    async def _trongrid(self, address: str, since_ms: Optional[int]) -> list[dict]:
+        headers = {"TRON-PRO-API-KEY": self.trongrid_key} if self.trongrid_key else {}
+        params: dict[str, Any] = {
+            "only_to": "true",
+            "limit": 50,
+            "contract_address": self.usdt_contract,
+            "order_by": "block_timestamp,asc",
+        }
+        if since_ms:
+            params["min_timestamp"] = max(0, since_ms - OVERLAP_MS)
+
+        resp = await self._client.get(
+            f"{self.trongrid_base}/v1/accounts/{address}/transactions/trc20",
+            params=params, headers=headers,
+        )
+        resp.raise_for_status()
+        payload = resp.json()
+
+        out = []
+        for item in payload.get("data", []):
+            if (item.get("to") or "").strip() != address:
+                continue
+            out.append({
+                "tx_hash": item.get("transaction_id"),
+                "from_address": item.get("from"),
+                "amount": units_to_usdt(item.get("value", 0)),
+                "timestamp_ms": int(item.get("block_timestamp") or 0),
+                "block": None,
+            })
+        out.sort(key=lambda x: x["timestamp_ms"])
+        return out
+
+
+class DepositMonitor:
+    def __init__(self, *, repo, client: TronClient, notifier, config):
+        self.repo = repo
+        self.client = client
+        self.notifier = notifier
+        self.config = config
+        self._failures: dict[int, int] = {}
+
+    async def run_forever(self) -> None:
+        log.info("deposit monitor starting")
+        while True:
+            try:
+                await self.poll_once()
+            except Exception:
+                # A crash here would stop deposit detection silently, which is
+                # the worst failure this system has. Always log and continue.
+                log.exception("monitor cycle failed")
+            await asyncio.sleep(self.config.poll_interval_seconds)
+
+    async def poll_once(self) -> None:
+        # Re-read the wallet list every cycle rather than caching it, so a
+        # /walletchange takes effect on the next pass with no restart.
+        wallets = await self.repo.monitored_wallets()
+        for wallet in wallets:
+            await self._poll_wallet(wallet)
+
+    async def _poll_wallet(self, wallet) -> None:
+        wallet_id = wallet["id"]
+
+        # Exponential backoff on a failing wallet so one bad address does not
+        # exhaust the API budget for all the others.
+        failures = self._failures.get(wallet_id, 0)
+        if failures and failures % 3 != 0:
+            self._failures[wallet_id] = failures + 1
+            return
+
+        try:
+            transfers = await self.client.incoming_transfers(
+                wallet["address"], wallet["last_timestamp_ms"]
+            )
+        except Exception as exc:
+            self._failures[wallet_id] = failures + 1
+            log.error(
+                "both APIs failed for wallet %s (%s): %s",
+                wallet_id, wallet["address"], exc,
+            )
+            if failures + 1 == 5:
+                await self.notifier.to_bridge(
+                    f"Wallet monitoring is failing for {wallet['address']}. "
+                    "Deposits may not be detected. Please check."
+                )
+            return
+
+        self._failures.pop(wallet_id, None)
+
+        for tr in transfers:
+            if not tr["tx_hash"] or tr["amount"] <= 0:
+                continue
+            await self._handle_deposit(wallet, tr)
+
+        if transfers:
+            await self.repo.set_monitor_cursor(
+                wallet_id, max(t["timestamp_ms"] for t in transfers)
+            )
+
+    async def _handle_deposit(self, wallet, transfer: dict) -> None:
+        deposit_id = await self.repo.record_deposit(
+            tx_hash=transfer["tx_hash"],
+            wallet_id=wallet["id"],
+            amount_usdt=transfer["amount"],
+            from_address=transfer["from_address"],
+            block_number=transfer["block"],
+        )
+
+        if deposit_id is None:
+            # Already recorded. Normal after a restart or an overlapping window.
+            return
+
+        log.info(
+            "new deposit %s USDT to wallet %s (tx %s)",
+            transfer["amount"], wallet["id"], transfer["tx_hash"],
+        )
+
+        if not wallet["is_internal"]:
+            # B5: a deposit on a wallet that is not a supplier→client pairing
+            # has no trade to attach to. Notify and take no further action.
+            await self.notifier.to_bridge(
+                f"Deposit detected on a non-internal wallet\n"
+                f"{transfer['amount']} USDT\n"
+                f"Hash {transfer['tx_hash']}\n"
+                f"No trade was opened."
+            )
+            return
+
+        await self.notifier.on_supplier_deposit(
+            wallet=wallet,
+            deposit_id=deposit_id,
+            amount_usdt=transfer["amount"],
+            tx_hash=transfer["tx_hash"],
+        )

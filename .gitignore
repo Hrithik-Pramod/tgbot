@@ -1,0 +1,29 @@
+# Secrets — never commit
+.env
+
+# Client-confidential material. Kept locally, deliberately not in a public repo:
+# the brief and the returned documents contain bank details, real wallet
+# addresses and margins, and are marked "not for distribution".
+docs/
+
+# Real seed data — real wallet addresses and live rates.
+# db/seed.example.sql is the committed template with synthetic values.
+db/seed.sql
+db/seed.local.sql
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+.pytest_cache/
+
+# Editors / OS
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+
+# Backups
+*.sql.gz
+*.dump
