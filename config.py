@@ -10,7 +10,6 @@ from __future__ import annotations
 
 import os
 from dataclasses import dataclass
-from decimal import Decimal
 
 
 def _req(name: str) -> str:
@@ -59,8 +58,6 @@ class Config:
     # --- Behaviour ----------------------------------------------------------
     # C5: warn when the rate in force for a pairing is older than this.
     rate_staleness_hours: int
-    # E1: tolerance, expressed in USDT and converted at the trade's sell rate.
-    tolerance_usdt: Decimal
 
     @classmethod
     def from_env(cls) -> "Config":
@@ -84,5 +81,4 @@ class Config:
             ),
             poll_interval_seconds=int(_opt("POLL_INTERVAL_SECONDS", "20")),
             rate_staleness_hours=int(_opt("RATE_STALENESS_HOURS", "24")),
-            tolerance_usdt=Decimal(_opt("TOLERANCE_USDT", "1")),
         )

@@ -181,7 +181,6 @@ async def cmd_done(message: Message, party, repo, notifier) -> None:
         payments,
         reference=trade["reference"],
         expected_inr=trade["inr_expected"] or None,
-        sell_rate=trade["sell_rate"],
     )
     total = sum(p.amount_inr for p in payments)
 

@@ -25,7 +25,6 @@ from core.money import (  # noqa: E402
     round_inr,
     round_usdt,
     to_decimal,
-    tolerance_inr,
     usdt_to_inr,
 )
 from core.summary import (  # noqa: E402
@@ -195,55 +194,57 @@ class TestUTR:
         assert normalise_utr("123456789012") == "123456789012"
 
 
-class TestTolerance:
-    def test_tolerance_tracks_the_sell_rate(self):
-        # E1: "less than 1 USDT" converted at the trade's rate.
-        assert tolerance_inr("111") == D("111")
-        assert tolerance_inr("95.5") == D("96")
+class TestTotalCheck:
+    """
+    No tolerance band (client decision, 8 Sep 2026). Exact figures only: any
+    difference at all is reported and the bot never decides a shortfall is
+    acceptable.
+    """
 
     def test_exact_payment(self):
-        r = check_total(REAL_TOTAL, REAL_TOTAL, "111")
-        assert r.exact and r.within_tolerance and r.difference == 0
+        r = check_total(REAL_TOTAL, REAL_TOTAL)
+        assert r.exact and r.difference == 0
 
-    def test_small_shortfall_is_within_tolerance(self):
-        r = check_total(D("1499200"), REAL_TOTAL, "111")
+    def test_one_rupee_short_is_still_reported(self):
+        # Under the old tolerance rule this was absorbed silently. It is not now.
+        r = check_total(REAL_TOTAL - D("1"), REAL_TOTAL)
         assert not r.exact
-        assert r.within_tolerance
+        assert r.difference == D("-1")
+
+    def test_shortfall(self):
+        r = check_total(D("1499200"), REAL_TOTAL)
         assert r.difference == D("-97")
 
-    def test_large_shortfall_is_outside_tolerance(self):
-        r = check_total(D("1499000"), REAL_TOTAL, "111")
-        assert not r.within_tolerance
-        assert r.difference == D("-297")
-
-    def test_overpayment_detected(self):
-        r = check_total(D("1499397"), REAL_TOTAL, "111")
+    def test_overpayment(self):
+        r = check_total(D("1499397"), REAL_TOTAL)
         assert r.difference == D("100")
-        assert r.within_tolerance
 
 
 class TestSummaryReconciliation:
-    def test_shortfall_is_flagged_in_the_summary(self):
+    def test_shortfall_is_stated_plainly(self):
         payments = [Payment(u, a, b) for u, a, b in REAL_TRADE[:5]]
         out = render_trade_summary(
-            payments,
-            expected_inr=REAL_TOTAL,
-            sell_rate=D("111"),
-            include_header=False,
-        )
-        assert "Short by ₹240,297" in out
-        assert "OUTSIDE tolerance" in out
+            payments, expected_inr=REAL_TOTAL, include_header=False)
+        assert "Short by ₹240,297 against expected ₹1,499,297" in out
+        assert "tolerance" not in out.lower()
 
-    def test_within_tolerance_note(self):
-        payments = [Payment("UTR12345678", D("1499200"), "Alpha Traders")]
+    def test_overpayment_is_stated_plainly(self):
+        payments = [Payment("UTR12345678", D("1499397"), "Alpha Traders")]
         out = render_trade_summary(
-            payments,
-            expected_inr=REAL_TOTAL,
-            sell_rate=D("111"),
-            include_header=False,
-        )
-        assert "Within tolerance" in out
-        assert "carry to the next round" in out
+            payments, expected_inr=REAL_TOTAL, include_header=False)
+        assert "Over by ₹100" in out
+
+    def test_exact_total_adds_no_note(self):
+        payments = [Payment(u, a, b) for u, a, b in REAL_TRADE]
+        out = render_trade_summary(
+            payments, expected_inr=REAL_TOTAL, include_header=False)
+        assert "Short by" not in out and "Over by" not in out
+
+    def test_a_single_rupee_short_is_still_shown(self):
+        payments = [Payment("UTR12345678", REAL_TOTAL - D("1"), "Alpha Traders")]
+        out = render_trade_summary(
+            payments, expected_inr=REAL_TOTAL, include_header=False)
+        assert "Short by ₹1" in out
 
     def test_reference_header(self):
         payments = [Payment(u, a, b) for u, a, b in REAL_TRADE]
@@ -278,3 +279,56 @@ class TestGuards:
             usdt_to_inr("0", "100")
         with pytest.raises(MoneyError):
             inr_to_usdt("-1", "111")
+
+
+class TestDepositNotificationHeader:
+    """
+    Client request, 8 September 2026: the header must name the supplier and the
+    internal wallet address, "to ensure no manual errors my side".
+    """
+
+    def _render(self, **kw):
+        from core.summary import render_deposit_notification
+        base = dict(
+            reference="SUPA1", supplier_label="Supplier A",
+            client_label="Client A", usdt_in=D("1000"),
+            inr_out=D("105500"), tx_hash="3f2a91c4e8b7d05a",
+            wallet_address="TFLEpkCtXFSCYCvzqgtUENDaSUKcFUX2zb",
+        )
+        base.update(kw)
+        return render_deposit_notification(**base)
+
+    def test_supplier_is_named_on_the_first_line(self):
+        first = self._render().splitlines()[0]
+        assert "SUPPLIER A" in first
+        assert "SUPA1" in first
+
+    def test_wallet_address_appears_in_the_header(self):
+        lines = self._render().splitlines()
+        assert lines[1] == "Internal wallet TFLEpkCtXFSCYCvzqgtUENDaSUKcFUX2zb"
+
+    def test_address_is_never_truncated(self):
+        """
+        Abbreviating defeats the purpose: two different addresses can share
+        their first and last characters.
+        """
+        out = self._render()
+        assert "TFLEpkCtXFSCYCvzqgtUENDaSUKcFUX2zb" in out
+        assert "…" not in out and "..." not in out
+
+    def test_supplier_b_header_is_distinct(self):
+        a = self._render(supplier_label="Supplier A")
+        b = self._render(supplier_label="Supplier B",
+                         wallet_address="TJJb8jUTcrdtq57YrAcyEWhTkECd6dbRbo")
+        assert a.splitlines()[0] != b.splitlines()[0]
+        assert a.splitlines()[1] != b.splitlines()[1]
+
+    def test_amounts_and_hash_still_present(self):
+        out = self._render()
+        assert "USDT = 1,000.00 to Send INR 105,500" in out
+        assert "Hash 3f2a91c4e8b7d05a" in out
+
+    def test_works_without_an_address(self):
+        out = self._render(wallet_address=None)
+        assert "Internal wallet" not in out
+        assert "SUPPLIER A" in out

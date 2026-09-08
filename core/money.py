@@ -120,48 +120,29 @@ def margin_usdt(usdt_in, supply_rate, sell_rate) -> Decimal:
 
 
 # --------------------------------------------------------------------------
-# Tolerance (answer E1)
+# Reconciliation
 # --------------------------------------------------------------------------
-
-TOLERANCE_USDT = Decimal("1")
-
-
-def tolerance_inr(sell_rate) -> Decimal:
-    """
-    The client set the tolerance at "less than 1 USDT", but payments arrive in
-    INR. Convert at the trade's sell rate so the threshold means the same thing
-    in the currency actually being compared.
-
-    NOTE: open question 1 - confirm the tolerance should track the sell rate
-    rather than being a fixed rupee figure.
-    """
-    return round_inr(TOLERANCE_USDT * to_decimal(sell_rate))
+#
+# There is deliberately no tolerance band. The client asked for exact figures
+# rounded to 2 decimal places and nothing else (8 September 2026): a trade is
+# never "close enough", and the bot never decides that a shortfall is
+# acceptable. It reports the difference and leaves the judgement to the Bridge.
 
 
-class ToleranceCheck(NamedTuple):
-    within_tolerance: bool
+class TotalCheck(NamedTuple):
     exact: bool
     difference: Decimal      # positive = overpaid, negative = short
-    tolerance: Decimal
 
 
-def check_total(paid_inr, expected_inr, sell_rate) -> ToleranceCheck:
+def check_total(paid_inr, expected_inr) -> TotalCheck:
     """
     Compare what the client actually paid against what was expected.
 
-    Per E1 the trade is allowed to close inside tolerance, but the Bridge is
-    always notified of any shortfall so it can be carried to the next round.
+    Reports only. Any difference at all is surfaced — there is no threshold
+    below which a discrepancy is hidden.
     """
-    paid = round_inr(paid_inr)
-    expected = round_inr(expected_inr)
-    diff = paid - expected
-    tol = tolerance_inr(sell_rate)
-    return ToleranceCheck(
-        within_tolerance=abs(diff) <= tol,
-        exact=diff == 0,
-        difference=diff,
-        tolerance=tol,
-    )
+    diff = round_inr(paid_inr) - round_inr(expected_inr)
+    return TotalCheck(exact=diff == 0, difference=diff)
 
 
 # --------------------------------------------------------------------------

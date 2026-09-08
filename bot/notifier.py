@@ -183,6 +183,7 @@ class Notifier:
                 usdt_in=amount_usdt,
                 inr_out=inr_expected,
                 tx_hash=tx_hash,
+                wallet_address=wallet["address"],
             )
             + stale_note,
             reply_markup=confirm_keyboard(trade_id),

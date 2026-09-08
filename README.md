@@ -199,7 +199,7 @@ rounded parts is not the rounding of a sum.
 | Partial deposits | Accumulate against one open trade |
 | Deal reference | `SUPA1` — continuous per supplier, never resets |
 | Duplicate UTR | Rejected, client told |
-| Tolerance | 1 USDT, converted at the trade's sell rate |
+| Tolerance | None — exact figures only; any difference is reported, never absorbed |
 | Number format | Western grouping |
 | Identities | Labels only between counterparties |
 | KYC | Handled outside the bot |

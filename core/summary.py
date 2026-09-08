@@ -71,7 +71,6 @@ def render_trade_summary(
     *,
     reference: str | None = None,
     expected_inr: Decimal | None = None,
-    sell_rate: Decimal | None = None,
     include_header: bool = True,
 ) -> str:
     """
@@ -80,8 +79,8 @@ def render_trade_summary(
     Goes to the client, the Bridge, and the relevant supplier (brief, Step 6).
 
     Each payment renders as three lines - UTR, plain amount, beneficiary - then
-    the arithmetic line closes it. If the expected total and sell rate are
-    supplied, a reconciliation note is appended when the figures do not match.
+    the arithmetic line closes it. If the expected total is supplied, a plain
+    statement of the difference is appended when the figures do not match.
     """
     if not payments:
         raise ValueError("cannot render a summary with no payments")
@@ -102,30 +101,18 @@ def render_trade_summary(
 
     total = round_inr(sum(p.amount_inr for p in payments))
 
-    if expected_inr is not None and sell_rate is not None:
-        result = check_total(total, expected_inr, sell_rate)
+    if expected_inr is not None:
+        result = check_total(total, expected_inr)
         if not result.exact:
+            # Reported, never judged. There is no tolerance band: the client
+            # asked for exact figures, so any difference at all is shown and
+            # the decision is the Bridge's.
             lines.append("")
-            if result.difference < 0:
-                lines.append(
-                    f"Short by ₹{fmt_inr(abs(result.difference))} "
-                    f"against expected ₹{fmt_inr(expected_inr)}"
-                )
-            else:
-                lines.append(
-                    f"Over by ₹{fmt_inr(result.difference)} "
-                    f"against expected ₹{fmt_inr(expected_inr)}"
-                )
-            if result.within_tolerance:
-                lines.append(
-                    f"Within tolerance (₹{fmt_inr(result.tolerance)}) — "
-                    "carry to the next round."
-                )
-            else:
-                lines.append(
-                    f"OUTSIDE tolerance (₹{fmt_inr(result.tolerance)}) — "
-                    "please check before closing."
-                )
+            direction = "Short by" if result.difference < 0 else "Over by"
+            lines.append(
+                f"{direction} ₹{fmt_inr(abs(result.difference))} "
+                f"against expected ₹{fmt_inr(expected_inr)}"
+            )
 
     return "\n".join(lines)
 
@@ -146,14 +133,27 @@ def render_deposit_notification(
     usdt_in: Decimal,
     inr_out: Decimal,
     tx_hash: str,
+    wallet_address: str | None = None,
 ) -> str:
     """
     Sent to the Bridge channel when a supplier deposit is detected on-chain.
-    Follows the layout in the original brief.
+
+    The header names the supplier and the internal wallet that received the
+    funds (client request, 8 September 2026: "at header must state Supplier A
+    and Supplier B when notifying me with Internal wallet address, to ensure no
+    manual errors my side").
+
+    The address is printed in full, never truncated. The whole point is that the
+    Bridge can compare it against the wallet they are about to act on, and an
+    abbreviated address defeats that — the first and last characters of two
+    different addresses can easily match.
     """
-    return (
-        f"Transaction {reference}\n"
-        f"Incoming deposit from {supplier_label} to {client_label}\n"
+    header = [f"{supplier_label.upper()}  ·  Transaction {reference}"]
+    if wallet_address:
+        header.append(f"Internal wallet {wallet_address}")
+
+    return "\n".join(header) + (
+        f"\n\nIncoming deposit from {supplier_label} to {client_label}\n"
         f"USDT = {fmt_usdt(usdt_in)} to Send INR {fmt_inr(inr_out)}\n"
         f"Hash {tx_hash}"
     )
