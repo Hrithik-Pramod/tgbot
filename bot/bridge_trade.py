@@ -286,13 +286,16 @@ async def confirm_final(call: CallbackQuery, state: FSMContext, party, repo, not
         for a, m in slots
     ]
 
+    # html=True so the USDT figure and the account number are tap-to-copy in
+    # Telegram (client request, 8 Sep 2026).
     client_text = render_client_confirmation(
         client_label=trade["client_label"],
         usdt_out=trade["usdt_owed_client"],
         inr_amount=sum(m for _, m in slots),
         slots=slot_objs,
+        html=True,
     )
-    await notifier.to_party(trade["client_id"], client_text)
+    await notifier.to_party(trade["client_id"], client_text, html=True)
     await state.clear()
 
     await call.message.edit_text(

@@ -52,7 +52,13 @@ AMBIGUOUS_DIGIT_LEN = 12
 # "." is a separator so "Rs." and "Amt." are consumed with the label.
 _LBL_UTR = re.compile(r"^\s*(?:utr|rrn|ref(?:erence)?|txn|transaction)(?![a-z])[:\-–.\s]*", re.I)
 _LBL_AMT = re.compile(r"^\s*(?:amount|amt|rs|inr|₹)(?![a-z])[:\-–.\s]*", re.I)
-_LBL_BEN = re.compile(r"^\s*(?:to|acc(?:ount)?|beneficiary|benef)(?![a-z])[:\-–.\s]*", re.I)
+# "Acc name - Ekta traders" is the client's agreed format (8 Sep 2026), so the
+# optional " name" has to be consumed with the label — otherwise the
+# beneficiary comes out as "name - Ekta traders".
+_LBL_BEN = re.compile(
+    r"^\s*(?:to|acc(?:ount)?(?:\s+name)?|beneficiary|benef|name)(?![a-z])[:\-–.\s]*",
+    re.I,
+)
 
 # Lines that carry no payment data. Pasting alongside a screenshot brings the
 # surrounding chrome with it.

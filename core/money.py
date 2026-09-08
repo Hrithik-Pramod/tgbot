@@ -192,6 +192,18 @@ def fmt_usdt(value) -> str:
     return f"{round_usdt(value):,.2f}"
 
 
+def fmt_usdt_plain(value) -> str:
+    """
+    Format USDT to 2 dp with no separators at all.
+
+    Used for the figure the Bridge sends to the client (client request,
+    8 Sep 2026: "on amount to send to client in USDT, i dont want any commas").
+    That number gets pasted straight into a wallet, and a comma in a wallet's
+    amount field is at best rejected and at worst silently truncated.
+    """
+    return f"{round_usdt(value):.2f}"
+
+
 def fmt_inr_plain(value) -> str:
     """
     Format INR with no separators.

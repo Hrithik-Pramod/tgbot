@@ -247,3 +247,63 @@ class TestAccountMatching:
         account, so the caller is made to ask.
         """
         assert match_account("Traders", self.ACCOUNTS) is None
+
+
+class TestAgreedLabelledFormat:
+    """
+    The format the client and their team agreed on, 8 September 2026:
+
+        UTR XXXXXXXXXX
+        Amount 250000
+        Acc name - Ekta traders
+
+    "can be in any order but labels are there so bot picks up"
+    """
+
+    AGREED = f"UTR {UTR}\nAmount 250000\nAcc name - Ekta traders"
+
+    def test_the_agreed_format(self):
+        r = parse_payments(self.AGREED)
+        assert r.ok, r.problems
+        p = r.payments[0]
+        assert p.utr == UTR
+        assert p.amount_inr == D("250000")
+        assert p.beneficiary == "Ekta traders"
+
+    @pytest.mark.parametrize("order", [
+        (0, 1, 2), (0, 2, 1), (1, 0, 2), (1, 2, 0), (2, 0, 1), (2, 1, 0),
+    ])
+    def test_any_order(self, order):
+        lines = self.AGREED.splitlines()
+        r = parse_payments("\n".join(lines[i] for i in order))
+        assert r.ok, r.problems
+        assert r.payments[0].utr == UTR
+        assert r.payments[0].amount_inr == D("250000")
+        assert r.payments[0].beneficiary == "Ekta traders"
+
+    @pytest.mark.parametrize("line,expected", [
+        ("Acc name - Ekta traders", "Ekta traders"),
+        ("Account name - Ekta traders", "Ekta traders"),
+        ("Acc name: Ekta traders", "Ekta traders"),
+        ("Acc - Ekta traders", "Ekta traders"),
+        ("Account - Ekta traders", "Ekta traders"),
+        ("Name - Ekta traders", "Ekta traders"),
+        ("to Ekta traders", "Ekta traders"),
+    ])
+    def test_beneficiary_label_variants(self, line, expected):
+        """
+        "Acc name -" has to be consumed whole. A naive label rule stops at
+        "Acc" and leaves the beneficiary as "name - Ekta traders".
+        """
+        r = parse_payments(f"{UTR}\n250000\n{line}")
+        assert r.ok, r.problems
+        assert r.payments[0].beneficiary == expected
+
+    def test_amount_label_is_not_swallowed_by_the_account_rule(self):
+        # "Amount" must not be read as an account label.
+        assert classify("Amount 250000") == ("amount", "250000")
+
+    def test_labels_survive_spaces_in_the_amount(self):
+        r = parse_payments(f"UTR {UTR}\nAmount 250 000\nAcc name - Ekta traders")
+        assert r.ok, r.problems
+        assert r.payments[0].amount_inr == D("250000")

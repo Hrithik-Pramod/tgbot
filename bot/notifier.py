@@ -41,7 +41,7 @@ class Notifier:
             # where losing the deposit is not.
             log.exception("failed to notify bridge channel")
 
-    async def to_party(self, party_id: int, text: str) -> None:
+    async def to_party(self, party_id: int, text: str, *, html: bool = False) -> None:
         async with self.repo.pool.acquire() as conn:
             row = await conn.fetchrow(
                 """
@@ -57,7 +57,9 @@ class Notifier:
         bot = self.supplier_bot if row["role"] == "supplier" else self.client_bot
         chat_id = row["telegram_chat_id"]
         try:
-            await bot.send_message(chat_id, text)
+            await bot.send_message(
+                chat_id, text, parse_mode="HTML" if html else None
+            )
         except Exception:
             log.exception("failed to notify party %s", party_id)
 

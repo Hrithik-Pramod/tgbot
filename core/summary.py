@@ -21,12 +21,15 @@ from dataclasses import dataclass
 from decimal import Decimal
 from typing import Sequence
 
+from html import escape as html_escape
+
 from .money import (
     build_sum_line,
     check_total,
     fmt_inr,
     fmt_inr_plain,
     fmt_usdt,
+    fmt_usdt_plain,
     round_inr,
 )
 
@@ -53,15 +56,21 @@ class PaymentSlot:
     amount_inr: Decimal
 
 
-def render_payment_slot(slot: PaymentSlot) -> str:
+def render_payment_slot(slot: PaymentSlot, *, html: bool = False) -> str:
     """
     The instruction sent to the client, in the exact layout the client specified.
+
+    With html=True the account number is wrapped in <code> so it is tap-to-copy
+    — it is transcribed into a banking app, which is exactly where a mistyped
+    digit costs the most.
     """
+    esc = html_escape if html else (lambda s: s)
+    num = f"<code>{slot.account_number}</code>" if html else slot.account_number
     return (
         "New slot\n"
-        f"Acc num - {slot.account_number}\n"
-        f"Ifsc - {slot.ifsc}\n"
-        f"Acc name - {slot.account_name}\n"
+        f"Acc num - {num}\n"
+        f"Ifsc - {esc(slot.ifsc)}\n"
+        f"Acc name - {esc(slot.account_name)}\n"
         f"{fmt_inr_plain(slot.amount_inr)}"
     )
 
@@ -165,16 +174,35 @@ def render_client_confirmation(
     usdt_out: Decimal,
     inr_amount: Decimal,
     slots: Sequence[PaymentSlot],
+    html: bool = False,
 ) -> str:
     """
     The confirmation the Bridge approves before it is forwarded to the client.
+
+    Two client requests from 8 September 2026 shape this:
+
+      * The USDT figure carries no thousands separators. It is pasted straight
+        into a wallet, and a comma there is at best rejected and at worst
+        silently truncated. INR keeps its separators — that one is read, not
+        pasted.
+
+      * With html=True the USDT figure is wrapped in <code>, which Telegram
+        renders as tap-to-copy. That is the "copy button" — Telegram has no
+        real one, but a code span is one tap and works on mobile and desktop.
+
+    Everything interpolated is escaped, because account names come from user
+    input and an unescaped "&" would break the whole message.
     """
+    esc = html_escape if html else (lambda s: s)
+    usdt = fmt_usdt_plain(usdt_out)
+
     lines = [
-        f"Confirm amount and details to send to {client_label}",
-        f"USDT = {fmt_usdt(usdt_out)} to Send INR {fmt_inr(inr_amount)}",
+        f"Confirm amount and details to send to {esc(client_label)}",
+        f"USDT = {f'<code>{usdt}</code>' if html else usdt}"
+        f" to Send INR {fmt_inr(inr_amount)}",
         "",
     ]
     for slot in slots:
-        lines.append(render_payment_slot(slot))
+        lines.append(render_payment_slot(slot, html=html))
         lines.append("")
     return "\n".join(lines).rstrip()

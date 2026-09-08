@@ -14,12 +14,16 @@ is part of every payment.
 from __future__ import annotations
 
 import logging
+import os
 
 from aiogram import F, Router
 from aiogram.filters import Command
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
-from aiogram.types import CallbackQuery, InlineKeyboardButton, InlineKeyboardMarkup, Message
+from aiogram.types import (
+    CallbackQuery, InlineKeyboardButton, InlineKeyboardMarkup, Message,
+    ReactionTypeEmoji,
+)
 
 from core.money import (
     MoneyError, fmt_inr, fmt_inr_plain, normalise_utr, round_inr, to_decimal,
@@ -29,6 +33,15 @@ from core.summary import Payment, render_completion_notice, render_trade_summary
 
 log = logging.getLogger(__name__)
 router = Router()
+
+# The client asked for the confirmation tap to be removed once the agreed
+# labelled format was in place (8 Sep 2026). Kept as a switch rather than
+# deleted: turning it back on is an env change, not a rebuild, and this is the
+# kind of decision that gets revisited after the first surprise.
+REQUIRE_PASTE_CONFIRMATION = (
+    os.environ.get("REQUIRE_PASTE_CONFIRMATION", "false").strip().lower()
+    in ("1", "true", "yes")
+)
 
 
 class AddPayment(StatesGroup):
@@ -215,7 +228,8 @@ async def on_pasted_payment(message: Message, state: FSMContext, party, repo) ->
     unmatched = [s for s in staged if s["account_id"] is None]
     if unmatched:
         # Never guess an account. A wrong one attributes money to the wrong
-        # place, and the client is right here to be asked.
+        # place, and the client is right here to be asked. This is the one case
+        # that still stops and waits, whatever the confirmation setting.
         await state.set_state(PastedPayment.account)
         kb = InlineKeyboardMarkup(inline_keyboard=[
             [InlineKeyboardButton(text=a["account_name"], callback_data=f"pacct:{a['id']}")]
@@ -225,31 +239,108 @@ async def on_pasted_payment(message: Message, state: FSMContext, party, repo) ->
         await message.answer("\n".join(lines), reply_markup=kb)
         return
 
-    await state.set_state(PastedPayment.confirm)
-    kb = InlineKeyboardMarkup(inline_keyboard=[[
-        InlineKeyboardButton(text="Confirm", callback_data="pyes"),
-        InlineKeyboardButton(text="Cancel", callback_data="pno"),
-    ]])
-    lines.append("Correct?")
-    await message.answer("\n".join(lines), reply_markup=kb)
+    if result.problems:
+        # Something was only partly readable. Never silently drop it.
+        await state.set_state(PastedPayment.confirm)
+        kb = InlineKeyboardMarkup(inline_keyboard=[[
+            InlineKeyboardButton(text="Confirm", callback_data="pyes"),
+            InlineKeyboardButton(text="Cancel", callback_data="pno"),
+        ]])
+        lines.append("Correct?")
+        await message.answer("\n".join(lines), reply_markup=kb)
+        return
+
+    if REQUIRE_PASTE_CONFIRMATION:
+        await state.set_state(PastedPayment.confirm)
+        kb = InlineKeyboardMarkup(inline_keyboard=[[
+            InlineKeyboardButton(text="Confirm", callback_data="pyes"),
+            InlineKeyboardButton(text="Cancel", callback_data="pno"),
+        ]])
+        lines.append("Correct?")
+        await message.answer("\n".join(lines), reply_markup=kb)
+        return
+
+    # Everything read cleanly and every account matched: record it and
+    # acknowledge, no tap required (client decision, 8 Sep 2026).
+    await state.clear()
+    await _record(message, trade["id"], staged, party, repo, acknowledge=True)
+
+
+async def _acknowledge(message: Message) -> None:
+    """
+    Tell the client their message landed.
+
+    A thumbs up on their own message is what the client asked for, and it is
+    better than a reply: it sits against the payment it refers to, so in a busy
+    group there is never any doubt which message was picked up.
+
+    Reactions need Bot API 7.0 and can be disabled by group settings, so a
+    plain "Noted." is the fallback. The rule the client's team is given is
+    "no acknowledgement means it was not picked up", and that rule has to hold
+    even when reactions are unavailable.
+    """
+    try:
+        await message.react([ReactionTypeEmoji(emoji="👍")])
+    except Exception:
+        log.info("reaction unavailable in chat %s, replying instead", message.chat.id)
+        await message.reply("Noted.")
+
+
+async def _record(message, trade_id, staged, party, repo, *, acknowledge: bool) -> None:
+    """Write the staged payments and report anything that was refused."""
+    added, rejected = [], []
+    for s in staged:
+        ok, msg = await repo.add_payment(
+            trade_id=trade_id, utr=s["utr"],
+            amount_inr=to_decimal(s["amount"]),
+            beneficiary_account_id=s["account_id"], added_by=party["id"],
+        )
+        (added if ok else rejected).append(msg)
+
+    if rejected:
+        # A duplicate UTR is never acknowledged silently — the client must know
+        # that one did not go in (E3).
+        total = await repo.trade_paid_total(trade_id)
+        await message.reply(
+            "\n".join([*rejected, f"Recorded {len(added)} of {len(staged)}.",
+                       f"Running total: ₹{fmt_inr(total)}"])
+        )
+        return
+
+    if acknowledge:
+        await _acknowledge(message)
 
 
 @router.callback_query(PastedPayment.account, F.data.startswith("pacct:"))
-async def pasted_pick_account(call: CallbackQuery, state: FSMContext) -> None:
+async def pasted_pick_account(call: CallbackQuery, state: FSMContext, party, repo) -> None:
     account_id = int(call.data.split(":", 1)[1])
     data = await state.get_data()
     staged = [
         {**s, "account_id": s["account_id"] or account_id} for s in data["staged"]
     ]
-    await state.update_data(staged=staged)
-    await state.set_state(PastedPayment.confirm)
+    if REQUIRE_PASTE_CONFIRMATION:
+        await state.update_data(staged=staged)
+        await state.set_state(PastedPayment.confirm)
+        kb = InlineKeyboardMarkup(inline_keyboard=[[
+            InlineKeyboardButton(text="Confirm", callback_data="pyes"),
+            InlineKeyboardButton(text="Cancel", callback_data="pno"),
+        ]])
+        await call.message.edit_text(
+            call.message.text + "\n\nAccount set. Confirm?", reply_markup=kb
+        )
+        await call.answer()
+        return
 
-    kb = InlineKeyboardMarkup(inline_keyboard=[[
-        InlineKeyboardButton(text="Confirm", callback_data="pyes"),
-        InlineKeyboardButton(text="Cancel", callback_data="pno"),
-    ]])
+    # The account was the only open question — answering it is the
+    # confirmation. Do not ask twice.
+    await state.clear()
+    total_before = await repo.trade_paid_total(data["trade_id"])
+    await _record(call.message, data["trade_id"], staged, party, repo,
+                  acknowledge=False)
+    total = await repo.trade_paid_total(data["trade_id"])
     await call.message.edit_text(
-        call.message.text + "\n\nAccount set. Confirm?", reply_markup=kb
+        call.message.text.split("Which account")[0].rstrip()
+        + f"\n\nRecorded. Running total: ₹{fmt_inr(total)}"
     )
     await call.answer()
 
