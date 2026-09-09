@@ -7,12 +7,24 @@
 -- Clears:  every trade, payment, slot, deposit, counter, cursor, and the audit
 --          trail those produced.
 --
+-- STOP THE BOT FIRST. This is not optional.
+--
+--   docker compose stop bot
+--   docker compose exec -T db psql -U settlement -d settlement < deploy/reset-uat.sql
+--   docker compose start bot
+--
+-- Clearing monitor_state under a running bot is a race, and the bot wins. It
+-- re-adopts every wallet within one poll interval and writes fresh cursors
+-- before you can restart it — so a reset intended to apply a fix instead
+-- preserves the behaviour of the version still running. That happened on
+-- 10 September 2026: the reset landed, the old container re-adopted twenty
+-- seconds later, and the new image started up to find the old cursors already
+-- in place and adoption already "done".
+--
 -- Change a wallet ADDRESS with /walletchange rather than SQL. That command
 -- clears the monitoring cursor for the wallet, so the new address is not
 -- scanned from an offset that belonged to the old one. An UPDATE here would
 -- not.
---
---   docker compose exec -T db psql -U settlement -d settlement < deploy/reset-uat.sql
 
 BEGIN;
 
