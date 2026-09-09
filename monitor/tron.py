@@ -54,6 +54,7 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import logging
+import time
 from decimal import Decimal
 from typing import Any, Optional
 
@@ -467,6 +468,43 @@ class DepositMonitor:
             log.info("wallet %s recovered after %s failures", wallet_id, failures)
         self._failures.pop(wallet_id, None)
         self._skips.pop(wallet_id, None)
+
+        # ADOPTION. A wallet with no cursor is one we have only just been told
+        # to watch — newly added, or an address just changed. It is NOT a wallet
+        # whose history we are behind on.
+        #
+        # Without this the first poll has no lower bound, so the provider
+        # returns the most recent transactions that already exist and every one
+        # is treated as a deposit that just landed. On 9 September 2026 that
+        # turned two of the client's live wallets into 38 deposits and a trade
+        # for 188,167 USDT against ₹19,851,619, from transfers dating back to
+        # June. On go-live, with real wallets, it would have done the same in
+        # front of the client.
+        #
+        # So the first pass adopts the wallet at its current state and records
+        # nothing. The cursor is set from the newest transaction the chain
+        # already shows rather than from this server's clock, so it does not
+        # depend on the clock being right.
+        if wallet["last_timestamp_ms"] is None:
+            newest = max((t["timestamp_ms"] for t in transfers), default=0)
+            cursor = newest or int(time.time() * 1000)
+            await self.repo.set_monitor_cursor(wallet_id, cursor)
+
+            log.warning(
+                "adopted wallet %s (%s): %s existing transaction(s) ignored, "
+                "cursor set to %s",
+                wallet_id, wallet["address"], len(transfers), cursor,
+            )
+            # Said out loud, because "the bot ignored what was already there"
+            # is exactly the kind of decision that must not be silent.
+            await self.notifier.to_bridge(
+                f"Now monitoring {wallet['address']}\n\n"
+                + (f"{len(transfers)} existing transaction(s) on this address "
+                   "were ignored. Only new deposits from now on will be picked up."
+                   if transfers else
+                   "No existing transactions. Ready.")
+            )
+            return
 
         for tr in transfers:
             if not tr["tx_hash"] or tr["amount"] <= 0:

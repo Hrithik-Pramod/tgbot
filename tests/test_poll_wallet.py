@@ -60,9 +60,13 @@ class _Notifier:
         self.messages.append(text)
 
 
+# An established wallet: already adopted, carrying a cursor. That is the normal
+# state, so it is the default here. A wallet with last_timestamp_ms None is
+# being seen for the first time and takes the adoption path instead — see
+# TestAdoption.
 WALLET = {"id": 1, "address": "TFLEpkCtXFSCYCvzqgtUENDaSUKcFUX2zb",
           "is_internal": True, "supplier_id": 1, "client_id": 2,
-          "last_timestamp_ms": None}
+          "last_timestamp_ms": 1_699_000_000_000}
 
 
 def transfer(amount, *, tx="a" * 64, ts=1_700_000_000_000):
@@ -134,6 +138,94 @@ class TestDustIsIgnored:
                             transfer("0.00002", tx="f" * 64, ts=1_700_000_500_000)])
         await monitor._poll_wallet(WALLET)
         assert monitor.repo.cursors == {1: 1_700_000_500_000}
+
+
+class TestAdoption:
+    """
+    What happens the first time a wallet is watched.
+
+    This is not a hypothetical. On 9 September 2026 the client supplied two of
+    his live wallets for a test. /walletchange cleared the cursor, the next poll
+    ran with no lower bound, and the provider returned the most recent existing
+    transactions — which the monitor recorded as deposits that had just landed.
+    The result was 38 deposits and one open trade for 188,167 USDT against
+    ₹19,851,619, built from transfers dating back to June.
+
+    A wallet with no cursor has just been handed to us. It is not a wallet we
+    are behind on.
+    """
+
+    ADOPTED = dict(WALLET, last_timestamp_ms=None)
+
+    @pytest.mark.asyncio
+    async def test_existing_history_is_not_recorded(self):
+        monitor, handled = build([
+            transfer("9417", tx="a" * 64, ts=1_786_985_172_000),
+            transfer("9417", tx="b" * 64, ts=1_786_985_173_000),
+            transfer("9417", tx="c" * 64, ts=1_786_985_174_000),
+        ])
+        await monitor._poll_wallet(self.ADOPTED)
+        assert handled == [], "history was ingested as new deposits"
+
+    @pytest.mark.asyncio
+    async def test_the_cursor_is_set_from_the_newest_existing_transaction(self):
+        """
+        Chain time, not the server's clock — so adoption does not depend on the
+        server clock being correct.
+        """
+        monitor, _ = build([
+            transfer("9417", tx="a" * 64, ts=1_786_985_172_000),
+            transfer("9417", tx="b" * 64, ts=1_786_985_174_000),
+        ])
+        await monitor._poll_wallet(self.ADOPTED)
+        assert monitor.repo.cursors == {1: 1_786_985_174_000}
+
+    @pytest.mark.asyncio
+    async def test_an_empty_wallet_still_gets_a_cursor(self):
+        """
+        Otherwise it is adopted again on every single poll, and its real first
+        deposit is skipped as 'history'.
+        """
+        monitor, _ = build([])
+        await monitor._poll_wallet(self.ADOPTED)
+        assert monitor.repo.cursors.get(1, 0) > 1_700_000_000_000
+
+    @pytest.mark.asyncio
+    async def test_the_bridge_is_told_what_was_ignored(self):
+        """Silently discarding transactions is not acceptable, even correctly."""
+        monitor, _ = build([transfer("9417", tx="a" * 64)])
+        await monitor._poll_wallet(self.ADOPTED)
+        assert len(monitor.notifier.messages) == 1
+        msg = monitor.notifier.messages[0]
+        assert "Now monitoring" in msg and "1 existing transaction" in msg
+
+    @pytest.mark.asyncio
+    async def test_adoption_happens_once_not_every_poll(self):
+        """
+        The second poll must behave normally — a real deposit arriving right
+        after adoption has to be picked up.
+        """
+        monitor, handled = build([transfer("9417", tx="a" * 64,
+                                           ts=1_786_985_172_000)])
+        await monitor._poll_wallet(self.ADOPTED)
+        assert handled == []
+
+        # Same wallet, now carrying the cursor adoption gave it.
+        settled = dict(WALLET, last_timestamp_ms=monitor.repo.cursors[1])
+        monitor.client.transfers = [transfer("5000", tx="d" * 64,
+                                             ts=1_786_985_999_000)]
+        await monitor._poll_wallet(settled)
+        assert [t["amount"] for t in handled] == [D("5000")]
+
+    @pytest.mark.asyncio
+    async def test_a_failing_api_does_not_adopt(self):
+        """
+        Adopting on a failed call would set a cursor from no information and
+        skip everything between now and the next success.
+        """
+        monitor, _ = build([], fail=True)
+        await monitor._poll_wallet(self.ADOPTED)
+        assert monitor.repo.cursors == {}
 
 
 class TestOtherRejections:
