@@ -77,7 +77,8 @@ def _matches(magics, text: str) -> bool:
 COMMANDS = [
     "/done", "/done@pt_client_desk_bot", "/accounts", "/add",
     "/account", "/account_remove", "/send", "/setrate", "/wallet",
-    "/walletchange", "/summary", "/start", "/help",
+    "/walletchange", "/summary", "/viewrate", "/progress",
+    "/cancel", "/correct", "/export", "/start", "/help",
 ]
 
 

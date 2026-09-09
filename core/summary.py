@@ -149,6 +149,67 @@ def render_trade_summary(
     return "\n".join(lines)
 
 
+def render_supplier_summary(
+    payments: Sequence[Payment],
+    *,
+    expected_inr: Decimal | None = None,
+) -> str:
+    """
+    The supplier's copy of the closing summary.
+
+    Two differences from everyone else's, both asked for on 10 September 2026:
+
+      * headed TRADE COMPLETED, with no deal reference — "remove the SUPA1 as
+        dont want them to see that";
+      * closed with "Send Next Trade", so the message that tells them this trade
+        is finished is also the one that asks for the next deposit.
+
+    The tranches and the arithmetic are identical to the copy the Bridge and the
+    client receive, so all three still reconcile against the same figures.
+    """
+    return "\n".join([
+        "TRADE COMPLETED",
+        "",
+        render_trade_summary(payments, expected_inr=expected_inr,
+                             include_header=False),
+        "",
+        "Send Next Trade",
+    ])
+
+
+def render_collection_progress(
+    *,
+    expected_inr: Decimal,
+    paid_inr: Decimal,
+) -> str:
+    """
+    Where a trade has got to, for the supplier who is waiting on it.
+
+    Client request, 10 September 2026: "collection progress, can i add this to
+    the suppliers as an option? just another thing they always ask." Giving the
+    supplier a way to ask the bot removes that question from the Bridge's day.
+
+    Deliberately carries no deal reference, no rates, and not even the client's
+    name. The supplier is owed one fact — how much of their INR has landed — and
+    everything else about the trade is between the Bridge and the client.
+    """
+    outstanding = expected_inr - paid_inr
+    if outstanding < 0:
+        outstanding = Decimal(0)
+
+    pct = (paid_inr / expected_inr * 100) if expected_inr else Decimal(0)
+
+    return "\n".join([
+        "Collection progress",
+        "",
+        f"Expected      ₹{fmt_inr(expected_inr)}",
+        f"Collected     ₹{fmt_inr(paid_inr)}",
+        f"Outstanding   ₹{fmt_inr(outstanding)}",
+        "",
+        f"{pct:.0f}% collected",
+    ])
+
+
 def render_completion_notice(total_inr: Decimal) -> str:
     """
     The short confirmation the client asked for, quoting their own wording:

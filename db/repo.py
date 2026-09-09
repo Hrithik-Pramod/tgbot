@@ -391,6 +391,89 @@ class Repo:
                 client_id,
             )
 
+    async def open_trade_for_supplier(self, supplier_id: int) -> Optional[asyncpg.Record]:
+        """
+        Backs the supplier's own progress view (client request, 10 Sep 2026:
+        "collection progress, can i add this to the suppliers as an option?").
+        """
+        async with self.pool.acquire() as conn:
+            return await conn.fetchrow(
+                """
+                SELECT t.*, c.label AS client_label,
+                       COALESCE((SELECT sum(p.amount_inr) FROM payments p
+                                 WHERE p.trade_id = t.id), 0) AS paid_inr
+                FROM trades t
+                JOIN parties c ON c.id = t.client_id
+                WHERE t.supplier_id = $1 AND t.status IN ('open', 'awaiting_payment')
+                ORDER BY t.opened_at DESC
+                LIMIT 1
+                """,
+                supplier_id,
+            )
+
+    async def claim_completion(self, trade_id: int) -> Optional[asyncpg.Record]:
+        """
+        Close a trade the moment its payments cover what was expected.
+
+        Client request, 10 September 2026: "remove /done, have it calculate".
+        Waiting for someone to type a command means the supplier and the Bridge
+        sit unaware of a trade that is, in fact, finished.
+
+        The claim is a single statement for the same reason claim_near_completion
+        is: several pastes can land in the same instant, and each one asks
+        whether the trade is now covered. Only one of them can win, so the
+        summary is distributed exactly once.
+
+        Returns the trade if this caller closed it, None if it was already
+        closed, still short, or has no expected total to compare against.
+        """
+        async with self.pool.acquire() as conn:
+            async with conn.transaction():
+                trade = await conn.fetchrow(
+                    """
+                    UPDATE trades t
+                    SET status = 'completed', completed_at = now()
+                    WHERE t.id = $1
+                      AND t.status = 'awaiting_payment'
+                      AND t.inr_expected IS NOT NULL
+                      AND t.inr_expected > 0
+                      AND COALESCE((SELECT sum(p.amount_inr) FROM payments p
+                                    WHERE p.trade_id = t.id), 0) >= t.inr_expected
+                    RETURNING t.*
+                    """,
+                    trade_id,
+                )
+                if trade is None:
+                    return None
+
+                await self.audit(
+                    conn, actor_party_id=None, action="trade.complete",
+                    entity_type="trade", entity_id=trade_id,
+                    detail={"trigger": "payments covered the expected total"},
+                )
+                return trade
+
+    async def current_rates(self) -> list[asyncpg.Record]:
+        """
+        The rate in force for every pairing, newest per pairing.
+
+        Backs /viewrate — the Bridge asked to be able to see what is set without
+        starting to change it.
+        """
+        async with self.pool.acquire() as conn:
+            return await conn.fetch(
+                """
+                SELECT DISTINCT ON (r.supplier_id, r.client_id)
+                       s.label AS supplier_label, c.label AS client_label,
+                       r.supply_rate, r.sell_rate, r.created_at,
+                       EXTRACT(EPOCH FROM (now() - r.created_at)) / 3600 AS age_hours
+                FROM rates r
+                JOIN parties s ON s.id = r.supplier_id
+                JOIN parties c ON c.id = r.client_id
+                ORDER BY r.supplier_id, r.client_id, r.created_at DESC
+                """
+            )
+
     async def complete_trade(self, trade_id: int, actor_party_id: int) -> None:
         async with self.pool.acquire() as conn:
             async with conn.transaction():

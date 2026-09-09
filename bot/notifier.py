@@ -15,7 +15,10 @@ from aiogram import Bot
 from aiogram.types import LinkPreviewOptions
 
 from core.money import fmt_inr, inr_to_usdt, margin_usdt, usdt_to_inr
-from core.summary import render_deposit_notification
+from core.summary import (
+    Payment, render_completion_notice, render_deposit_notification,
+    render_supplier_summary, render_trade_summary,
+)
 
 log = logging.getLogger(__name__)
 
@@ -105,6 +108,61 @@ class Notifier:
             "prepare the next batch."
         )
         log.info("near-completion notice sent for trade %s", trade["reference"])
+
+    # --------------------------------------------------- automatic completion
+
+    async def check_completion(self, trade_id: int) -> bool:
+        """
+        Close and distribute the moment the payments cover the expected total.
+
+        Client request, 10 September 2026: "yes, remove /done, have it
+        calculate". Until now a trade stayed open until someone typed the
+        command, so a fully paid trade could sit there with the supplier and the
+        Bridge none the wiser.
+
+        /done still exists as the way to close a trade that will never be paid
+        in full — a shortfall the Bridge has decided to accept. This handles the
+        ordinary case, which is every trade that is actually paid.
+
+        Returns True if this call is the one that closed it.
+        """
+        trade = await self.repo.claim_completion(trade_id)
+        if trade is None:
+            return False
+
+        rows = await self.repo.trade_payments(trade_id)
+        if not rows:
+            # Cannot happen — the claim requires payments covering the total —
+            # but a summary with no payments would raise, and this must never
+            # take down the paste that triggered it.
+            log.error("trade %s claimed as complete with no payments",
+                      trade["reference"])
+            return False
+
+        payments = [
+            Payment(utr=r["utr"], amount_inr=r["amount_inr"],
+                    beneficiary_name=r["account_name"])
+            for r in rows
+        ]
+        total = sum(p.amount_inr for p in payments)
+
+        summary = render_trade_summary(
+            payments,
+            reference=trade["reference"],
+            expected_inr=trade["inr_expected"] or None,
+        )
+
+        await self.to_party(trade["client_id"], summary)
+        await self.to_party(trade["client_id"], render_completion_notice(total))
+        await self.to_bridge(summary)
+        await self.to_party(
+            trade["supplier_id"],
+            render_supplier_summary(payments, expected_inr=trade["inr_expected"] or None),
+        )
+
+        log.info("trade %s completed automatically, total %s",
+                 trade["reference"], total)
+        return True
 
     # ------------------------------------------------- deposit → trade flow
 

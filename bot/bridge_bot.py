@@ -174,6 +174,46 @@ async def setrate_cancel(call: CallbackQuery, state: FSMContext) -> None:
     await call.answer()
 
 
+# --------------------------------------------------------------- /viewrate
+
+@router.message(Command("viewrate"))
+async def cmd_viewrate(message: Message, repo) -> None:
+    """
+    Every rate currently in force, without starting to change one.
+
+    Client request, 10 September 2026. /setrate does show the current rate, but
+    only after you have chosen a supplier and a client and are already two taps
+    into changing it — which is no use when the question is simply "what are we
+    on?". Reading and writing should not be the same command.
+    """
+    rates = await repo.current_rates()
+    if not rates:
+        await message.answer("No rates are set yet. Use /setrate.")
+        return
+
+    lines = ["Rates in force", ""]
+    for r in rates:
+        age = float(r["age_hours"])
+        if age < 1:
+            when = f"{age * 60:.0f} minutes ago"
+        elif age < 48:
+            when = f"{age:.0f} hours ago"
+        else:
+            when = f"{age / 24:.0f} days ago"
+
+        # The staleness warning is the same threshold the deposit notice uses,
+        # so the two never disagree about what counts as old.
+        stale = "   ← CHECK THIS" if age > 24 else ""
+
+        lines.append(f"{r['supplier_label']} → {r['client_label']}{stale}")
+        lines.append(f"Buy  {r['supply_rate']}")
+        lines.append(f"Sell {r['sell_rate']}")
+        lines.append(f"Set {when}")
+        lines.append("")
+
+    await message.answer("\n".join(lines).rstrip())
+
+
 # ------------------------------------------------------------------ /wallet
 
 @router.message(Command("wallet"))

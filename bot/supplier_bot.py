@@ -1,5 +1,5 @@
 """
-Supplier bot: /account, /account_remove, /send.
+Supplier bot: /account, /account_remove, /send, /progress.
 
 Telegram command names cannot contain a space, so the brief's "/account remove"
 becomes /account_remove.
@@ -15,6 +15,8 @@ from aiogram.filters import Command
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.types import CallbackQuery, InlineKeyboardButton, InlineKeyboardMarkup, Message
+
+from core.summary import render_collection_progress
 
 log = logging.getLogger(__name__)
 router = Router()
@@ -97,6 +99,41 @@ async def account_ifsc(message: Message, state: FSMContext, party, repo, notifie
 
     # The brief requires the Bridge to be notified of every account change.
     await notifier.to_bridge(f"New account registered by {party['label']}\n\n{detail}")
+
+
+# ---------------------------------------------------------------- /progress
+
+@router.message(Command("progress"))
+async def cmd_progress(message: Message, party, repo) -> None:
+    """
+    How much of the current trade's INR has landed.
+
+    Client request, 10 September 2026: "collection progress, can i add this to
+    the suppliers as an option? just another thing they always ask." Asking the
+    bot costs the Bridge nothing; being asked the same question by every
+    supplier costs them their day.
+
+    Deliberately says nothing about rates, margin or the deal reference — the
+    supplier sees the collection of their own INR and no more (decision D4).
+    """
+    trade = await repo.open_trade_for_supplier(party["id"])
+    if trade is None:
+        await message.answer("You have no trade in progress at the moment.")
+        return
+
+    if not trade["inr_expected"]:
+        # The deposit is in but the Bridge has not issued instructions yet, so
+        # there is no total to measure against.
+        await message.answer(
+            "Your deposit has been received. Payment instructions have not "
+            "been issued yet."
+        )
+        return
+
+    await message.answer(render_collection_progress(
+        expected_inr=trade["inr_expected"],
+        paid_inr=trade["paid_inr"],
+    ))
 
 
 # ---------------------------------------------------------- /account_remove

@@ -29,7 +29,10 @@ from core.money import (
     MoneyError, fmt_inr, fmt_inr_plain, normalise_utr, round_inr, to_decimal,
 )
 from core.parse import match_account, parse_payments
-from core.summary import Payment, render_completion_notice, render_trade_summary
+from core.summary import (
+    Payment, render_completion_notice, render_supplier_summary,
+    render_trade_summary,
+)
 
 log = logging.getLogger(__name__)
 router = Router()
@@ -164,7 +167,11 @@ async def add_account(call: CallbackQuery, state: FSMContext, party, repo,
         await call.answer()
         return
 
-    await notifier.check_near_completion(data["trade_id"])
+    # Completion first. A payment that finishes a trade also drags it under the
+    # near-completion threshold, so asking in the other order tells the supplier
+    # to prepare the next batch and then, immediately, that this one is done.
+    if not await notifier.check_completion(data["trade_id"]):
+        await notifier.check_near_completion(data["trade_id"])
 
     total = await repo.trade_paid_total(data["trade_id"])
     await call.message.edit_text(
@@ -327,13 +334,18 @@ async def _record(message, trade_id, staged, party, repo, *, acknowledge: bool,
             "\n".join([*rejected, f"Recorded {len(added)} of {len(staged)}.",
                        f"Running total: ₹{fmt_inr(total)}"])
         )
-        return
-
-    if notifier is not None:
-        await notifier.check_near_completion(trade_id)
-
-    if acknowledge:
+    elif acknowledge:
+        # Acknowledge first, so the client sees the thumbs up on their own
+        # message before any summary arrives underneath it.
         await _acknowledge(message)
+
+    # Checked even when something was rejected: a paste can carry one duplicate
+    # and one good payment, and that good payment can be the one that finishes
+    # the trade. Returning early here would leave a fully paid trade open.
+    if added and notifier is not None:
+        # Completion first — see the note in add_account.
+        if not await notifier.check_completion(trade_id):
+            await notifier.check_near_completion(trade_id)
 
 
 @router.callback_query(PastedPayment.account, F.data.startswith("pacct:"))
@@ -391,7 +403,11 @@ async def pasted_confirm(call: CallbackQuery, state: FSMContext, party, repo,
     out += [f"  {m}" for m in rejected]          # E3: duplicates named, not hidden
     out.append(f"Running total: ₹{fmt_inr(total)}")
 
-    await notifier.check_near_completion(data["trade_id"])
+    # Completion first. A payment that finishes a trade also drags it under the
+    # near-completion threshold, so asking in the other order tells the supplier
+    # to prepare the next batch and then, immediately, that this one is done.
+    if not await notifier.check_completion(data["trade_id"]):
+        await notifier.check_near_completion(data["trade_id"])
     await call.message.edit_text("\n".join(out))
     await call.answer()
 
@@ -408,9 +424,15 @@ async def pasted_cancel(call: CallbackQuery, state: FSMContext) -> None:
 @router.message(Command("done"))
 async def cmd_done(message: Message, party, repo, notifier) -> None:
     """
-    Close the trade and distribute the summary.
+    Close a trade early, before its payments cover the expected total.
 
-    Goes to the client, the Bridge, and the supplier (brief, Step 6).
+    A trade that IS fully paid now closes itself the moment the last payment
+    lands (client request, 10 September 2026) — nobody has to remember a
+    command, and the supplier is not left waiting on a trade that is finished.
+
+    This remains for the case that automation cannot decide: a trade that will
+    never be paid in full, where the Bridge has accepted the shortfall. The
+    summary states the difference plainly, as it always has.
     """
     trade = await repo.open_trade_for_client(party["id"])
     if trade is None:
@@ -445,20 +467,9 @@ async def cmd_done(message: Message, party, repo, notifier) -> None:
     await message.answer(render_completion_notice(total))
 
     await notifier.to_bridge(summary)
-
-    # The supplier's copy is headed TRADE COMPLETED and carries no deal
-    # reference (client request, 10 September 2026: "notification to supplier
-    # needs header TRADE COMPLETED" and "remove the SUPA1 as dont want them to
-    # see that"). The tranches and the arithmetic are identical, so all three
-    # parties still reconcile against the same figures — only the heading
-    # differs, and the reference is internal to the Bridge.
     await notifier.to_party(
         trade["supplier_id"],
-        "TRADE COMPLETED\n\n" + render_trade_summary(
-            payments,
-            expected_inr=trade["inr_expected"] or None,
-            include_header=False,
-        ),
+        render_supplier_summary(payments, expected_inr=trade["inr_expected"] or None),
     )
 
     log.info(
