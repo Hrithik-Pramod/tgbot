@@ -230,7 +230,7 @@ class Repo:
             return await conn.fetch(
                 """
                 SELECT w.id, w.address, w.is_internal, w.supplier_id, w.client_id,
-                       m.last_timestamp_ms
+                       m.last_timestamp_ms, m.adopted_at_ms
                 FROM wallets w
                 LEFT JOIN monitor_state m ON m.wallet_id = w.id
                 WHERE w.is_monitored
@@ -281,6 +281,32 @@ class Repo:
                     consecutive_errors = 0
                 """,
                 wallet_id, last_timestamp_ms,
+            )
+
+    async def adopt_wallet(
+        self, wallet_id: int, *, cursor_ms: int, adopted_at_ms: int
+    ) -> None:
+        """
+        Record that a wallet has been taken on, and where its history ends.
+
+        Written together in one statement so a wallet can never end up with a
+        cursor but no adoption baseline — that combination would look exactly
+        like an established wallet and let its history back in.
+        """
+        async with self.pool.acquire() as conn:
+            await conn.execute(
+                """
+                INSERT INTO monitor_state (wallet_id, last_timestamp_ms,
+                                           adopted_at_ms, last_polled_at,
+                                           consecutive_errors)
+                VALUES ($1, $2, $3, now(), 0)
+                ON CONFLICT (wallet_id) DO UPDATE
+                SET last_timestamp_ms = EXCLUDED.last_timestamp_ms,
+                    adopted_at_ms = EXCLUDED.adopted_at_ms,
+                    last_polled_at = now(),
+                    consecutive_errors = 0
+                """,
+                wallet_id, cursor_ms, adopted_at_ms,
             )
 
     # ------------------------------------------------------------------ rates

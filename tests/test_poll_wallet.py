@@ -34,9 +34,14 @@ class _Config:
 class _Repo:
     def __init__(self):
         self.cursors = {}
+        self.adopted = {}
 
     async def set_monitor_cursor(self, wallet_id, ts):
         self.cursors[wallet_id] = ts
+
+    async def adopt_wallet(self, wallet_id, *, cursor_ms, adopted_at_ms):
+        self.cursors[wallet_id] = cursor_ms
+        self.adopted[wallet_id] = adopted_at_ms
 
 
 class _Client:
@@ -66,7 +71,7 @@ class _Notifier:
 # TestAdoption.
 WALLET = {"id": 1, "address": "TFLEpkCtXFSCYCvzqgtUENDaSUKcFUX2zb",
           "is_internal": True, "supplier_id": 1, "client_id": 2,
-          "last_timestamp_ms": 1_699_000_000_000}
+          "last_timestamp_ms": 1_699_000_000_000, "adopted_at_ms": None}
 
 
 def transfer(amount, *, tx="a" * 64, ts=1_700_000_000_000):
@@ -256,6 +261,100 @@ class TestAdoption:
         monitor, _ = build([], fail=True)
         await monitor._poll_wallet(self.ADOPTED)
         assert monitor.repo.cursors == {}
+
+
+class TestTheAdoptionBoundaryHolds:
+    """
+    The third and final attempt at this, and the reason the boundary moved out
+    of the provider's query and into our own code.
+
+    Attempt one set the cursor to the newest existing transaction. The overlap
+    rewind walked back past it.
+
+    Attempt two offset the cursor by OVERLAP_MS + 1, so the query would start
+    one millisecond after that transaction. It still came back — TronScan
+    truncates start_timestamp to whole seconds, verified live: asking from
+    1787667471001 returns the transaction at 1787667471000.
+
+    So the boundary cannot live in the request. These tests simulate a provider
+    that ignores the filter entirely, which is the honest worst case, and
+    require that nothing pre-adoption is ever treated as a deposit.
+    """
+
+    HISTORY_TS = 1_787_667_471_000
+
+    def _settled_after_adoption(self, monitor):
+        """The wallet as the next poll will load it from the database."""
+        return dict(
+            WALLET,
+            last_timestamp_ms=monitor.repo.cursors[1],
+            adopted_at_ms=monitor.repo.adopted[1],
+        )
+
+    @pytest.mark.asyncio
+    async def test_history_stays_out_even_if_the_provider_ignores_the_filter(self):
+        history = transfer("30", tx="2f948c99" + "0" * 56, ts=self.HISTORY_TS)
+        monitor, handled = build([history])
+
+        await monitor._poll_wallet(dict(WALLET, last_timestamp_ms=None))
+        assert handled == []
+
+        # The provider returns it again regardless of what we asked for.
+        for _ in range(5):
+            await monitor._poll_wallet(self._settled_after_adoption(monitor))
+
+        assert handled == [], (
+            "a pre-adoption transaction was recorded as a deposit — this is "
+            "the 30 TRX from 25 August reappearing on 10 September"
+        )
+
+    @pytest.mark.asyncio
+    async def test_a_genuine_deposit_after_adoption_is_still_seen(self):
+        """The boundary must exclude history without excluding the test send."""
+        history = transfer("30", tx="a" * 64, ts=self.HISTORY_TS)
+        monitor, handled = build([history])
+        await monitor._poll_wallet(dict(WALLET, last_timestamp_ms=None))
+
+        real = transfer("10", tx="b" * 64, ts=self.HISTORY_TS + 60_000)
+        monitor.client.transfers = [history, real]
+        await monitor._poll_wallet(self._settled_after_adoption(monitor))
+
+        assert [t["tx_hash"] for t in handled] == ["b" * 64]
+
+    @pytest.mark.asyncio
+    async def test_a_deposit_in_the_same_second_as_the_boundary_is_excluded(self):
+        """
+        Deliberate, and worth stating. A transaction sharing the adoption
+        timestamp is indistinguishable from history, so it is treated as
+        history. Losing it is acceptable; letting history through is not.
+        """
+        history = transfer("30", tx="a" * 64, ts=self.HISTORY_TS)
+        monitor, handled = build([history])
+        await monitor._poll_wallet(dict(WALLET, last_timestamp_ms=None))
+
+        monitor.client.transfers = [transfer("10", tx="b" * 64, ts=self.HISTORY_TS)]
+        await monitor._poll_wallet(self._settled_after_adoption(monitor))
+        assert handled == []
+
+    @pytest.mark.asyncio
+    async def test_the_baseline_survives_a_restart(self):
+        """
+        It is stored, not held in memory. A restart re-reads it from the
+        database, so history cannot creep back in overnight.
+        """
+        monitor, _ = build([transfer("30", tx="a" * 64, ts=self.HISTORY_TS)])
+        await monitor._poll_wallet(dict(WALLET, last_timestamp_ms=None))
+        assert monitor.repo.adopted[1] == self.HISTORY_TS
+
+    @pytest.mark.asyncio
+    async def test_an_established_wallet_is_unaffected(self):
+        """
+        A wallet adopted long ago, with no baseline recorded, must keep working
+        — the column is nullable and old rows predate it.
+        """
+        monitor, handled = build([transfer("5000")])
+        await monitor._poll_wallet(dict(WALLET, adopted_at_ms=None))
+        assert len(handled) == 1
 
 
 class TestOtherRejections:

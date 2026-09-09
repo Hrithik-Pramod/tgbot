@@ -289,7 +289,18 @@ CREATE TABLE monitor_state (
     last_block          BIGINT,
     last_timestamp_ms   BIGINT,
     last_polled_at      TIMESTAMPTZ,
-    consecutive_errors  INT NOT NULL DEFAULT 0
+    consecutive_errors  INT NOT NULL DEFAULT 0,
+
+    -- The moment this wallet was adopted: the timestamp of the newest
+    -- transaction that already existed when we were first told to watch it.
+    -- Anything at or before this is history and is never a deposit.
+    --
+    -- This is enforced in our own code, not by asking the provider to filter.
+    -- TronScan's start_timestamp is truncated to whole seconds, so a boundary
+    -- expressed in milliseconds does not hold: on 10 September 2026 a query
+    -- from ...471001 still returned the transaction at ...471000, and a
+    -- fifteen-day-old transfer was reported as a new deposit twice.
+    adopted_at_ms       BIGINT
 );
 
 COMMIT;

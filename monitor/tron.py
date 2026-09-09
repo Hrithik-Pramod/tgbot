@@ -507,12 +507,21 @@ class DepositMonitor:
             # `newest + 1`, which excludes it. Nothing real is lost — a genuine
             # deposit arrives after adoption, so its timestamp is far beyond
             # `newest`, and the overlap still protects every poll after this one.
+            # The offset is an optimisation — it keeps the provider from
+            # returning history we would only throw away. It is NOT the
+            # guarantee. TronScan truncates start_timestamp to whole seconds,
+            # so a millisecond boundary does not hold, and asking from
+            # ...471001 still returns the transaction at ...471000. The
+            # guarantee is adopted_at_ms, enforced below in our own code.
             if newest:
                 cursor = newest + OVERLAP_MS + 1
             else:
-                cursor = int(time.time() * 1000)
+                newest = int(time.time() * 1000)
+                cursor = newest
 
-            await self.repo.set_monitor_cursor(wallet_id, cursor)
+            await self.repo.adopt_wallet(
+                wallet_id, cursor_ms=cursor, adopted_at_ms=newest
+            )
 
             log.warning(
                 "adopted wallet %s (%s): %s existing transaction(s) ignored, "
@@ -530,8 +539,23 @@ class DepositMonitor:
             )
             return
 
+        # The adoption boundary, enforced here rather than trusted to the
+        # provider's date filter. Everything at or before it existed before we
+        # were asked to watch this wallet, and adoption deliberately recorded
+        # none of it — so there is no database row to absorb a re-read, and the
+        # two-minute overlap would otherwise walk straight back into it on
+        # every single poll.
+        adopted_at = wallet["adopted_at_ms"]
+
         for tr in transfers:
             if not tr["tx_hash"] or tr["amount"] <= 0:
+                continue
+
+            if adopted_at is not None and tr["timestamp_ms"] <= adopted_at:
+                log.debug(
+                    "skipping pre-adoption transaction %s on wallet %s",
+                    tr["tx_hash"], wallet_id,
+                )
                 continue
 
             # Dust. TRON wallets receive unsolicited micro-transfers constantly,
