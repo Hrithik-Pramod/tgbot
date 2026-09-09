@@ -54,6 +54,18 @@ constraint. Nothing is double-counted and nothing in the gap is missed.
 
 ## Common problems
 
+### The bot sees commands but ignores pasted payments
+
+Privacy mode. By default a bot in a group only receives messages beginning with
+`/` or mentioning it, so `/add` works and a pasted payment is never delivered —
+with no error to explain it.
+
+Fix in @BotFather: `/mybots` → the bot → Bot Settings → Group Privacy → Turn
+off. Then **remove the bot from the group and add it again**; the change does
+not apply to existing memberships.
+
+Confirm with `getUpdates` that plain messages now appear.
+
 ### The bot is not responding to commands
 
 Almost always the chat is not registered. Authorisation is by chat: if the group

@@ -17,6 +17,36 @@ ignoring every message, which looks like a fault but isn't.
 
 ---
 
+## 0. Turn OFF privacy mode on the supplier and client bots
+
+**Do this before adding the bots to any group.** By default a Telegram bot in a
+group only sees messages that start with `/` or that mention it by name. Under
+that default the paste parser never sees anything: the client sends a payment,
+the bot receives nothing, and there is no error anywhere to explain it.
+
+In [@BotFather](https://t.me/BotFather):
+
+```
+/mybots  →  choose the bot  →  Bot Settings  →  Group Privacy  →  Turn off
+```
+
+Do it for the **supplier** and **client** bots. The Bridge bot only takes
+commands, so it can keep privacy mode on.
+
+**If a bot is already in a group, remove it and add it again** — the change does
+not apply to existing memberships.
+
+Verify: send a plain message (no slash) in a group and check
+`getUpdates` shows it.
+
+```bash
+curl -s "https://api.telegram.org/bot<CLIENT_TOKEN>/getUpdates" | python3 -m json.tool
+```
+
+If plain messages do not appear, privacy mode is still on.
+
+---
+
 ## 1. Install Docker
 
 ```bash
