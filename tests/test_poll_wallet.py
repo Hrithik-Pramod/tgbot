@@ -20,7 +20,7 @@ import pytest
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from monitor.tron import MAX_BACKOFF_CYCLES, DepositMonitor  # noqa: E402
+from monitor.tron import MAX_BACKOFF_CYCLES, OVERLAP_MS, DepositMonitor  # noqa: E402
 
 D = Decimal
 
@@ -171,14 +171,44 @@ class TestAdoption:
     async def test_the_cursor_is_set_from_the_newest_existing_transaction(self):
         """
         Chain time, not the server's clock — so adoption does not depend on the
-        server clock being correct.
+        server clock being correct — and offset past the overlap rewind.
         """
         monitor, _ = build([
             transfer("9417", tx="a" * 64, ts=1_786_985_172_000),
             transfer("9417", tx="b" * 64, ts=1_786_985_174_000),
         ])
         await monitor._poll_wallet(self.ADOPTED)
-        assert monitor.repo.cursors == {1: 1_786_985_174_000}
+        assert monitor.repo.cursors == {1: 1_786_985_174_000 + OVERLAP_MS + 1}
+
+    @pytest.mark.asyncio
+    async def test_the_overlap_rewind_cannot_reach_back_into_ignored_history(self):
+        """
+        The regression guard for the second half of this bug.
+
+        Adoption ignores history but records nothing, so there is no database
+        row for the UNIQUE constraint to absorb a re-read. Every poll rewinds
+        OVERLAP_MS for boundary safety — which, with the cursor set to `newest`,
+        pulled the newest ignored transaction straight back in. In production
+        that reported a 30 TRX transfer from 25 August as arriving on 10
+        September.
+
+        The test asserts the property that matters — after adoption, the next
+        query starts strictly after the last ignored transaction — rather than
+        the arithmetic that currently achieves it.
+        """
+        newest_ignored = 1_786_985_174_000
+        monitor, handled = build([
+            transfer("9417", tx="a" * 64, ts=1_786_985_172_000),
+            transfer("9417", tx="b" * 64, ts=newest_ignored),
+        ])
+        await monitor._poll_wallet(self.ADOPTED)
+
+        cursor = monitor.repo.cursors[1]
+        next_query_starts_at = cursor - OVERLAP_MS
+        assert next_query_starts_at > newest_ignored, (
+            f"the next poll asks from {next_query_starts_at}, which still "
+            f"includes the ignored transaction at {newest_ignored}"
+        )
 
     @pytest.mark.asyncio
     async def test_an_empty_wallet_still_gets_a_cursor(self):

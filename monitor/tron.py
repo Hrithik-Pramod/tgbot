@@ -487,7 +487,31 @@ class DepositMonitor:
         # depend on the clock being right.
         if wallet["last_timestamp_ms"] is None:
             newest = max((t["timestamp_ms"] for t in transfers), default=0)
-            cursor = newest or int(time.time() * 1000)
+
+            # The + OVERLAP_MS + 1 is not padding, it is the whole point.
+            #
+            # Every poll deliberately rewinds the cursor by OVERLAP_MS, because
+            # block timestamps are not perfectly ordered. During normal running
+            # that is free: anything re-read is absorbed by the UNIQUE
+            # (tx_hash, wallet_id) constraint. Adoption is the one case where it
+            # is not free, because adopted transactions are deliberately NOT
+            # recorded — there is no row for the constraint to collide with.
+            #
+            # So a cursor set to `newest` is rewound to `newest - OVERLAP_MS` on
+            # the very next poll, and the transaction we just decided to ignore
+            # comes straight back as a new deposit. That happened: a 30 TRX
+            # transfer from 25 August 2026 was reported as arriving on 10
+            # September, fifteen days later.
+            #
+            # Offsetting by the overlap makes the next query start at
+            # `newest + 1`, which excludes it. Nothing real is lost — a genuine
+            # deposit arrives after adoption, so its timestamp is far beyond
+            # `newest`, and the overlap still protects every poll after this one.
+            if newest:
+                cursor = newest + OVERLAP_MS + 1
+            else:
+                cursor = int(time.time() * 1000)
+
             await self.repo.set_monitor_cursor(wallet_id, cursor)
 
             log.warning(
