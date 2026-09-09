@@ -179,10 +179,17 @@ async def add_account(call: CallbackQuery, state: FSMContext, party, repo,
 # order and formatting they happen to use (client note, 8 Sep 2026). Rather
 # than asking them to change how they work, the bot reads what they send.
 #
-# Registered last so it only sees messages no command or FSM state claimed.
+# Registered last so it only sees messages no FSM state claimed.
+#
+# The `~F.text.startswith("/")` is not cosmetic. aiogram tries handlers in
+# registration order, so a bare F.text catch-all swallows every command
+# registered below it — /done was defined after this handler and never ran, and
+# because "/done" contains no digit the catch-all returned in silence. Filtering
+# commands out here makes the order irrelevant, so the next command added to
+# this file cannot be broken the same way. See tests/test_handler_order.py.
 
 
-@router.message(F.text)
+@router.message(F.text, ~F.text.startswith("/"))
 async def on_pasted_payment(message: Message, state: FSMContext, party, repo,
                             notifier) -> None:
     if await state.get_state() is not None:
