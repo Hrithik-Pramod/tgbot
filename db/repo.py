@@ -230,6 +230,7 @@ class Repo:
             return await conn.fetch(
                 """
                 SELECT w.id, w.address, w.is_internal, w.supplier_id, w.client_id,
+                       w.owner_party_id,
                        m.last_timestamp_ms, m.adopted_at_ms
                 FROM wallets w
                 LEFT JOIN monitor_state m ON m.wallet_id = w.id

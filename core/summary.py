@@ -34,6 +34,29 @@ from .money import (
 )
 
 
+TRONSCAN_TX = "https://tronscan.org/#/transaction/"
+
+
+def tx_link(tx_hash: str, *, html: bool = False) -> str:
+    """
+    A transaction hash, clickable where the surface allows it.
+
+    Client request, 10 September 2026: "can this have the tronscan clickable
+    hash, not just hash alone?" — the hash is checked against the explorer every
+    time, and copying 64 characters out of a chat window is the step where it
+    goes wrong.
+
+    The full hash stays visible as the link text rather than being replaced by
+    a word. Two different transactions can share a prefix, so anyone comparing
+    against their own records needs to see the whole thing, not a label.
+    """
+    if not tx_hash:
+        return ""
+    if not html:
+        return tx_hash
+    return f'<a href="{TRONSCAN_TX}{html_escape(tx_hash, quote=True)}">{html_escape(tx_hash)}</a>'
+
+
 @dataclass(frozen=True)
 class Payment:
     """One INR tranche logged by the client via /add."""
@@ -143,6 +166,10 @@ def render_deposit_notification(
     inr_out: Decimal,
     tx_hash: str,
     wallet_address: str | None = None,
+    supply_rate: Decimal | None = None,
+    sell_rate: Decimal | None = None,
+    usdt_out: Decimal | None = None,
+    html: bool = False,
 ) -> str:
     """
     Sent to the Bridge channel when a supplier deposit is detected on-chain.
@@ -161,11 +188,80 @@ def render_deposit_notification(
     if wallet_address:
         header.append(f"Internal wallet {wallet_address}")
 
-    return "\n".join(header) + (
-        f"\n\nIncoming deposit from {supplier_label} to {client_label}\n"
-        f"USDT = {fmt_usdt(usdt_in)} to Send INR {fmt_inr(inr_out)}\n"
-        f"Hash {tx_hash}"
+    body = [
+        "",
+        f"Incoming deposit from {supplier_label} to {client_label}",
+        f"USDT = {fmt_usdt(usdt_in)} to Send INR {fmt_inr(inr_out)}",
+    ]
+
+    # Both rates, and the onward obligation, stated here rather than left to be
+    # worked out (client request, 10 September 2026). The Bridge reads this
+    # message and then has to act on it, so everything the action needs is in
+    # it: what came in, at what rate, what goes back out, and at what rate.
+    if supply_rate is not None:
+        body.append(f"Bought at {fmt_usdt_plain(supply_rate)}")
+    if usdt_out is not None:
+        line = f"Send on to {client_label}: {fmt_usdt_plain(usdt_out)} USDT"
+        if sell_rate is not None:
+            line += f" at {fmt_usdt_plain(sell_rate)}"
+        body.append(line)
+
+    body.append(f"Hash {tx_link(tx_hash, html=html)}")
+    return "\n".join(header) + "\n" + "\n".join(body)
+
+
+def render_payout_notice(
+    *,
+    amount: Decimal,
+    tx_hash: str,
+    html: bool = False,
+) -> str:
+    """
+    Sent to the client when funds land on their own wallet.
+
+    Client request, 10 September 2026: "i just sent money onto client account
+    but bot did not notify client of hash?" — the client was being left to
+    notice the arrival themselves, which defeats the point of the bot sitting
+    between the two of them.
+
+    Nothing about the trade is included. This is the fact of the transfer and
+    the evidence for it, addressed to the party whose wallet received it.
+    """
+    return (
+        "Funds received\n"
+        f"USDT = {fmt_usdt_plain(amount)}\n"
+        f"Hash {tx_link(tx_hash, html=html)}"
     )
+
+
+def render_send_instruction(
+    *,
+    client_label: str,
+    usdt_out: Decimal,
+    inr_amount: Decimal,
+    sell_rate: Decimal | None = None,
+    html: bool = False,
+) -> str:
+    """
+    What the Bridge must now do, sent to the Bridge — not to the client.
+
+    "Confirm amount and details to send to Client A" is an instruction to the
+    person doing the sending, so it belongs in their channel. The client gets
+    the payment slots and nothing else, one message each, because their own bot
+    reads those messages and every extra shape is something it has to ignore
+    (client request, 10 September 2026).
+
+    The rate is the one being given to the client — the sell rate — and it is
+    stated because the Bridge is quoting it onward.
+    """
+    usdt = fmt_usdt_plain(usdt_out)
+    line = f"USDT = {f'<code>{usdt}</code>' if html else usdt}"
+    if sell_rate is not None:
+        line += f" at {fmt_usdt_plain(sell_rate)}"
+    line += f" to Send INR {fmt_inr(inr_amount)}"
+
+    esc = html_escape if html else (lambda s: s)
+    return f"Confirm amount and details to send to {esc(client_label)}\n{line}"
 
 
 def render_client_confirmation(

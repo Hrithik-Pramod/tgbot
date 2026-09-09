@@ -35,7 +35,9 @@ from aiogram.types import (
 
 from core.money import MoneyError, fmt_inr, round_inr, to_decimal
 from core.slots import check_new_slot
-from core.summary import PaymentSlot, render_client_confirmation
+from core.summary import (
+    PaymentSlot, render_payment_slot, render_send_instruction,
+)
 
 log = logging.getLogger(__name__)
 router = Router()
@@ -245,13 +247,20 @@ async def _show_final(message, state: FSMContext, repo, *, edit: bool) -> None:
             amount_inr=to_decimal(amount),
         ))
 
+    # Built from the same two renderers the real messages use, so the preview
+    # cannot drift away from what actually gets sent. The separator marks where
+    # one client message ends and the next begins — they go out individually.
     allocated = sum(to_decimal(m) for _, m in data["slots"])
-    preview = render_client_confirmation(
-        client_label=trade["client_label"],
-        usdt_out=trade["usdt_owed_client"],
-        inr_amount=allocated,
-        slots=slot_objs,
-    )
+    preview = "\n\n".join([
+        render_send_instruction(
+            client_label=trade["client_label"],
+            usdt_out=trade["usdt_owed_client"],
+            inr_amount=allocated,
+            sell_rate=trade["sell_rate"],
+        ),
+        f"To {trade['client_label']}, as {len(slot_objs)} separate message(s):",
+        *[render_payment_slot(s) for s in slot_objs],
+    ])
 
     await state.set_state(Confirm.final)
     kb = InlineKeyboardMarkup(inline_keyboard=[[
@@ -286,20 +295,31 @@ async def confirm_final(call: CallbackQuery, state: FSMContext, party, repo, not
         for a, m in slots
     ]
 
-    # html=True so the USDT figure and the account number are tap-to-copy in
-    # Telegram (client request, 8 Sep 2026).
-    client_text = render_client_confirmation(
-        client_label=trade["client_label"],
-        usdt_out=trade["usdt_owed_client"],
-        inr_amount=sum(m for _, m in slots),
-        slots=slot_objs,
-        html=True,
-    )
-    await notifier.to_party(trade["client_id"], client_text, html=True)
+    # One message per slot, nothing else (client request, 10 Sep 2026: "need to
+    # be separate messages to client, or their bot wont pick it up"). The
+    # client's side is automated, so each message it receives should be one
+    # complete instruction it can parse on its own.
+    #
+    # html=True so the account number is tap-to-copy — it gets typed into a
+    # banking app, which is where a wrong digit costs most (client request,
+    # 8 Sep 2026).
+    for slot in slot_objs:
+        await notifier.to_party(
+            trade["client_id"], render_payment_slot(slot, html=True), html=True
+        )
+
     await state.clear()
 
+    # The onward obligation goes to the Bridge, who is the one who has to act
+    # on it, rather than to the client.
     await call.message.edit_text(
-        f"Sent to {trade['client_label']}. Waiting for payment."
+        f"Sent to {trade['client_label']}. Waiting for payment.\n\n"
+        + render_send_instruction(
+            client_label=trade["client_label"],
+            usdt_out=trade["usdt_owed_client"],
+            inr_amount=sum(m for _, m in slots),
+            sell_rate=trade["sell_rate"],
+        )
     )
     await call.answer()
     log.info("trade %s slots issued and sent to client", trade["reference"])

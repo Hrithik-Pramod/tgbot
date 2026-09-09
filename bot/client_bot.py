@@ -189,17 +189,26 @@ async def add_account(call: CallbackQuery, state: FSMContext, party, repo,
 # this file cannot be broken the same way. See tests/test_handler_order.py.
 
 
-@router.message(F.text, ~F.text.startswith("/"))
+@router.message(
+    (F.text & ~F.text.startswith("/")) | (F.caption & ~F.caption.startswith("/"))
+)
 async def on_pasted_payment(message: Message, state: FSMContext, party, repo,
                             notifier) -> None:
     if await state.get_state() is not None:
         return  # mid-conversation; the FSM handlers own this message
 
+    # Clients send a screenshot of the bank confirmation with the details typed
+    # underneath (client question, 10 September 2026). On a photo the details
+    # are in `caption` and `text` is None, so filtering on text alone made the
+    # bot ignore the message entirely — no reaction, no record, and no way for
+    # the sender to tell. The image itself is not needed and is not stored.
+    body = message.text or message.caption or ""
+
     trade = await repo.open_trade_for_client(party["id"])
     if trade is None:
         return  # nothing open — stay quiet rather than nagging on small talk
 
-    result = parse_payments(message.text or "")
+    result = parse_payments(body)
 
     if not result.payments:
         # Almost always ordinary conversation, not a failed paste. Only speak
@@ -435,10 +444,22 @@ async def cmd_done(message: Message, party, repo, notifier) -> None:
     await message.answer(summary)
     await message.answer(render_completion_notice(total))
 
-    # Bridge and supplier receive the same summary, so all three parties are
-    # reconciling against identical text.
     await notifier.to_bridge(summary)
-    await notifier.to_party(trade["supplier_id"], summary)
+
+    # The supplier's copy is headed TRADE COMPLETED and carries no deal
+    # reference (client request, 10 September 2026: "notification to supplier
+    # needs header TRADE COMPLETED" and "remove the SUPA1 as dont want them to
+    # see that"). The tranches and the arithmetic are identical, so all three
+    # parties still reconcile against the same figures — only the heading
+    # differs, and the reference is internal to the Bridge.
+    await notifier.to_party(
+        trade["supplier_id"],
+        "TRADE COMPLETED\n\n" + render_trade_summary(
+            payments,
+            expected_inr=trade["inr_expected"] or None,
+            include_header=False,
+        ),
+    )
 
     log.info(
         "trade %s completed by client %s, total %s",

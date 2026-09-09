@@ -60,6 +60,8 @@ from typing import Any, Optional
 
 import httpx
 
+from core.summary import render_payout_notice, tx_link
+
 log = logging.getLogger(__name__)
 
 # USDT on TRON has 6 decimals. So does TRX (1 TRX = 1,000,000 SUN), so the same
@@ -614,13 +616,33 @@ class DepositMonitor:
 
         if not wallet["is_internal"]:
             # B5: a deposit on a wallet that is not a supplier→client pairing
-            # has no trade to attach to. Notify and take no further action.
+            # has no trade to attach to, so no trade is opened.
+            #
+            # It is still worth telling the owner of that wallet, and this is
+            # the ordinary case rather than an oddity: it is the Bridge sending
+            # the client their USDT. The client was previously left to notice
+            # the arrival on their own (client request, 10 September 2026:
+            # "i just sent money onto client account but bot did not notify
+            # client of hash?").
             await self.notifier.to_bridge(
                 f"Deposit detected on a non-internal wallet\n"
                 f"{transfer['amount']} USDT\n"
-                f"Hash {transfer['tx_hash']}\n"
-                f"No trade was opened."
+                f"Hash {tx_link(transfer['tx_hash'], html=True)}\n"
+                f"No trade was opened.",
+                html=True,
             )
+
+            owner = wallet["owner_party_id"]
+            if owner:
+                await self.notifier.to_party(
+                    owner,
+                    render_payout_notice(
+                        amount=transfer["amount"],
+                        tx_hash=transfer["tx_hash"],
+                        html=True,
+                    ),
+                    html=True,
+                )
             return
 
         await self.notifier.on_supplier_deposit(

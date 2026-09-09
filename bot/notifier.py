@@ -12,6 +12,7 @@ import logging
 from decimal import Decimal
 
 from aiogram import Bot
+from aiogram.types import LinkPreviewOptions
 
 from core.money import fmt_inr, inr_to_usdt, margin_usdt, usdt_to_inr
 from core.summary import render_deposit_notification
@@ -30,10 +31,15 @@ class Notifier:
 
     # ------------------------------------------------------------- delivery
 
-    async def to_bridge(self, text: str, reply_markup=None) -> None:
+    async def to_bridge(self, text: str, reply_markup=None, *,
+                        html: bool = False) -> None:
         try:
             await self.bridge_bot.send_message(
-                self.config.bridge_channel_id, text, reply_markup=reply_markup
+                self.config.bridge_channel_id, text, reply_markup=reply_markup,
+                parse_mode="HTML" if html else None,
+                # Telegram would otherwise render a card for the explorer link
+                # and push the figures off the screen.
+                link_preview_options=LinkPreviewOptions(is_disabled=True),
             )
         except Exception:
             # A failed notification must never take down the caller - the
@@ -58,7 +64,8 @@ class Notifier:
         chat_id = row["telegram_chat_id"]
         try:
             await bot.send_message(
-                chat_id, text, parse_mode="HTML" if html else None
+                chat_id, text, parse_mode="HTML" if html else None,
+                link_preview_options=LinkPreviewOptions(is_disabled=True),
             )
         except Exception:
             log.exception("failed to notify party %s", party_id)
@@ -222,6 +229,12 @@ class Notifier:
                 inr_out=inr_expected,
                 tx_hash=tx_hash,
                 wallet_address=wallet["address"],
+                # Both rates and the onward amount, so the Bridge can act on
+                # this message without looking anything up (client request,
+                # 10 September 2026).
+                supply_rate=trade["supply_rate"] if trade else rate["supply_rate"],
+                sell_rate=sell,
+                usdt_out=usdt_owed,
             )
             + stale_note,
             reply_markup=confirm_keyboard(trade_id),
