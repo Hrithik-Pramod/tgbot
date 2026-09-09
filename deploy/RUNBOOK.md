@@ -112,6 +112,34 @@ A deposit with `status = 'unallocated'` or a null `trade_id` usually means **no
 rate is set** for that supplier/client pairing. The Bridge channel will have
 been told. Fix with `/setrate`.
 
+If the transaction is visible on TronScan but never reached the database at
+all, check whether it was below the dust floor:
+
+```bash
+docker compose logs bot | grep "ignoring dust"
+```
+
+`MIN_DEPOSIT_AMOUNT` in `.env` sets that floor (default 1). Anything smaller is
+skipped deliberately — TRON wallets receive unsolicited micro-transfers
+constantly and each one would otherwise open a trade.
+
+### Proving the monitor can see the chain
+
+A wallet that has received nothing and a monitor that cannot reach the internet
+look identical: no cursor, no deposits, no errors. To tell them apart:
+
+```bash
+docker compose exec bot python deploy/check_monitor.py --probe
+```
+
+`--probe` also queries a known-busy address. If the probe finds transfers and
+your wallets do not, the monitor is healthy and your wallets are simply quiet.
+If neither finds anything, the problem is the server, the API, or
+`MONITOR_ASSET` — and nothing would be detected if funds arrived.
+
+Run it after any `/walletchange` and after changing `MONITOR_ASSET`, since the
+TRX and USDT paths use entirely different endpoints on both providers.
+
 ### Both blockchain APIs are failing
 
 The Bridge channel gets an alert after five consecutive failures. Check by hand:

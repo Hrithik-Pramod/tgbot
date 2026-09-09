@@ -78,7 +78,15 @@ _B58_ALPHABET = "123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz"
 OVERLAP_MS = 120_000  # two minutes
 
 # Back off after repeated failures rather than hammering a rate-limited API.
+# Capped so a wallet that has been failing all night is still retried on a
+# sensible cadence rather than once an hour.
 MAX_BACKOFF_SECONDS = 300
+MAX_BACKOFF_CYCLES = 15
+
+# Consecutive failures before the Bridge is told. Low enough to be useful,
+# high enough that a single rate-limit blip does not raise an alarm — TronScan
+# returns 429 under load and the TronGrid fallback usually absorbs it.
+ESCALATE_AFTER_FAILURES = 5
 
 # A TRON transaction confirms in well under a minute. Anything still
 # unconfirmed after this is worth telling the Bridge about, because they may
@@ -359,7 +367,14 @@ class DepositMonitor:
         self.client = client
         self.notifier = notifier
         self.config = config
+
+        # Consecutive FAILED ATTEMPTS per wallet, and cycles skipped since the
+        # last attempt. Two counters on purpose: one variable serving both
+        # meant the escalation threshold below sat on a count that only ever
+        # advanced while skipping, so it was never reached during an attempt
+        # and the Bridge was never told.
         self._failures: dict[int, int] = {}
+        self._skips: dict[int, int] = {}
 
     async def run_forever(self) -> None:
         log.info("deposit monitor starting")
@@ -415,37 +430,68 @@ class DepositMonitor:
     async def _poll_wallet(self, wallet) -> None:
         wallet_id = wallet["id"]
 
-        # Exponential backoff on a failing wallet so one bad address does not
-        # exhaust the API budget for all the others.
+        # Back off a failing wallet so one bad address does not exhaust the API
+        # budget for the others: skip as many cycles as there have been
+        # consecutive failures, up to the cap.
         failures = self._failures.get(wallet_id, 0)
-        if failures and failures % 3 != 0:
-            self._failures[wallet_id] = failures + 1
-            return
+        if failures:
+            skips = self._skips.get(wallet_id, 0)
+            if skips < min(failures, MAX_BACKOFF_CYCLES):
+                self._skips[wallet_id] = skips + 1
+                return
+            self._skips[wallet_id] = 0
 
         try:
             transfers = await self.client.incoming_transfers(
                 wallet["address"], wallet["last_timestamp_ms"]
             )
         except Exception as exc:
-            self._failures[wallet_id] = failures + 1
+            failures += 1
+            self._failures[wallet_id] = failures
             log.error(
-                "both APIs failed for wallet %s (%s): %s",
-                wallet_id, wallet["address"], exc,
+                "both APIs failed for wallet %s (%s), %s consecutive: %s",
+                wallet_id, wallet["address"], failures, exc,
             )
-            if failures + 1 == 5:
+            # Once when it becomes a real outage rather than a blip, then
+            # periodically — a single message hours ago is easy to miss, and a
+            # wallet that is no longer being polled must not go quiet.
+            if failures == ESCALATE_AFTER_FAILURES or failures % 20 == 0:
                 await self.notifier.to_bridge(
                     f"Wallet monitoring is failing for {wallet['address']}. "
+                    f"{failures} consecutive failures. "
                     "Deposits may not be detected. Please check."
                 )
             return
 
+        if failures:
+            log.info("wallet %s recovered after %s failures", wallet_id, failures)
         self._failures.pop(wallet_id, None)
+        self._skips.pop(wallet_id, None)
 
         for tr in transfers:
             if not tr["tx_hash"] or tr["amount"] <= 0:
                 continue
+
+            # Dust. TRON wallets receive unsolicited micro-transfers constantly,
+            # usually address-poisoning: the sender's address is crafted to look
+            # like one you have used before, hoping it gets copied out of your
+            # history later. They are not deposits. Without this floor each one
+            # opens a trade, burns a reference number, and puts a notification
+            # in front of the Bridge for a fraction of a rupee.
+            #
+            # Skipped quietly and logged rather than announced — announcing it
+            # would simply move the noise from one channel to another.
+            if tr["amount"] < self.config.min_deposit_amount:
+                log.info(
+                    "ignoring dust deposit of %s to wallet %s (tx %s)",
+                    tr["amount"], wallet_id, tr["tx_hash"],
+                )
+                continue
+
             await self._handle_deposit(wallet, tr)
 
+        # The cursor advances past dust as well, so ignored transfers are not
+        # re-examined on every subsequent poll.
         if transfers:
             await self.repo.set_monitor_cursor(
                 wallet_id, max(t["timestamp_ms"] for t in transfers)

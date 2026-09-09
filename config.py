@@ -70,6 +70,13 @@ class Config:
     # trade falls to this (client request, 8 Sep 2026).
     near_completion_inr: Decimal
 
+    # Ignore deposits below this. TRON wallets attract dust — tiny unsolicited
+    # transfers, often address-poisoning attempts. Without a floor, one of them
+    # opens a trade, consumes a reference number, and puts a notification in
+    # front of the Bridge for a fraction of a rupee. Observed on a live wallet
+    # while testing on 9 September 2026: transfers of 0.00001 and 0.000101.
+    min_deposit_amount: Decimal
+
     @classmethod
     def from_env(cls) -> "Config":
         return cls(
@@ -94,4 +101,5 @@ class Config:
             monitor_asset=_opt("MONITOR_ASSET", "USDT").strip().upper(),
             rate_staleness_hours=int(_opt("RATE_STALENESS_HOURS", "24")),
             near_completion_inr=Decimal(_opt("NEAR_COMPLETION_INR", "300000")),
+            min_deposit_amount=Decimal(_opt("MIN_DEPOSIT_AMOUNT", "1")),
         )
