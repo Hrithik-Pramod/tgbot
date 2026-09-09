@@ -33,6 +33,7 @@ from __future__ import annotations
 import argparse
 import asyncio
 import sys
+from decimal import Decimal
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
@@ -48,7 +49,8 @@ from monitor.tron import TronClient             # noqa: E402
 PROBE_ADDRESS = "TMuA6YqfCeX8EhbfYEg5y7S4DqzSJireY9"
 
 
-async def report(client: TronClient, label: str, address: str) -> bool:
+async def report(client: TronClient, label: str, address: str,
+                 minimum: Decimal) -> bool:
     print(f"\n{label}")
     print(f"  {address}")
     try:
@@ -61,10 +63,17 @@ async def report(client: TronClient, label: str, address: str) -> bool:
         print("  reachable, no incoming transfers found")
         return True
 
-    print(f"  reachable, {len(transfers)} incoming transfer(s), newest last:")
+    # This prints what the API returned, not what the poller would keep. Marking
+    # the difference matters: an unmarked list of dust reads as "the bot is
+    # about to open trades for these", which is the opposite of what happens.
+    dust = sum(1 for t in transfers if t["amount"] < minimum)
+    print(f"  reachable, {len(transfers)} incoming transfer(s)"
+          + (f", {dust} below the {minimum} floor" if dust else "")
+          + ", newest last:")
     for t in transfers[-3:]:
         flag = "confirmed" if t["confirmed"] else "unconfirmed"
-        print(f"    {t['amount']:>16}  {flag:<12} {t['tx_hash']}")
+        note = "  <- dust, would be ignored" if t["amount"] < minimum else ""
+        print(f"    {t['amount']:>16}  {flag:<12} {t['tx_hash']}{note}")
     return True
 
 
@@ -84,13 +93,15 @@ async def main() -> int:
         asset=config.monitor_asset,
     )
 
+    minimum = config.min_deposit_amount
     print(f"MONITOR_ASSET = {client.asset}"
           + ("   <-- TEST SETTING, not for production" if client.asset == "TRX" else ""))
+    print(f"MIN_DEPOSIT_AMOUNT = {minimum}")
 
     ok = True
     try:
         if args.address:
-            ok &= await report(client, "Requested address", args.address)
+            ok &= await report(client, "Requested address", args.address, minimum)
         else:
             repo = await Repo.connect(config.database_url)
             try:
@@ -108,12 +119,12 @@ async def main() -> int:
                     client,
                     f"Wallet {w['id']}"
                     + (f"  (cursor {cursor})" if cursor else "  (no cursor yet)"),
-                    w["address"],
+                    w["address"], minimum,
                 )
 
         if args.probe:
             ok &= await report(client, "Probe — known-busy address, not recorded",
-                               PROBE_ADDRESS)
+                               PROBE_ADDRESS, minimum)
     finally:
         await client.close()
 
