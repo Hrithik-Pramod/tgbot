@@ -75,14 +75,18 @@ async def main() -> None:
         repo=repo, client=tron, notifier=notifier, config=config
     )
 
-    # membership.router is added to the supplier and client bots only - those
-    # are the groups whose membership grants command access.
+    # Membership alerts go on the supplier and client bots only - those are the
+    # groups whose membership grants command access.
+    #
+    # build_router() per dispatcher, never a shared instance: aiogram allows a
+    # router exactly one parent, so reusing one raises "Router is already
+    # attached" on the second include.
     dispatchers = [
         (build_dispatcher([bridge_bot.router, bridge_trade.router],
                           repo, notifier, "bridge", config), bridge),
-        (build_dispatcher([membership.router, supplier_bot.router],
+        (build_dispatcher([membership.build_router(), supplier_bot.router],
                           repo, notifier, "supplier", config), supplier),
-        (build_dispatcher([membership.router, client_bot.router],
+        (build_dispatcher([membership.build_router(), client_bot.router],
                           repo, notifier, "client", config), client),
     ]
 

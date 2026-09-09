@@ -10,7 +10,10 @@ channel. This is the compensating control for chat-based authorisation and it
 costs the Bridge nothing — no approval step, no extra command, just a message
 saying what happened.
 
-Registered as a router on both the supplier and client bots.
+Used by BOTH the supplier and client bots, which is why this module exposes a
+factory rather than a module-level Router. aiogram allows a router exactly one
+parent dispatcher, so a shared singleton raises "Router is already attached"
+on the second include — at startup, not at import.
 """
 
 from __future__ import annotations
@@ -21,64 +24,73 @@ from aiogram import F, Router
 from aiogram.types import Message
 
 log = logging.getLogger(__name__)
-router = Router()
 
 
 def _describe(user) -> str:
-    """A readable identifier for a Telegram user, without assuming they have a username."""
+    """A readable identifier for a Telegram user, without assuming a username."""
     name = " ".join(filter(None, [user.first_name, user.last_name])).strip()
     handle = f"@{user.username}" if user.username else "no username"
     return f"{name or 'Unknown'} ({handle}, id {user.id})"
 
 
-@router.message(F.new_chat_members)
-async def on_join(message: Message, party, notifier) -> None:
+def build_router() -> Router:
     """
-    Someone was added to a registered group.
+    A fresh Router each call.
 
-    They can now use this bot as this party, so the Bridge is told who, and by
-    whom. The bot being added to the group itself is filtered out - that is a
-    setup step, not a membership change worth alarming about.
+    One per dispatcher. Do not cache the result — that reintroduces exactly the
+    single-parent problem this factory exists to avoid.
     """
-    joined = [u for u in (message.new_chat_members or []) if not u.is_bot]
-    if not joined:
-        return
+    router = Router(name="membership")
 
-    added_by = _describe(message.from_user) if message.from_user else "unknown"
-    lines = [
-        f"⚠ New member in {party['label']}'s group",
-        "",
-        "They can now use the bot as this party:",
-    ]
-    lines += [f"  • {_describe(u)}" for u in joined]
-    lines += ["", f"Added by: {added_by}"]
+    @router.message(F.new_chat_members)
+    async def on_join(message: Message, party, notifier) -> None:
+        """
+        Someone was added to a registered group.
 
-    if party["role"] == "supplier":
-        # The consequential case: a supplier group member can register a bank
-        # account that ends up on a payment instruction.
-        lines += [
+        They can now use this bot as this party, so the Bridge is told who, and
+        by whom. The bot being added to the group itself is filtered out — that
+        is a setup step, not a membership change worth alarming about.
+        """
+        joined = [u for u in (message.new_chat_members or []) if not u.is_bot]
+        if not joined:
+            return
+
+        added_by = _describe(message.from_user) if message.from_user else "unknown"
+        lines = [
+            f"⚠ New member in {party['label']}'s group",
             "",
-            "Note: members of a supplier group can add and remove bank "
-            "accounts. Check this is expected.",
+            "They can now use the bot as this party:",
         ]
+        lines += [f"  • {_describe(u)}" for u in joined]
+        lines += ["", f"Added by: {added_by}"]
 
-    await notifier.to_bridge("\n".join(lines))
-    log.warning(
-        "membership: %s user(s) joined %s (chat %s)",
-        len(joined), party["label"], message.chat.id,
-    )
+        if party["role"] == "supplier":
+            # The consequential case: a supplier group member can register a
+            # bank account that ends up on a payment instruction.
+            lines += [
+                "",
+                "Note: members of a supplier group can add and remove bank "
+                "accounts. Check this is expected.",
+            ]
 
+        await notifier.to_bridge("\n".join(lines))
+        log.warning(
+            "membership: %s user(s) joined %s (chat %s)",
+            len(joined), party["label"], message.chat.id,
+        )
 
-@router.message(F.left_chat_member)
-async def on_leave(message: Message, party, notifier) -> None:
-    """Someone left or was removed. Recorded so the picture stays complete."""
-    left = message.left_chat_member
-    if left is None or left.is_bot:
-        return
+    @router.message(F.left_chat_member)
+    async def on_leave(message: Message, party, notifier) -> None:
+        """Someone left or was removed. Recorded so the picture stays complete."""
+        left = message.left_chat_member
+        if left is None or left.is_bot:
+            return
 
-    await notifier.to_bridge(
-        f"Member left {party['label']}'s group\n\n"
-        f"  • {_describe(left)}\n\n"
-        "They can no longer use the bot as this party."
-    )
-    log.info("membership: user left %s (chat %s)", party["label"], message.chat.id)
+        await notifier.to_bridge(
+            f"Member left {party['label']}'s group\n\n"
+            f"  • {_describe(left)}\n\n"
+            "They can no longer use the bot as this party."
+        )
+        log.info("membership: user left %s (chat %s)", party["label"], message.chat.id)
+
+    return router
