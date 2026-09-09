@@ -54,9 +54,11 @@ SELECT ref, sup, cli, wal, rate,
        105.50, 106.50, 5000, 527500, 4953.05, 46.95, 'awaiting_payment'
   FROM ids;
 
+-- The hash is derived from the reference so the script can be run again for
+-- the next trade without colliding with UNIQUE (tx_hash, wallet_id).
 INSERT INTO deposits (tx_hash, wallet_id, trade_id, amount_usdt,
                       from_address, block_number, status, confirmed_at)
-SELECT 'simulated_test_deposit_0001', t.wallet_id, t.id, 5000,
+SELECT 'simulated_deposit_' || t.reference, t.wallet_id, t.id, 5000,
        'TSimulatedSenderAddressForTesting1', 99999999, 'confirmed', now()
   FROM trades t
  WHERE t.reference = (SELECT prefix || last_number FROM supplier_counters
