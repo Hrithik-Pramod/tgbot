@@ -1,8 +1,30 @@
 """
-TRC20 USDT deposit monitor.
+Deposit monitor.
 
-Polls each monitored wallet for incoming USDT transfers, opens or extends the
+Polls each monitored wallet for incoming transfers, opens or extends the
 matching trade, and notifies the Bridge.
+
+WHICH ASSET
+-----------
+Production monitors TRC20 USDT. MONITOR_ASSET=TRX switches the poller to native
+TRX for testing only (client request, 9 September 2026: a USDT transfer burns
+roughly 13-27 TRX in energy, so repeated end-to-end tests get expensive, while a
+TRX transfer costs a fraction of one TRX).
+
+TRX is not a TRC20 token and does not appear on the TRC20 endpoints at all, so
+this is a genuinely different request on both providers — not a filter change.
+What it does and does not prove is worth being precise about:
+
+  proves      polling, the cursor and its rewind, duplicate absorption, trade
+              creation, the arithmetic, and every notification. That is the
+              whole pipeline.
+  leaves out  the TRC20 response parser itself, which is a different function.
+              That one is pinned separately against captured live responses in
+              tests/test_tronscan_contract.py.
+
+So a TRX run is a real end-to-end test of everything except twenty lines of
+parsing that have their own tests. Switch back to USDT before go-live; the
+setting is the only thing that changes.
 
 Design notes, because this is the part that goes wrong in production:
 
@@ -30,6 +52,7 @@ Design notes, because this is the part that goes wrong in production:
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import logging
 from decimal import Decimal
 from typing import Any, Optional
@@ -38,9 +61,18 @@ import httpx
 
 log = logging.getLogger(__name__)
 
-# USDT on TRON has 6 decimals.
+# USDT on TRON has 6 decimals. So does TRX (1 TRX = 1,000,000 SUN), so the same
+# scale serves both — but they are the same number by coincidence, not by rule,
+# which is why the constant is named for the asset and not shared implicitly.
 USDT_DECIMALS = 6
+TRX_DECIMALS = 6
 _SCALE = Decimal(10) ** USDT_DECIMALS
+
+# TronScan marks a native TRX transfer with this token name. Anything else on
+# that endpoint is a TRC10 token, which is not what we are monitoring.
+_TRX_TOKEN_NAME = "_"
+
+_B58_ALPHABET = "123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz"
 
 # Re-scan this far back each poll so boundary transactions are not missed.
 OVERLAP_MS = 120_000  # two minutes
@@ -64,6 +96,33 @@ def units_to_usdt(raw: Any) -> Decimal:
     return Decimal(str(raw)) / _SCALE
 
 
+def hex_to_base58(hex_address: str) -> str:
+    """
+    Convert TRON's hex address form (41...) to the base58check form (T...).
+
+    TronGrid returns raw transactions with hex addresses while every other
+    surface — TronScan, the database, the /wallet listing, the Bridge's own
+    eyes — uses base58. Comparing the two forms directly silently matches
+    nothing, which would look exactly like "no deposits arrived".
+    """
+    raw = bytes.fromhex(hex_address)
+    checksum = hashlib.sha256(hashlib.sha256(raw).digest()).digest()[:4]
+    payload = raw + checksum
+
+    number = int.from_bytes(payload, "big")
+    out = ""
+    while number > 0:
+        number, remainder = divmod(number, 58)
+        out = _B58_ALPHABET[remainder] + out
+    # Leading zero bytes are not representable in the arithmetic above and must
+    # be restored as '1's, one per byte.
+    for byte in payload:
+        if byte != 0:
+            break
+        out = "1" + out
+    return out
+
+
 class TronClient:
     """Thin API client with an automatic fallback."""
 
@@ -74,12 +133,26 @@ class TronClient:
         trongrid_base: str,
         trongrid_key: str,
         usdt_contract: str,
+        asset: str = "USDT",
         timeout: float = 20.0,
     ):
         self.tronscan_base = tronscan_base.rstrip("/")
         self.trongrid_base = trongrid_base.rstrip("/")
         self.trongrid_key = trongrid_key
         self.usdt_contract = usdt_contract
+
+        self.asset = asset.strip().upper()
+        if self.asset not in ("USDT", "TRX"):
+            raise ValueError(
+                f"MONITOR_ASSET must be USDT or TRX, not {asset!r}. "
+                "Refusing to start rather than monitoring the wrong thing."
+            )
+        if self.asset == "TRX":
+            log.warning(
+                "MONITOR_ASSET=TRX — monitoring native TRX, not USDT. "
+                "This is a test setting. Production must be USDT."
+            )
+
         self._client = httpx.AsyncClient(timeout=timeout)
 
     async def close(self) -> None:
@@ -96,11 +169,16 @@ class TronClient:
         would look identical to "no deposits", which would silently hide a
         broken monitor.
         """
+        if self.asset == "TRX":
+            primary, fallback = self._tronscan_trx, self._trongrid_trx
+        else:
+            primary, fallback = self._tronscan, self._trongrid
+
         try:
-            return await self._tronscan(address, since_ms)
+            return await primary(address, since_ms)
         except Exception as exc:
             log.warning("TronScan failed for %s (%s), trying TronGrid", address, exc)
-            return await self._trongrid(address, since_ms)
+            return await fallback(address, since_ms)
 
     async def _tronscan(self, address: str, since_ms: Optional[int]) -> list[dict]:
         params: dict[str, Any] = {
@@ -174,6 +252,102 @@ class TronClient:
                 # will settle it, and guessing "confirmed" here would defeat
                 # the whole point of the second check.
                 "confirmed": False,
+            })
+        out.sort(key=lambda x: x["timestamp_ms"])
+        return out
+
+    # ------------------------------------------------------------- native TRX
+    #
+    # Test mode only. Same output shape as the TRC20 methods above, so nothing
+    # downstream knows or cares which asset is being watched.
+
+    async def _tronscan_trx(self, address: str, since_ms: Optional[int]) -> list[dict]:
+        params: dict[str, Any] = {
+            "address": address,
+            "limit": 50,
+            "start": 0,
+            "sort": "-timestamp",
+        }
+        if since_ms:
+            params["start_timestamp"] = max(0, since_ms - OVERLAP_MS)
+
+        resp = await self._client.get(f"{self.tronscan_base}/transfer", params=params)
+        resp.raise_for_status()
+        payload = resp.json()
+
+        out = []
+        for item in payload.get("data", []):
+            # This endpoint carries TRC10 tokens as well as native TRX. Only
+            # TRX is money here; a TRC10 token with a similar amount would
+            # otherwise open a trade against something worthless.
+            if (item.get("tokenName") or "") != _TRX_TOKEN_NAME:
+                continue
+            if (item.get("transferToAddress") or "").strip() != address:
+                continue
+            if item.get("contractRet") not in (None, "SUCCESS"):
+                continue
+            if item.get("revert"):
+                continue
+            out.append({
+                "tx_hash": item.get("transactionHash"),
+                "from_address": item.get("transferFromAddress"),
+                "amount": units_to_usdt(item.get("amount", 0)),
+                "timestamp_ms": int(item.get("timestamp") or 0),
+                "block": item.get("block"),
+                "confirmed": bool(item.get("confirmed")),
+            })
+        out.sort(key=lambda x: x["timestamp_ms"])
+        return out
+
+    async def _trongrid_trx(self, address: str, since_ms: Optional[int]) -> list[dict]:
+        """
+        The fallback for TRX.
+
+        TronGrid has no native-transfer endpoint, so this reads raw transactions
+        and keeps the TransferContract ones. Addresses come back in hex and are
+        converted before comparison — see hex_to_base58.
+        """
+        headers = {"TRON-PRO-API-KEY": self.trongrid_key} if self.trongrid_key else {}
+        params: dict[str, Any] = {
+            "only_to": "true",
+            "limit": 50,
+            "order_by": "block_timestamp,asc",
+        }
+        if since_ms:
+            params["min_timestamp"] = max(0, since_ms - OVERLAP_MS)
+
+        resp = await self._client.get(
+            f"{self.trongrid_base}/v1/accounts/{address}/transactions",
+            params=params, headers=headers,
+        )
+        resp.raise_for_status()
+        payload = resp.json()
+
+        out = []
+        for item in payload.get("data", []):
+            rets = item.get("ret") or []
+            if rets and rets[0].get("contractRet") not in (None, "SUCCESS"):
+                continue
+
+            contracts = (item.get("raw_data") or {}).get("contract") or []
+            if not contracts or contracts[0].get("type") != "TransferContract":
+                # Staking, delegation, contract calls — everything that is not
+                # someone sending TRX to this address.
+                continue
+
+            value = (contracts[0].get("parameter") or {}).get("value") or {}
+            to_hex = value.get("to_address")
+            if not to_hex or hex_to_base58(to_hex) != address:
+                continue
+
+            from_hex = value.get("owner_address")
+            out.append({
+                "tx_hash": item.get("txID"),
+                "from_address": hex_to_base58(from_hex) if from_hex else None,
+                "amount": units_to_usdt(value.get("amount", 0)),
+                "timestamp_ms": int(item.get("block_timestamp") or 0),
+                "block": item.get("blockNumber"),
+                "confirmed": False,      # same reasoning as the TRC20 fallback
             })
         out.sort(key=lambda x: x["timestamp_ms"])
         return out

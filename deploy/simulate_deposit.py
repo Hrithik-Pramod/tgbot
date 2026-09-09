@@ -93,6 +93,7 @@ async def main() -> int:
         trongrid_base=config.trongrid_api_base,
         trongrid_key=config.trongrid_api_key,
         usdt_contract=config.usdt_contract,
+        asset=config.monitor_asset,
     )
     monitor = DepositMonitor(repo=repo, client=tron, notifier=notifier,
                              config=config)

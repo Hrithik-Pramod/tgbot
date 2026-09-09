@@ -56,6 +56,12 @@ class Config:
     usdt_contract: str
     poll_interval_seconds: int
 
+    # TESTING ONLY. "TRX" switches the monitor to native TRX so end-to-end tests
+    # can be run for a fraction of a TRX instead of the 13-27 TRX of energy a
+    # USDT transfer burns (client request, 9 September 2026). Production is
+    # USDT and this must be USDT before go-live.
+    monitor_asset: str
+
     # --- Behaviour ----------------------------------------------------------
     # C5: warn when the rate in force for a pairing is older than this.
     rate_staleness_hours: int
@@ -85,6 +91,7 @@ class Config:
                 "USDT_CONTRACT", "TR7NHqjeKQxGTCi8q8ZY4pL8otSzgjLj6t"
             ),
             poll_interval_seconds=int(_opt("POLL_INTERVAL_SECONDS", "20")),
+            monitor_asset=_opt("MONITOR_ASSET", "USDT").strip().upper(),
             rate_staleness_hours=int(_opt("RATE_STALENESS_HOURS", "24")),
             near_completion_inr=Decimal(_opt("NEAR_COMPLETION_INR", "300000")),
         )
