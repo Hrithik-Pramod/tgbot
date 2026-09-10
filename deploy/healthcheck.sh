@@ -71,11 +71,23 @@ else
 fi
 
 # The container runs a built image, not the working tree. A pull without a
-# rebuild leaves old code running and looks completely normal.
-if docker compose exec -T bot test -f /app/deploy/healthcheck.sh 2>/dev/null; then
-    ok "image contains the current deploy tools"
+# rebuild leaves old code running and looks entirely normal — which has caught
+# us twice, once with a router fix and once with the poll pacing.
+#
+# Compare the source itself rather than looking for a marker file. Hash the
+# contents only, not the paths, since they differ between the repo and /app.
+HOST_SRC="$(find core bot monitor db main.py config.py -name '*.py' \
+            -exec md5sum {} + 2>/dev/null | awk '{print $1}' | sort | md5sum | cut -d' ' -f1)"
+CONT_SRC="$(docker compose exec -T bot sh -c \
+            "find /app/core /app/bot /app/monitor /app/db /app/main.py /app/config.py -name '*.py' -exec md5sum {} + 2>/dev/null | awk '{print \$1}' | sort | md5sum" \
+            2>/dev/null | cut -d' ' -f1)"
+
+if [ -z "$CONT_SRC" ]; then
+    warn "could not read the container's source to compare"
+elif [ "$HOST_SRC" = "$CONT_SRC" ]; then
+    ok "running image matches the working tree"
 else
-    warn "image may predate the latest build — docker compose build bot"
+    bad "the container is running DIFFERENT code from the repo — docker compose build bot && docker compose up -d bot"
 fi
 
 # ---------------------------------------------------------------- settings
@@ -97,7 +109,17 @@ check_env MIN_DEPOSIT_AMOUNT
 check_env NEAR_COMPLETION_INR
 check_env POLL_INTERVAL_SECONDS
 check_env BRIDGE_CHANNEL_ID
-check_env DATABASE_URL
+
+# DATABASE_URL deliberately does NOT come from .env — docker-compose.yml sets
+# it on the container so that inside the network the host is always "db", and
+# a stale .env cannot point the bot at the wrong database. So check the
+# container's environment, not the file.
+DBURL_IN_CONTAINER="$(docker compose exec -T bot printenv DATABASE_URL 2>/dev/null | tr -d '\r')"
+case "$DBURL_IN_CONTAINER" in
+    postgresql://*@db:*) ok "DATABASE_URL points at the db container" ;;
+    "")                  bad "DATABASE_URL is not set inside the container" ;;
+    *)                   warn "DATABASE_URL is set but not to the db host: ${DBURL_IN_CONTAINER%%:*}..." ;;
+esac
 
 case "$(stat -c%a .env 2>/dev/null)" in
     600|400) ok ".env is not readable by other users" ;;
@@ -163,6 +185,13 @@ if [ "${NORATE:-0}" -eq 0 ]; then
     ok "every pairing has a rate"
 else
     bad "$NORATE pairing(s) with no rate — a deposit there opens no trade"
+    q "SELECT '        needs /setrate: ' || s.label || ' -> ' || c.label
+       FROM wallets w
+       JOIN parties s ON s.id = w.supplier_id
+       JOIN parties c ON c.id = w.client_id
+       WHERE w.is_internal AND NOT EXISTS (
+         SELECT 1 FROM rates r WHERE r.supplier_id = w.supplier_id
+                                 AND r.client_id = w.client_id)"
 fi
 
 STALE="$(q "SELECT count(*) FROM (
