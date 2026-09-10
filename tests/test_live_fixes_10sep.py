@@ -66,15 +66,24 @@ class TestItStopsAnsweringConversation:
         The root cause. Spaces were squashed out before the shape test, so
         "call 9876543210 when done" became "call9876543210whendone" —
         alphanumeric, contains a digit, long enough — and was read as a UTR.
-        A reference is one unbroken token; a sentence is not.
+
+        The fix is not "no spaces allowed": some banking apps paste a UTR with
+        spaces in it. What separates a reference from a sentence is that every
+        chunk of a reference carries digits, and a sentence is mostly words.
         """
         from core.parse import classify
 
-        kind, _ = classify("call 9876543210 when done")
-        assert kind != "utr"
+        for sentence in ("call 9876543210 when done",
+                         "will send 5 lakh by 4pm",
+                         "sending 2 now",
+                         "ok 1 done"):
+            kind, _ = classify(sentence)
+            assert kind != "utr", f"{sentence!r} was read as a bank reference"
 
-        kind, _ = classify("BKIDR12026091000000001")
-        assert kind == "utr", "a real reference must still be recognised"
+        for reference in ("BKIDR12026091000000001",
+                          "BKIDR1 2026 0908 00000380"):
+            kind, _ = classify(reference)
+            assert kind == "utr", f"{reference!r} is a real UTR and must parse"
 
     def test_a_labelled_reference_still_works_with_spaces(self):
         """

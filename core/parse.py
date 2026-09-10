@@ -172,24 +172,31 @@ def classify(line: str) -> tuple[str, str]:
     if re.fullmatch(r"\d[\d.]*", squashed) and squashed.count(".") <= 1:
         return "amount", raw
 
-    # Mixed letters and digits with no internal spaces — a reference.
+    # Mixed letters and digits — a reference.
     #
-    # The whitespace check is the point, and it was missing: `squashed` has
-    # already had its spaces removed, so an ordinary sentence containing a
-    # number collapses into one long alphanumeric run and was being read as a
-    # bank reference. "call 9876543210 when done" became
-    # "call9876543210whendone" — alphanumeric, contains a digit, over eight
-    # characters, therefore a UTR.
+    # `squashed` has already had its spaces removed, so testing it alone reads
+    # any sentence containing a number as one long alphanumeric run:
+    # "call 9876543210 when done" becomes "call9876543210whendone", which is
+    # alphanumeric, contains a digit and is over eight characters. That is why
+    # the bot answered nearly every message in the client's live group on
+    # 10 September 2026.
     #
-    # That is why the bot answered nearly every message in the client's live
-    # group on 10 September 2026. A real reference is a single unbroken token;
-    # a sentence is not. Labelled forms like "UTR: ABC123" never reach here —
-    # they are matched by _LBL_UTR above.
+    # Requiring a single unbroken token fixes that but breaks a real format —
+    # some banking apps paste a UTR with spaces in it, "BKIDR1 2026 0908
+    # 00000380", and that must still be read.
+    #
+    # What separates the two is not the spaces but what sits between them.
+    # Every chunk of a spaced reference carries digits; a sentence is mostly
+    # words. So: one token, or every token contains a digit.
+    tokens = raw.split()
+    every_token_has_a_digit = all(
+        any(c.isdigit() for c in t) for t in tokens
+    )
     if (
-        not re.search(r"\s", raw.strip())
-        and squashed.isalnum()
+        squashed.isalnum()
         and any(c.isdigit() for c in squashed)
         and len(squashed) >= 8
+        and (len(tokens) == 1 or every_token_has_a_digit)
     ):
         return "utr", raw
 
