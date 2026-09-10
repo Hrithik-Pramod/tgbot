@@ -63,6 +63,13 @@ def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(description=__doc__.split("\n")[1])
     p.add_argument("--supplier", default="Supplier A")
     p.add_argument("--client", default="Client A")
+    p.add_argument("--address", default=None,
+                   help="Target one monitored wallet by address instead of "
+                        "resolving the supplier/client pairing. Use this to hit "
+                        "an EXTERNAL wallet — that path opens no trade and "
+                        "instead notifies the wallet's owner that funds "
+                        "arrived, which is otherwise only reachable by making "
+                        "a real transfer.")
     p.add_argument("--amount", default="5000",
                    help="USDT, as a decimal string. Never a float.")
     p.add_argument("--hash", default=None,
@@ -99,15 +106,26 @@ async def main() -> int:
                              config=config)
 
     try:
-        # Find the internal wallet for this pairing, exactly as the monitor
-        # would: by wallet, never by asking anyone to choose (decision C3).
         wallets = await repo.list_wallets()
-        match = [
-            w for w in wallets
-            if w["is_internal"]
-            and w["supplier_label"] == args.supplier
-            and w["client_label"] == args.client
-        ]
+
+        if args.address:
+            match = [w for w in wallets if w["address"] == args.address]
+            if not match:
+                log.error("No wallet in the database has address %s", args.address)
+                log.error("Known wallets:")
+                for w in wallets:
+                    log.error("  %s  %s", "internal" if w["is_internal"] else "external",
+                              w["address"])
+                return 1
+        else:
+            # Find the internal wallet for this pairing, exactly as the monitor
+            # would: by wallet, never by asking anyone to choose (decision C3).
+            match = [
+                w for w in wallets
+                if w["is_internal"]
+                and w["supplier_label"] == args.supplier
+                and w["client_label"] == args.client
+            ]
         if not match:
             log.error("No internal wallet links %s to %s.", args.supplier, args.client)
             log.error("Registered internal wallets:")
@@ -117,10 +135,19 @@ async def main() -> int:
                               w["client_label"], w["address"])
             return 1
 
-        # monitored_wallets returns the shape _handle_deposit expects.
+        # monitored_wallets returns the shape _handle_deposit expects, and it
+        # only returns wallets flagged is_monitored — a wallet that is not being
+        # watched cannot receive a simulated deposit either, which is the honest
+        # behaviour rather than a crash.
         wallet = next(
-            w for w in await repo.monitored_wallets() if w["id"] == match[0]["id"]
+            (w for w in await repo.monitored_wallets() if w["id"] == match[0]["id"]),
+            None,
         )
+        if wallet is None:
+            log.error("Wallet %s exists but is not marked as monitored, so the "
+                      "real monitor would not see a deposit on it either.",
+                      match[0]["address"])
+            return 1
 
         tx_hash = args.hash or f"sim-{secrets.token_hex(16)}"
         transfer = {
@@ -131,8 +158,9 @@ async def main() -> int:
             "confirmed": not args.unconfirmed,
         }
 
-        log.info("simulating %s USDT from %s to %s (wallet %s)",
-                 amount, args.supplier, args.client, wallet["address"])
+        kind = "internal" if wallet["is_internal"] else "EXTERNAL — no trade opens"
+        log.info("simulating %s USDT to the %s wallet %s",
+                 amount, kind, wallet["address"])
         log.info("hash %s", tx_hash)
 
         await monitor._handle_deposit(wallet, transfer)
