@@ -150,6 +150,63 @@ check_bot "bridge  " "${BRIDGE_BOT_TOKEN:-}"   no
 check_bot "supplier" "${SUPPLIER_BOT_TOKEN:-}" yes
 check_bot "client  " "${CLIENT_BOT_TOKEN:-}"   yes
 
+# ---------------------------------------------------------------- membership
+head_ "Group membership"
+
+# A bot can be alive, its chat registered, its settings perfect — and it can
+# still have been removed from the group. Nothing else in this file notices.
+#
+# On 10 September 2026 the client's side removed the Client Desk bot because it
+# was replying to conversation. Every other check here passed while the bot was
+# banned and completely unable to reach the people it exists to serve. This is
+# the check that would have caught it in seconds.
+#
+# Removing a member from a supergroup also BANS them, so re-adding needs the
+# ban lifting first — which only an admin of that group can do.
+
+bot_id_for() {
+    curl -s --max-time 15 "https://api.telegram.org/bot$1/getMe" \
+        | sed -n 's/.*"id":\([0-9]*\).*/\1/p' | head -1
+}
+
+TMP_PARTIES="/tmp/healthcheck-parties.$$"
+
+member_check() {
+    role="$1"; token="$2"
+    if [ -z "$token" ]; then bad "$role — no token configured"; return; fi
+
+    botid="$(bot_id_for "$token")"
+    if [ -z "$botid" ]; then bad "$role — could not identify the bot"; return; fi
+
+    q "SELECT label || '|' || telegram_chat_id FROM parties
+       WHERE role = '$role' AND is_active" > "$TMP_PARTIES"
+
+    # Read from a file, not a pipe: a piped while-loop runs in a subshell and
+    # its FAIL counts would be discarded — which would make this check lie in
+    # exactly the way it exists to prevent.
+    while IFS='|' read -r label chat; do
+        [ -z "${chat:-}" ] && continue
+        st="$(curl -s --max-time 15 \
+              "https://api.telegram.org/bot$token/getChatMember?chat_id=$chat&user_id=$botid" \
+              | python3 -c 'import sys,json
+r = json.load(sys.stdin)
+print(r["result"]["status"] if r.get("ok") else "NOT IN GROUP - " + r.get("description",""))' \
+              2>/dev/null)"
+        case "$st" in
+            member|administrator|creator)
+                ok "$label — bot present ($st)" ;;
+            "") bad "$label — could not check membership" ;;
+            *)  bad "$label — $st" ;;
+        esac
+    done < "$TMP_PARTIES"
+
+    rm -f "$TMP_PARTIES"
+}
+
+member_check bridge   "${BRIDGE_BOT_TOKEN:-}"
+member_check supplier "${SUPPLIER_BOT_TOKEN:-}"
+member_check client   "${CLIENT_BOT_TOKEN:-}"
+
 # ---------------------------------------------------------------- setup data
 head_ "Parties, wallets, rates"
 
