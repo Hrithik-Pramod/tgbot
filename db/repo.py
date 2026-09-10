@@ -391,6 +391,27 @@ class Repo:
                 client_id,
             )
 
+    async def suppliers_for_client(self, client_id: int) -> list[asyncpg.Record]:
+        """
+        Every supplier this client is paired with, via the internal wallets.
+
+        Backs /accounts when no trade is open. Before this the command needed
+        an open trade and said "you have no open trade" otherwise, which reads
+        as a fault to anyone who just wants to see where they pay
+        (reported 10 September 2026: "Does not show accounts").
+        """
+        async with self.pool.acquire() as conn:
+            return await conn.fetch(
+                """
+                SELECT DISTINCT s.id, s.label
+                FROM wallets w
+                JOIN parties s ON s.id = w.supplier_id
+                WHERE w.is_internal AND w.client_id = $1 AND s.is_active
+                ORDER BY s.label
+                """,
+                client_id,
+            )
+
     async def open_trade_for_supplier(self, supplier_id: int) -> Optional[asyncpg.Record]:
         """
         Backs the supplier's own progress view (client request, 10 Sep 2026:

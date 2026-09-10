@@ -60,30 +60,60 @@ class PastedPayment(StatesGroup):
 
 # --------------------------------------------------------------- /accounts
 
-@router.message(Command("accounts"))
-async def cmd_accounts(message: Message, party, repo) -> None:
-    """Show the supplier accounts this client can pay into."""
-    trade = await repo.open_trade_for_client(party["id"])
-    if trade is None:
-        await message.answer("You have no open trade at the moment.")
-        return
-
-    accounts = await repo.list_bank_accounts(trade["supplier_id"])
-    if not accounts:
-        await message.answer(
-            "No accounts are registered for this supplier yet. "
-            "The supplier needs to add one with /account."
-        )
-        return
-
-    # D4: the supplier is shown by label only, never by real identity.
-    lines = [f"Accounts under {trade['supplier_label']}:", ""]
+def _render_accounts(supplier_label: str, accounts) -> list[str]:
+    """D4: the supplier is shown by label only, never by real identity."""
+    lines = [f"Accounts under {supplier_label}:", ""]
     for a in accounts:
         lines.append(a["account_name"])
         lines.append(f"Acc num - {a['account_number']}")
         lines.append(f"Ifsc - {a['ifsc']}")
         lines.append("")
-    await message.answer("\n".join(lines).rstrip())
+    return lines
+
+
+@router.message(Command("accounts"))
+async def cmd_accounts(message: Message, party, repo) -> None:
+    """
+    Show the supplier accounts this client can pay into.
+
+    With a trade open this is the one supplier that trade belongs to. Without
+    one it lists every supplier the client is paired with, rather than refusing.
+    Answering "you have no open trade" to someone asking where they pay reads
+    as a broken bot, and it is not what they asked (reported 10 Sep 2026).
+    """
+    trade = await repo.open_trade_for_client(party["id"])
+
+    if trade is not None:
+        accounts = await repo.list_bank_accounts(trade["supplier_id"])
+        if not accounts:
+            await message.answer(
+                "No accounts are registered for this supplier yet. "
+                "The supplier needs to add one with /account."
+            )
+            return
+        await message.answer(
+            "\n".join(_render_accounts(trade["supplier_label"], accounts)).rstrip()
+        )
+        return
+
+    suppliers = await repo.suppliers_for_client(party["id"])
+    blocks: list[str] = []
+    for s in suppliers:
+        accounts = await repo.list_bank_accounts(s["id"])
+        if accounts:
+            blocks.append("\n".join(_render_accounts(s["label"], accounts)).rstrip())
+
+    if not blocks:
+        await message.answer(
+            "No accounts have been registered yet. Each supplier adds their "
+            "own with /account in their group."
+        )
+        return
+
+    await message.answer(
+        "No trade is open at the moment. Registered accounts:\n\n"
+        + "\n\n".join(blocks)
+    )
 
 
 # -------------------------------------------------------------------- /add
@@ -218,9 +248,20 @@ async def on_pasted_payment(message: Message, state: FSMContext, party, repo,
     result = parse_payments(body)
 
     if not result.payments:
-        # Almost always ordinary conversation, not a failed paste. Only speak
-        # up if it looked like an attempt.
-        if result.problems and any(c.isdigit() for c in (message.text or "")):
+        # Speak only if a UTR was actually present.
+        #
+        # This used to fire on any message containing a digit, so the bot
+        # answered ordinary conversation — "send 5 lakh by 4" and the like. In
+        # the client's live group on 10 September 2026 it replied to nearly
+        # everything and their team found it unusable, which is fair: a bot
+        # that interrupts a conversation it does not understand is worse than
+        # one that says nothing at all.
+        #
+        # A bank reference is long and distinctive, so its presence is a
+        # reliable sign someone was logging a payment rather than talking.
+        # Without one, stay quiet. The standing rule still covers it: no
+        # acknowledgement means it was not picked up.
+        if result.saw_utr and result.problems:
             await message.answer(
                 "\n".join(["I could not read that as a payment:", *result.problems])
                 + "\n\nSend it as UTR, amount, and the account — or use /add."

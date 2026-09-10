@@ -347,6 +347,10 @@ async def confirm_final(call: CallbackQuery, state: FSMContext, party, repo, not
 
     # The onward obligation goes to the Bridge, who is the one who has to act
     # on it, rather than to the client.
+    # html=True and parse_mode together, or the USDT figure is not tap-to-copy.
+    # Missing the parse_mode was the whole bug: the <code> markup was rendered
+    # as literal text, so the client could not copy the amount they had to send
+    # (reported 10 September 2026, "I cannot copy just the Usdt value").
     await call.message.edit_text(
         f"Sent to {trade['client_label']}. Waiting for payment.\n\n"
         + render_send_instruction(
@@ -354,7 +358,9 @@ async def confirm_final(call: CallbackQuery, state: FSMContext, party, repo, not
             usdt_out=trade["usdt_owed_client"],
             inr_amount=sum(m for _, m in slots),
             sell_rate=trade["sell_rate"],
-        )
+            html=True,
+        ),
+        parse_mode="HTML",
     )
     await call.answer()
     log.info("trade %s slots issued and sent to client", trade["reference"])

@@ -246,9 +246,11 @@ def render_deposit_notification(
     abbreviated address defeats that — the first and last characters of two
     different addresses can easily match.
     """
-    header = [f"{supplier_label.upper()}  ·  Transaction {reference}"]
+    esc = html_escape if html else (lambda s: s)
+
+    header = [f"{esc(supplier_label.upper())}  ·  Transaction {esc(reference)}"]
     if wallet_address:
-        header.append(f"Internal wallet {wallet_address}")
+        header.append(f"Internal wallet {esc(wallet_address)}")
 
     body = [""]
 
@@ -258,7 +260,7 @@ def render_deposit_notification(
     # transfer or the trade so far.
     if previous_usdt is not None:
         body.append(
-            f"ADDITIONAL deposit from {supplier_label} to {client_label}"
+            f"ADDITIONAL deposit from {esc(supplier_label)} to {esc(client_label)}"
         )
         body.append(
             f"This transfer: {fmt_usdt(usdt_in)}   "
@@ -267,7 +269,7 @@ def render_deposit_notification(
         body.append(f"Trade total now {fmt_usdt(previous_usdt + usdt_in)} "
                     f"to Send INR {fmt_inr(inr_out)}")
     else:
-        body.append(f"Incoming deposit from {supplier_label} to {client_label}")
+        body.append(f"Incoming deposit from {esc(supplier_label)} to {esc(client_label)}")
         body.append(f"USDT = {fmt_usdt(usdt_in)} to Send INR {fmt_inr(inr_out)}")
 
     # Both rates, and the onward obligation, stated here rather than left to be
@@ -277,7 +279,12 @@ def render_deposit_notification(
     if supply_rate is not None:
         body.append(f"Bought at {fmt_usdt_plain(supply_rate)}")
     if usdt_out is not None:
-        line = f"Send on to {client_label}: {fmt_usdt_plain(usdt_out)} USDT"
+        # Tap-to-copy: this is the figure the Bridge types into a wallet to
+        # send the client, so it is the one that must be copyable on its own
+        # (client request, 10 September 2026).
+        out = fmt_usdt_plain(usdt_out)
+        line = (f"Send on to {esc(client_label)}: "
+                f"{f'<code>{out}</code>' if html else out} USDT")
         if sell_rate is not None:
             line += f" at {fmt_usdt_plain(sell_rate)}"
         body.append(line)

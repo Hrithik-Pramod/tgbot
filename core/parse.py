@@ -114,6 +114,20 @@ class ParseResult:
     payments: list[ParsedPayment] = field(default_factory=list)
     problems: list[str] = field(default_factory=list)
 
+    # Whether anything UTR-shaped appeared at all.
+    #
+    # This is what separates "a payment that did not parse" from "someone
+    # talking". The bot lives in a group where people hold ordinary
+    # conversations, and almost any sentence with a number in it produces a
+    # problem — so problems alone is far too eager a reason to speak. On
+    # 10 September 2026 the client's group was being answered on every message
+    # containing a digit, which their team found intolerable and rightly so.
+    #
+    # A bank reference is long and distinctive. If one is present the sender
+    # was trying to log a payment and deserves to be told it failed. If not,
+    # silence.
+    saw_utr: bool = False
+
     @property
     def ok(self) -> bool:
         return bool(self.payments) and not self.problems
@@ -212,6 +226,8 @@ def parse_payments(text: str) -> ParseResult:
         if "utr" not in rec:
             result.problems.append(f"{where}no UTR found.")
             continue
+
+        result.saw_utr = True
         if "amount" not in rec:
             result.problems.append(f"{where}no amount found.")
             continue
