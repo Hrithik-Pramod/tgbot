@@ -380,22 +380,50 @@ class DepositMonitor:
         self._skips: dict[int, int] = {}
 
     async def run_forever(self) -> None:
-        log.info("deposit monitor starting")
+        log.info(
+            "deposit monitor starting, polling every %ss",
+            self.config.poll_interval_seconds,
+        )
         while True:
             try:
-                await self.poll_once()
+                await self.poll_once(stagger=True)
             except Exception:
                 # A crash here would stop deposit detection silently, which is
                 # the worst failure this system has. Always log and continue.
                 log.exception("monitor cycle failed")
-            await asyncio.sleep(self.config.poll_interval_seconds)
+                await asyncio.sleep(self.config.poll_interval_seconds)
 
-    async def poll_once(self) -> None:
+    async def poll_once(self, *, stagger: bool = False) -> None:
+        """
+        One pass over every monitored wallet.
+
+        With stagger=True the calls are spread evenly across the poll interval
+        rather than fired in a burst and then sleeping. Same number of requests
+        per minute either way, but the providers care about bursts: TronScan
+        returned 429 on the fourth call in a few seconds on 9 September 2026,
+        while the same volume spread out went through untouched.
+
+        This matters more the shorter the interval gets. At five seconds with
+        several wallets, bursting would sit permanently in rate-limit territory
+        and push every poll onto the fallback provider.
+        """
         # Re-read the wallet list every cycle rather than caching it, so a
         # /walletchange takes effect on the next pass with no restart.
         wallets = await self.repo.monitored_wallets()
+
+        if not wallets:
+            # Nothing to watch. Without this the staggered loop would spin.
+            if stagger:
+                await asyncio.sleep(self.config.poll_interval_seconds)
+            return
+
+        gap = self.config.poll_interval_seconds / len(wallets) if stagger else 0
+
         for wallet in wallets:
             await self._poll_wallet(wallet)
+            if gap:
+                await asyncio.sleep(gap)
+
         await self._report_unconfirmed()
 
     async def _report_unconfirmed(self) -> None:
