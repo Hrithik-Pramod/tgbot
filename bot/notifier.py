@@ -293,6 +293,9 @@ class Notifier:
                 supply_rate=trade["supply_rate"] if trade else rate["supply_rate"],
                 sell_rate=sell,
                 usdt_out=usdt_owed,
+                # Set only when this lands on a trade that was already open, so
+                # the message distinguishes a second tranche from a new trade.
+                previous_usdt=trade["usdt_received"] if trade else None,
             )
             + stale_note,
             reply_markup=confirm_keyboard(trade_id),

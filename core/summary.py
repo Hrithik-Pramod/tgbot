@@ -230,6 +230,7 @@ def render_deposit_notification(
     supply_rate: Decimal | None = None,
     sell_rate: Decimal | None = None,
     usdt_out: Decimal | None = None,
+    previous_usdt: Decimal | None = None,
     html: bool = False,
 ) -> str:
     """
@@ -249,11 +250,25 @@ def render_deposit_notification(
     if wallet_address:
         header.append(f"Internal wallet {wallet_address}")
 
-    body = [
-        "",
-        f"Incoming deposit from {supplier_label} to {client_label}",
-        f"USDT = {fmt_usdt(usdt_in)} to Send INR {fmt_inr(inr_out)}",
-    ]
+    body = [""]
+
+    # A supplier sending in two goes is normal, and the two cases read very
+    # differently: a fresh trade, or more USDT landing on one already running.
+    # Saying which removes any doubt about whether the figures below are this
+    # transfer or the trade so far.
+    if previous_usdt is not None:
+        body.append(
+            f"ADDITIONAL deposit from {supplier_label} to {client_label}"
+        )
+        body.append(
+            f"This transfer: {fmt_usdt(usdt_in)}   "
+            f"Previously: {fmt_usdt(previous_usdt)}"
+        )
+        body.append(f"Trade total now {fmt_usdt(previous_usdt + usdt_in)} "
+                    f"to Send INR {fmt_inr(inr_out)}")
+    else:
+        body.append(f"Incoming deposit from {supplier_label} to {client_label}")
+        body.append(f"USDT = {fmt_usdt(usdt_in)} to Send INR {fmt_inr(inr_out)}")
 
     # Both rates, and the onward obligation, stated here rather than left to be
     # worked out (client request, 10 September 2026). The Bridge reads this

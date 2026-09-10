@@ -93,11 +93,27 @@ async def confirm_start(call: CallbackQuery, state: FSMContext, repo) -> None:
         )
         return
 
+    # Allocate what is still OWED, not the gross total.
+    #
+    # A supplier can send in two goes. The second deposit lands on the same open
+    # trade and raises inr_expected — but by then the client may already have
+    # paid against the first instruction. Offering the gross figure here would
+    # have you issue an instruction for the whole new total, and a client who
+    # pays it after already paying the first one has overpaid.
+    paid = trade["paid_inr"] or Decimal(0)
+    outstanding = round_inr(trade["inr_expected"]) - round_inr(paid)
+
+    if outstanding <= 0:
+        await call.answer(
+            "This trade is already covered by payments received.", show_alert=True
+        )
+        return
+
     await state.set_state(Confirm.account)
     await state.update_data(
         trade_id=trade_id,
         supplier_id=trade["supplier_id"],
-        remaining=str(round_inr(trade["inr_expected"])),
+        remaining=str(outstanding),
         slots=[],
     )
 
@@ -122,10 +138,29 @@ async def confirm_start(call: CallbackQuery, state: FSMContext, repo) -> None:
     else:
         note = "\nThe supplier has not nominated an account yet."
 
+    # If instructions have already gone out on this trade, say so before any
+    # more are sent. The client keeps the old message in their chat, and two
+    # live instructions for the same trade is how someone pays twice.
+    already = await repo.trade_slots(trade_id)
+    if already:
+        note += (
+            f"\n\n⚠ {len(already)} instruction(s) have already been sent to the "
+            "client for this trade. Sending new ones replaces them here, but the "
+            "old message stays in their chat — tell them to ignore it."
+        )
+
+    lines = [f"Transaction {trade['reference']}"]
+    if paid > 0:
+        lines.append(f"Expected ₹{fmt_inr(trade['inr_expected'])}, "
+                     f"already paid ₹{fmt_inr(paid)}.")
+        lines.append(f"Still to instruct: ₹{fmt_inr(outstanding)}.{note}")
+    else:
+        lines.append(f"Client pays ₹{fmt_inr(outstanding)} in total.{note}")
+    lines.append("")
+    lines.append("Which account should they pay into?")
+
     await call.message.answer(
-        f"Transaction {trade['reference']}\n"
-        f"Client pays ₹{fmt_inr(trade['inr_expected'])} in total.{note}\n\n"
-        f"Which account should they pay into?",
+        "\n".join(lines),
         reply_markup=InlineKeyboardMarkup(inline_keyboard=rows),
     )
     await call.answer()

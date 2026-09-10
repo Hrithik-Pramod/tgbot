@@ -44,6 +44,20 @@ class _Repo:
         self.adopted[wallet_id] = adopted_at_ms
 
 
+class _WalletListRepo(_Repo):
+    """A repo that also answers monitored_wallets, for whole-pass tests."""
+
+    def __init__(self, wallets):
+        super().__init__()
+        self.wallets = wallets
+
+    async def monitored_wallets(self):
+        return self.wallets
+
+    async def unconfirmed_deposits(self, older_than_minutes):
+        return []
+
+
 class _Client:
     def __init__(self, transfers, fail=False):
         self.transfers = transfers
@@ -355,6 +369,82 @@ class TestTheAdoptionBoundaryHolds:
         monitor, handled = build([transfer("5000")])
         await monitor._poll_wallet(dict(WALLET, adopted_at_ms=None))
         assert len(handled) == 1
+
+
+class TestPollPacing:
+    """
+    Requests are spread across the interval rather than fired in a burst.
+
+    Client request, 10 September 2026: "can we reduce this to 5 sec?". The
+    providers rate-limit on bursts — TronScan returned 429 on the fourth call in
+    a few seconds — so at five seconds a burst of several wallets would sit
+    permanently in rate-limit territory. Same requests per minute, spread out.
+    """
+
+    def _monitor(self, n_wallets, interval=5):
+        monitor, _ = build([])
+        monitor.repo = _WalletListRepo(
+            [dict(WALLET, id=i + 1) for i in range(n_wallets)]
+        )
+        monitor.config.poll_interval_seconds = interval
+        return monitor
+
+    @pytest.mark.asyncio
+    async def test_calls_are_spaced_across_the_interval(self, monkeypatch):
+        slept = []
+
+        async def fake_sleep(seconds):
+            slept.append(seconds)
+
+        monkeypatch.setattr("monitor.tron.asyncio.sleep", fake_sleep)
+
+        monitor = self._monitor(4, interval=5)
+        await monitor.poll_once(stagger=True)
+
+        assert slept == [1.25, 1.25, 1.25, 1.25], \
+            "four wallets over five seconds should be spaced 1.25s apart"
+
+    @pytest.mark.asyncio
+    async def test_without_stagger_it_does_not_sleep(self, monkeypatch):
+        """poll_once stays synchronous for tests and one-off runs."""
+        slept = []
+
+        async def fake_sleep(seconds):
+            slept.append(seconds)
+
+        monkeypatch.setattr("monitor.tron.asyncio.sleep", fake_sleep)
+
+        monitor = self._monitor(3)
+        await monitor.poll_once()
+        assert slept == []
+
+    @pytest.mark.asyncio
+    async def test_no_wallets_does_not_spin(self, monkeypatch):
+        """
+        With nothing to watch, a staggered pass has nothing to pace against.
+        Without an explicit wait it would loop as fast as the CPU allows.
+        """
+        slept = []
+
+        async def fake_sleep(seconds):
+            slept.append(seconds)
+
+        monkeypatch.setattr("monitor.tron.asyncio.sleep", fake_sleep)
+
+        monitor = self._monitor(0, interval=5)
+        await monitor.poll_once(stagger=True)
+        assert slept == [5]
+
+    @pytest.mark.asyncio
+    async def test_every_wallet_is_still_polled(self, monkeypatch):
+        async def fake_sleep(seconds):
+            return None
+
+        monkeypatch.setattr("monitor.tron.asyncio.sleep", fake_sleep)
+
+        monitor = self._monitor(3, interval=5)
+        await monitor.poll_once(stagger=True)
+        assert monitor.client.calls == 3
 
 
 class TestOtherRejections:
