@@ -61,6 +61,29 @@ class TestItStopsAnsweringConversation:
         """Long digit strings are common in chat and must not trigger a reply."""
         assert not parse_payments("call 9876543210 when done").saw_utr
 
+    def test_a_sentence_is_never_a_reference(self):
+        """
+        The root cause. Spaces were squashed out before the shape test, so
+        "call 9876543210 when done" became "call9876543210whendone" —
+        alphanumeric, contains a digit, long enough — and was read as a UTR.
+        A reference is one unbroken token; a sentence is not.
+        """
+        from core.parse import classify
+
+        kind, _ = classify("call 9876543210 when done")
+        assert kind != "utr"
+
+        kind, _ = classify("BKIDR12026091000000001")
+        assert kind == "utr", "a real reference must still be recognised"
+
+    def test_a_labelled_reference_still_works_with_spaces(self):
+        """
+        "UTR: ABC123" is matched by the label rule before the shape rule, so
+        tightening the shape rule must not break it.
+        """
+        r = parse_payments("UTR: BKIDR12026091000000001\n1500\nto Ekta Traders")
+        assert r.payments and r.payments[0].utr == "BKIDR12026091000000001"
+
 
 class TestTheBridgeCanCopyTheUsdtFigure:
     """

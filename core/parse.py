@@ -173,7 +173,24 @@ def classify(line: str) -> tuple[str, str]:
         return "amount", raw
 
     # Mixed letters and digits with no internal spaces — a reference.
-    if squashed.isalnum() and any(c.isdigit() for c in squashed) and len(squashed) >= 8:
+    #
+    # The whitespace check is the point, and it was missing: `squashed` has
+    # already had its spaces removed, so an ordinary sentence containing a
+    # number collapses into one long alphanumeric run and was being read as a
+    # bank reference. "call 9876543210 when done" became
+    # "call9876543210whendone" — alphanumeric, contains a digit, over eight
+    # characters, therefore a UTR.
+    #
+    # That is why the bot answered nearly every message in the client's live
+    # group on 10 September 2026. A real reference is a single unbroken token;
+    # a sentence is not. Labelled forms like "UTR: ABC123" never reach here —
+    # they are matched by _LBL_UTR above.
+    if (
+        not re.search(r"\s", raw.strip())
+        and squashed.isalnum()
+        and any(c.isdigit() for c in squashed)
+        and len(squashed) >= 8
+    ):
         return "utr", raw
 
     # Anything else that reads as words is a name.
