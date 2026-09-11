@@ -697,15 +697,30 @@ class DepositMonitor:
             # the arrival on their own (client request, 10 September 2026:
             # "i just sent money onto client account but bot did not notify
             # client of hash?").
+            # Say what it is, not what it is not.
+            #
+            # This read "Deposit detected on a non-internal wallet ... No
+            # trade was opened", which describes a failure. It is not one:
+            # it is the Bridge's own settlement arriving in a counterparty's
+            # wallet, which is the last step of a trade working correctly.
+            #
+            # On 11 September 2026 the Bridge saw it against his own 13,992.59
+            # payout for SUPA3 and asked "no trade was opened?" — reasonably,
+            # because the wording invites exactly that question at the moment
+            # he is least able to absorb another alarm.
+            owner = wallet["owner_party_id"]
+            owner_label = await self.repo.party_label(owner) if owner else None
+            whose = f"{owner_label}'s" if owner_label else "a counterparty's"
+
             await self.notifier.to_bridge(
-                f"Deposit detected on a non-internal wallet\n"
-                f"{transfer['amount']} USDT\n"
+                f"Onward payout confirmed on chain\n"
+                f"{transfer['amount']} USDT reached {whose} wallet\n"
                 f"Hash {tx_link(transfer['tx_hash'], html=True)}\n"
-                f"No trade was opened.",
+                f"Nothing to action — a settlement leaving the desk is not a "
+                f"supplier deposit, so no trade is opened for it.",
                 html=True,
             )
 
-            owner = wallet["owner_party_id"]
             if owner:
                 await self.notifier.to_party(
                     owner,

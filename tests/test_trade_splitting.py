@@ -178,9 +178,10 @@ class TestSendCannotRewriteAnIssuedInstruction:
 
     def test_the_nomination_is_not_lost_when_nothing_matches(self):
         """
-        Returning None is correct, not a failure: latest_nomination reads it
-        back off the audit log when the next trade opens. That path must still
-        be recorded.
+        Returning None is correct, not a failure: the claim stays unmatched
+        in pending_sends and latest_nomination hands it to the next trade
+        that opens. The audit entry must still be written either way, because
+        it is the record of who chose what and when.
         """
         src = inspect.getsource(Repo.nominate_account)
         assert "trade.account_nominated" in src

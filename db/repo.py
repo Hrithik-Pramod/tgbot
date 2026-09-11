@@ -225,6 +225,14 @@ class Repo:
                 """
             )
 
+    async def party_label(self, party_id: int) -> Optional[str]:
+        """The name a party is known by. Used to say whose wallet a payout
+        reached, rather than describing it as 'non-internal'."""
+        async with self.pool.acquire() as conn:
+            return await conn.fetchval(
+                "SELECT label FROM parties WHERE id = $1", party_id
+            )
+
     async def monitored_wallets(self) -> list[asyncpg.Record]:
         async with self.pool.acquire() as conn:
             return await conn.fetch(
@@ -798,9 +806,9 @@ class Repo:
                           -- really about the next deposit.
                           --
                           -- With no uninstructed trade this returns nothing,
-                          -- which is the correct answer — the nomination is
-                          -- kept in the audit log and picked up by
-                          -- latest_nomination when the next trade opens.
+                          -- which is the correct answer — the claim stays in
+                          -- pending_sends and latest_nomination hands it to
+                          -- the next trade that opens.
                           AND instructed_at IS NULL
                         ORDER BY opened_at DESC LIMIT 1
                     )
@@ -820,21 +828,47 @@ class Repo:
 
     async def latest_nomination(self, supplier_id: int) -> Optional[int]:
         """
-        The account this supplier most recently nominated.
+        An account this supplier has nominated and NOT yet used.
 
         Used when a deposit is detected after the supplier has already run
         /send, so their choice is not lost to the ordering of the two events.
+
+        WHY IT READS pending_sends AND NOT THE AUDIT LOG
+
+        It used to take the most recent 'trade.account_nominated' entry in the
+        audit log. That log is a permanent record of everything that has ever
+        happened, so the query returned a nomination made hours earlier for a
+        trade long since closed — and every new deposit from that supplier
+        arrived pre-filled with it.
+
+        Live, 11 September 2026: Supplier A nominated Ekta traders at 15:42
+        for SUPA1. At 21:36 a fresh 14,151 USDT deposit opened SUPA3 and the
+        Bridge was shown "Supplier nominated: Ekta traders" for a trade nobody
+        had said anything about. The supplier then chose a different account
+        entirely. The Bridge: "money sent, but no one chose supplier... why
+        did it default? its should not do that."
+
+        A default that looks like a decision is worse than no default at all —
+        it invites the Bridge to confirm an account the supplier never asked
+        for, and the money goes to the wrong place.
+
+        pending_sends holds exactly the right thing: a claim made and not yet
+        attached to a trade. on_supplier_deposit matches it immediately after
+        opening the trade, so each nomination is offered once and then stops
+        being offered. No claim outstanding means no nomination, and the
+        Bridge is told so plainly.
         """
         async with self.pool.acquire() as conn:
             return await conn.fetchval(
                 """
-                SELECT entity_id FROM audit_log
-                WHERE action = 'trade.account_nominated'
-                  AND detail->>'supplier_id' = $1::text
+                SELECT bank_account_id FROM pending_sends
+                WHERE supplier_id = $1
+                  AND matched_trade_id IS NULL
+                  AND bank_account_id IS NOT NULL
                 ORDER BY created_at DESC
                 LIMIT 1
                 """,
-                str(supplier_id),
+                supplier_id,
             )
 
     # ----------------------------------------------------------- pending sends
