@@ -442,15 +442,54 @@ async def on_edited_payment(message: Message, party, repo, notifier) -> None:
     if not result.payments:
         return  # same rule as a new message: silence unless it was a payment
 
-    already = await repo.existing_utrs([p.utr for p in result.payments])
-    fresh = [p for p in result.payments if p.utr not in already]
+    recorded = await repo.recorded_amounts([p.utr for p in result.payments])
+    fresh = [p for p in result.payments if p.utr not in recorded]
 
     if not fresh:
+        # Everything in this message is already in the ledger. Whether that is
+        # worth saying depends entirely on whether the figures still agree.
+        restated = [
+            p for p in result.payments if recorded[p.utr] != p.amount_inr
+        ]
+
+        if not restated:
+            # A no-op edit. Stay silent.
+            #
+            # This is overwhelmingly the common case and the reply was wrong
+            # for it. On 11 September 2026 the client sent three payments as
+            # photos while the bot was down, then edited each caption to add
+            # the account name the Bridge had asked for. When the bot came
+            # back, Telegram delivered the originals and the edits together:
+            # the originals were recorded, and then the edit handler told
+            # them three times that "editing the message does not change what
+            # was logged" — about payments recorded seconds earlier, from the
+            # very messages they had edited. Their reply was "meaning?", and
+            # the Bridge's was "bot is clearing i am doing manually".
+            #
+            # Correcting a message before anyone has read it is not an error
+            # and does not need answering.
+            return
+
+        # The dangerous case, and the only one worth speaking for: a
+        # reference already in the books now carries a different figure.
+        # The client is told to stop and talk to a person, and the Bridge is
+        # told without having to notice it themselves.
+        lines = [
+            f"  {p.utr}  logged ₹{fmt_inr(recorded[p.utr])}, "
+            f"edited to ₹{fmt_inr(p.amount_inr)}"
+            for p in restated
+        ]
         await message.reply(
-            "That payment is already recorded — editing the message does not "
-            "change what was logged.\n\n"
-            "If something was wrong, tell the Bridge rather than editing."
+            "This payment is already recorded with a different amount, and "
+            "editing the message does not change the ledger.\n\n"
+            "Please raise it with the Bridge."
         )
+        if notifier is not None:
+            await notifier.to_bridge(
+                "A recorded payment was EDITED to a different amount.\n\n"
+                + "\n".join(lines)
+                + "\n\nThe ledger is unchanged. Nothing has been adjusted."
+            )
         return
 
     by_id = {a["id"]: a for a in accounts}

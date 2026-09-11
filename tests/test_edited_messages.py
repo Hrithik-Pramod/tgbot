@@ -53,11 +53,21 @@ class TestWhatAnEditDoes:
     Three outcomes, each of which has to be right on its own.
     """
 
-    def test_an_already_recorded_payment_is_explained_not_repeated(self):
+    def test_an_already_recorded_payment_is_never_recorded_twice(self):
+        """
+        Amended 11 September 2026. This used to require existing_utrs and an
+        unconditional "already recorded" reply. The reply turned out to be
+        wrong for the common case — see test_edited_no_op.py — and the check
+        now compares AMOUNTS, not just whether the reference is known.
+
+        What has not changed, and is what this test is really for: an edit
+        can never cause a second ledger entry for a reference already in it.
+        """
         src = inspect.getsource(client_bot.on_edited_payment)
-        assert "existing_utrs" in src, \
+        assert "recorded_amounts" in src, \
             "an edit must tell an already-logged payment from a new one"
-        assert "already recorded" in src
+        assert "p.utr not in recorded" in src, \
+            "only references absent from the ledger may be recorded"
 
     def test_a_payment_not_yet_recorded_is_recorded(self):
         src = inspect.getsource(client_bot.on_edited_payment)

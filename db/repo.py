@@ -678,6 +678,25 @@ class Repo:
             )
             return {r["utr"] for r in rows}
 
+    async def recorded_amounts(self, utrs: Sequence[str]) -> dict:
+        """
+        What the ledger holds for each of these references.
+
+        Knowing a reference exists is not enough to answer an edit. An edit
+        that reads back exactly what was already recorded changed nothing and
+        deserves no reply; an edit where the amount now differs is somebody
+        trying to restate a figure that is already in the books, which the
+        Bridge has to hear about. Only the amounts distinguish the two.
+        """
+        if not utrs:
+            return {}
+        async with self.pool.acquire() as conn:
+            rows = await conn.fetch(
+                "SELECT utr, amount_inr FROM payments WHERE utr = ANY($1::text[])",
+                list(utrs),
+            )
+            return {r["utr"]: r["amount_inr"] for r in rows}
+
     async def trade_payments(self, trade_id: int) -> list[asyncpg.Record]:
         async with self.pool.acquire() as conn:
             return await conn.fetch(
