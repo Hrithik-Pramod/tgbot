@@ -81,18 +81,24 @@ async def cmd_accounts(message: Message, party, repo) -> None:
     Answering "you have no open trade" to someone asking where they pay reads
     as a broken bot, and it is not what they asked (reported 10 Sep 2026).
     """
-    trade = await repo.open_trade_for_client(party["id"])
+    # Grouped by supplier, because a client can be running a trade with more
+    # than one at the same time and needs to see whose account is whose.
+    open_accounts = await repo.open_trade_accounts_for_client(party["id"])
+    if open_accounts:
+        by_supplier: dict[str, list] = {}
+        for a in open_accounts:
+            by_supplier.setdefault(a["supplier_label"], []).append(a)
+        await message.answer("\n\n".join(
+            "\n".join(_render_accounts(label, accs)).rstrip()
+            for label, accs in by_supplier.items()
+        ))
+        return
 
-    if trade is not None:
-        accounts = await repo.list_bank_accounts(trade["supplier_id"])
-        if not accounts:
-            await message.answer(
-                "No accounts are registered for this supplier yet. "
-                "The supplier needs to add one with /account."
-            )
-            return
+    open_trades = await repo.open_trades_for_client(party["id"])
+    if open_trades:
         await message.answer(
-            "\n".join(_render_accounts(trade["supplier_label"], accounts)).rstrip()
+            "No accounts are registered for this supplier yet. "
+            "The supplier needs to add one with /account."
         )
         return
 
@@ -120,12 +126,12 @@ async def cmd_accounts(message: Message, party, repo) -> None:
 
 @router.message(Command("add"))
 async def cmd_add(message: Message, state: FSMContext, party, repo) -> None:
-    trade = await repo.open_trade_for_client(party["id"])
-    if trade is None:
+    # No trade is chosen here. The account picked at the end decides it, the
+    # same way a pasted payment is resolved — one rule, not two.
+    if not await repo.open_trades_for_client(party["id"]):
         await message.answer("You have no open trade to add payments to.")
         return
 
-    await state.update_data(trade_id=trade["id"], supplier_id=trade["supplier_id"])
     await state.set_state(AddPayment.amount)
     await message.answer("Amount?")
 
@@ -159,8 +165,7 @@ async def add_utr(message: Message, state: FSMContext, repo) -> None:
         await message.answer(f"That UTR does not look right: {exc}")
         return
 
-    data = await state.get_data()
-    accounts = await repo.list_bank_accounts(data["supplier_id"])
+    accounts = await repo.open_trade_accounts_for_client(party["id"])
     if not accounts:
         await message.answer("The supplier has no registered accounts. Cannot continue.")
         await state.clear()
@@ -169,8 +174,12 @@ async def add_utr(message: Message, state: FSMContext, repo) -> None:
     await state.update_data(utr=utr)
     await state.set_state(AddPayment.account)
 
+    multi = len({a["trade_id"] for a in accounts}) > 1
     kb = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text=a["account_name"], callback_data=f"acct:{a['id']}")]
+        [InlineKeyboardButton(
+            text=(f"{a['supplier_label']} — {a['account_name']}"
+                  if multi else a["account_name"]),
+            callback_data=f"acct:{a['id']}")]
         for a in accounts
     ])
     await message.answer("Which account did you send it to?", reply_markup=kb)
@@ -182,8 +191,24 @@ async def add_account(call: CallbackQuery, state: FSMContext, party, repo,
     account_id = int(call.data.split(":", 1)[1])
     data = await state.get_data()
 
+    # The account decides the trade. Resolved here rather than carried in the
+    # state, because the client had not yet chosen when the state was written.
+    trade_id = None
+    for a in await repo.open_trade_accounts_for_client(party["id"]):
+        if a["id"] == account_id:
+            trade_id = a["trade_id"]
+            break
+
+    if trade_id is None:
+        await state.clear()
+        await call.message.edit_text(
+            "That account no longer belongs to an open trade. Nothing recorded."
+        )
+        await call.answer()
+        return
+
     ok, msg = await repo.add_payment(
-        trade_id=data["trade_id"],
+        trade_id=trade_id,
         utr=data["utr"],
         amount_inr=to_decimal(data["amount"]),
         beneficiary_account_id=account_id,
@@ -200,10 +225,10 @@ async def add_account(call: CallbackQuery, state: FSMContext, party, repo,
     # Completion first. A payment that finishes a trade also drags it under the
     # near-completion threshold, so asking in the other order tells the supplier
     # to prepare the next batch and then, immediately, that this one is done.
-    if not await notifier.check_completion(data["trade_id"]):
-        await notifier.check_near_completion(data["trade_id"])
+    if not await notifier.check_completion(trade_id):
+        await notifier.check_near_completion(trade_id)
 
-    total = await repo.trade_paid_total(data["trade_id"])
+    total = await repo.trade_paid_total(trade_id)
     await call.message.edit_text(
         f"{msg}\nRunning total: ₹{fmt_inr(total)}"
     )
@@ -241,8 +266,13 @@ async def on_pasted_payment(message: Message, state: FSMContext, party, repo,
     # the sender to tell. The image itself is not needed and is not stored.
     body = message.text or message.caption or ""
 
-    trade = await repo.open_trade_for_client(party["id"])
-    if trade is None:
+    # Every account this client could be paying, each carrying the trade it
+    # belongs to. A client can have one trade open per supplier at the same
+    # time, so "the" open trade is not a thing that exists — resolving it by
+    # recency charged payments to whichever trade happened to start last
+    # (live, 11 September 2026). The account identifies the trade.
+    accounts = await repo.open_trade_accounts_for_client(party["id"])
+    if not accounts:
         return  # nothing open — stay quiet rather than nagging on small talk
 
     result = parse_payments(body)
@@ -268,18 +298,29 @@ async def on_pasted_payment(message: Message, state: FSMContext, party, repo,
             )
         return
 
-    accounts = await repo.list_bank_accounts(trade["supplier_id"])
+    # account id -> (name, trade id). The account carries its trade, so
+    # matching the name resolves both at once.
+    by_id = {a["id"]: a for a in accounts}
+    multi = len({a["trade_id"] for a in accounts}) > 1
 
     staged, lines = [], ["Read this as:", ""]
     for p in result.payments:
         account_id = match_account(p.beneficiary, accounts)
+        row = by_id.get(account_id)
         staged.append({
             "utr": p.utr, "amount": str(p.amount_inr), "account_id": account_id,
+            "trade_id": row["trade_id"] if row else None,
         })
-        name = next((a["account_name"] for a in accounts if a["id"] == account_id), None)
         lines.append(p.utr)
         lines.append(fmt_inr_plain(p.amount_inr))
-        lines.append(f"to {name}" if name else "to ?  (account not recognised)")
+        if row:
+            # With more than one trade running, name the supplier too — the
+            # client should be able to see which trade their money landed on
+            # rather than trusting it silently.
+            lines.append(f"to {row['account_name']}"
+                         + (f"  ({row['supplier_label']})" if multi else ""))
+        else:
+            lines.append("to ?  (account not recognised)")
         lines.append("")
 
     if len(staged) > 1:
@@ -290,17 +331,20 @@ async def on_pasted_payment(message: Message, state: FSMContext, party, repo,
     for problem in result.problems:
         lines.append(f"Note: {problem}")
 
-    await state.update_data(staged=staged, supplier_id=trade["supplier_id"],
-                            trade_id=trade["id"])
+    await state.update_data(staged=staged)
 
     unmatched = [s for s in staged if s["account_id"] is None]
     if unmatched:
         # Never guess an account. A wrong one attributes money to the wrong
-        # place, and the client is right here to be asked. This is the one case
-        # that still stops and waits, whatever the confirmation setting.
+        # place — and now to the wrong trade as well — and the client is right
+        # here to be asked. This is the one case that still stops and waits,
+        # whatever the confirmation setting.
         await state.set_state(PastedPayment.account)
         kb = InlineKeyboardMarkup(inline_keyboard=[
-            [InlineKeyboardButton(text=a["account_name"], callback_data=f"pacct:{a['id']}")]
+            [InlineKeyboardButton(
+                text=(f"{a['supplier_label']} — {a['account_name']}"
+                      if multi else a["account_name"]),
+                callback_data=f"pacct:{a['id']}")]
             for a in accounts
         ])
         lines.append("Which account did these go to?")
@@ -331,7 +375,7 @@ async def on_pasted_payment(message: Message, state: FSMContext, party, repo,
     # Everything read cleanly and every account matched: record it and
     # acknowledge, no tap required (client decision, 8 Sep 2026).
     await state.clear()
-    await _record(message, trade["id"], staged, party, repo, acknowledge=True,
+    await _record(message, staged, party, repo, acknowledge=True,
                   notifier=notifier)
 
 
@@ -355,25 +399,37 @@ async def _acknowledge(message: Message) -> None:
         await message.reply("Noted.")
 
 
-async def _record(message, trade_id, staged, party, repo, *, acknowledge: bool,
+async def _record(message, staged, party, repo, *, acknowledge: bool,
                   notifier=None) -> None:
-    """Write the staged payments and report anything that was refused."""
+    """
+    Write the staged payments and report anything that was refused.
+
+    Each entry carries its OWN trade, taken from the account it was paid to.
+    One pasted message can legitimately span two trades — a client running a
+    trade with each of two suppliers may pay both in one go — and before this
+    every payment in a message went to whichever trade started most recently.
+    """
     added, rejected = [], []
+    touched: list[int] = []
+
     for s in staged:
         ok, msg = await repo.add_payment(
-            trade_id=trade_id, utr=s["utr"],
+            trade_id=s["trade_id"], utr=s["utr"],
             amount_inr=to_decimal(s["amount"]),
             beneficiary_account_id=s["account_id"], added_by=party["id"],
         )
         (added if ok else rejected).append(msg)
+        if ok and s["trade_id"] not in touched:
+            touched.append(s["trade_id"])
 
     if rejected:
         # A duplicate UTR is never acknowledged silently — the client must know
         # that one did not go in (E3).
-        total = await repo.trade_paid_total(trade_id)
+        totals = []
+        for tid in touched or [s["trade_id"] for s in staged]:
+            totals.append(f"Running total: ₹{fmt_inr(await repo.trade_paid_total(tid))}")
         await message.reply(
-            "\n".join([*rejected, f"Recorded {len(added)} of {len(staged)}.",
-                       f"Running total: ₹{fmt_inr(total)}"])
+            "\n".join([*rejected, f"Recorded {len(added)} of {len(staged)}.", *totals])
         )
     elif acknowledge:
         # Acknowledge first, so the client sees the thumbs up on their own
@@ -383,10 +439,11 @@ async def _record(message, trade_id, staged, party, repo, *, acknowledge: bool,
     # Checked even when something was rejected: a paste can carry one duplicate
     # and one good payment, and that good payment can be the one that finishes
     # the trade. Returning early here would leave a fully paid trade open.
-    if added and notifier is not None:
-        # Completion first — see the note in add_account.
-        if not await notifier.check_completion(trade_id):
-            await notifier.check_near_completion(trade_id)
+    if notifier is not None:
+        for tid in touched:
+            # Completion first — see the note in add_account.
+            if not await notifier.check_completion(tid):
+                await notifier.check_near_completion(tid)
 
 
 @router.callback_query(PastedPayment.account, F.data.startswith("pacct:"))
@@ -394,8 +451,21 @@ async def pasted_pick_account(call: CallbackQuery, state: FSMContext, party, rep
                               notifier) -> None:
     account_id = int(call.data.split(":", 1)[1])
     data = await state.get_data()
+
+    # The chosen account decides the trade as well as the beneficiary — they
+    # are the same fact. Look it up rather than carrying a trade in the state,
+    # because the state was written before the client answered.
+    chosen_trade = None
+    for a in await repo.open_trade_accounts_for_client(party["id"]):
+        if a["id"] == account_id:
+            chosen_trade = a["trade_id"]
+            break
+
     staged = [
-        {**s, "account_id": s["account_id"] or account_id} for s in data["staged"]
+        {**s,
+         "account_id": s["account_id"] or account_id,
+         "trade_id": s["trade_id"] or chosen_trade}
+        for s in data["staged"]
     ]
     if REQUIRE_PASTE_CONFIRMATION:
         await state.update_data(staged=staged)
@@ -413,13 +483,15 @@ async def pasted_pick_account(call: CallbackQuery, state: FSMContext, party, rep
     # The account was the only open question — answering it is the
     # confirmation. Do not ask twice.
     await state.clear()
-    total_before = await repo.trade_paid_total(data["trade_id"])
-    await _record(call.message, data["trade_id"], staged, party, repo,
+    await _record(call.message, staged, party, repo,
                   acknowledge=False, notifier=notifier)
-    total = await repo.trade_paid_total(data["trade_id"])
+
+    totals = []
+    for tid in {s["trade_id"] for s in staged if s["trade_id"]}:
+        totals.append(f"Running total: ₹{fmt_inr(await repo.trade_paid_total(tid))}")
     await call.message.edit_text(
         call.message.text.split("Which account")[0].rstrip()
-        + f"\n\nRecorded. Running total: ₹{fmt_inr(total)}"
+        + "\n\nRecorded. " + "  ".join(totals)
     )
     await call.answer()
 
@@ -430,25 +502,28 @@ async def pasted_confirm(call: CallbackQuery, state: FSMContext, party, repo,
     data = await state.get_data()
     await state.clear()
 
-    added, rejected = [], []
+    added, rejected, touched = [], [], []
     for s in data["staged"]:
         ok, msg = await repo.add_payment(
-            trade_id=data["trade_id"], utr=s["utr"],
+            trade_id=s["trade_id"], utr=s["utr"],
             amount_inr=to_decimal(s["amount"]),
             beneficiary_account_id=s["account_id"], added_by=party["id"],
         )
         (added if ok else rejected).append(msg)
+        if ok and s["trade_id"] not in touched:
+            touched.append(s["trade_id"])
 
-    total = await repo.trade_paid_total(data["trade_id"])
     out = [f"Recorded {len(added)} payment(s)."]
     out += [f"  {m}" for m in rejected]          # E3: duplicates named, not hidden
-    out.append(f"Running total: ₹{fmt_inr(total)}")
+    for tid in touched:
+        out.append(f"Running total: ₹{fmt_inr(await repo.trade_paid_total(tid))}")
 
     # Completion first. A payment that finishes a trade also drags it under the
     # near-completion threshold, so asking in the other order tells the supplier
     # to prepare the next batch and then, immediately, that this one is done.
-    if not await notifier.check_completion(data["trade_id"]):
-        await notifier.check_near_completion(data["trade_id"])
+    for tid in touched:
+        if not await notifier.check_completion(tid):
+            await notifier.check_near_completion(tid)
     await call.message.edit_text("\n".join(out))
     await call.answer()
 
@@ -475,11 +550,29 @@ async def cmd_done(message: Message, party, repo, notifier) -> None:
     never be paid in full, where the Bridge has accepted the shortfall. The
     summary states the difference plainly, as it always has.
     """
-    trade = await repo.open_trade_for_client(party["id"])
-    if trade is None:
+    open_trades = await repo.open_trades_for_client(party["id"])
+    if not open_trades:
         await message.answer("You have no open trade to close.")
         return
 
+    if len(open_trades) > 1:
+        # Closing a trade short is a decision about a specific one. With
+        # several running there is no "the" trade to close, and guessing would
+        # close the wrong supplier's — which is the same class of mistake that
+        # misattributed payments (11 September 2026).
+        await message.answer(
+            "You have more than one trade open, so I cannot tell which to "
+            "close:\n\n"
+            + "\n".join(
+                f"  {t['reference']} — {t['supplier_label']}" for t in open_trades
+            )
+            + "\n\nA trade closes itself as soon as its payments cover the "
+              "expected total. Use this only for one that will never be paid "
+              "in full, and tell the Bridge which."
+        )
+        return
+
+    trade = open_trades[0]
     rows = await repo.trade_payments(trade["id"])
     if not rows:
         await message.answer("No payments have been added yet. Nothing to close.")

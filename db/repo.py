@@ -412,6 +412,52 @@ class Repo:
                 client_id,
             )
 
+    async def open_trades_for_client(self, client_id: int) -> list[asyncpg.Record]:
+        """
+        EVERY open trade for this client, not just the newest.
+
+        A client can be running one trade per supplier at the same time — Client
+        A had SUPA1 and SUPB1 open together on 11 September 2026. Resolving
+        "the" open trade with ORDER BY opened_at DESC LIMIT 1 silently charged
+        every payment to whichever started most recently, so money paid against
+        one supplier's instruction landed on another's trade.
+        """
+        async with self.pool.acquire() as conn:
+            return await conn.fetch(
+                """
+                SELECT t.*, s.label AS supplier_label, c.label AS client_label
+                FROM trades t
+                JOIN parties s ON s.id = t.supplier_id
+                JOIN parties c ON c.id = t.client_id
+                WHERE t.client_id = $1 AND t.status IN ('open', 'awaiting_payment')
+                ORDER BY t.opened_at
+                """,
+                client_id,
+            )
+
+    async def open_trade_accounts_for_client(self, client_id: int) -> list[asyncpg.Record]:
+        """
+        Every account this client could be paying, each carrying its trade.
+
+        This is what makes a payment attributable. A bank account belongs to
+        exactly one supplier, and a supplier's open trade is one trade — so the
+        account named on a payment identifies the trade it belongs to, with no
+        guessing and nothing for the client to select.
+        """
+        async with self.pool.acquire() as conn:
+            return await conn.fetch(
+                """
+                SELECT b.id, b.account_name, b.account_number, b.ifsc,
+                       t.id AS trade_id, t.reference, s.label AS supplier_label
+                FROM trades t
+                JOIN parties s ON s.id = t.supplier_id
+                JOIN bank_accounts b ON b.party_id = t.supplier_id AND b.is_active
+                WHERE t.client_id = $1 AND t.status IN ('open', 'awaiting_payment')
+                ORDER BY s.label, b.account_name
+                """,
+                client_id,
+            )
+
     async def open_trade_for_supplier(self, supplier_id: int) -> Optional[asyncpg.Record]:
         """
         Backs the supplier's own progress view (client request, 10 Sep 2026:
