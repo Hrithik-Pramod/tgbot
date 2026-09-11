@@ -598,7 +598,9 @@ async def cmd_done(message: Message, party, repo, notifier) -> None:
 
     # The client sees the summary plus their own confirmation wording.
     await message.answer(summary)
-    await message.answer(render_completion_notice(total))
+    await message.answer(
+        render_completion_notice(total, trade["inr_expected"] or None)
+    )
 
     await notifier.to_bridge(summary)
     await notifier.to_party(

@@ -152,9 +152,27 @@ class Notifier:
             expected_inr=trade["inr_expected"] or None,
         )
 
+        expected = trade["inr_expected"] or None
+
         await self.to_party(trade["client_id"], summary)
-        await self.to_party(trade["client_id"], render_completion_notice(total))
+        await self.to_party(
+            trade["client_id"], render_completion_notice(total, expected)
+        )
         await self.to_bridge(summary)
+
+        # An overpayment is money that has to go back to someone. It closes —
+        # the obligation is more than met — but it is called out separately
+        # rather than left to be spotted inside a summary (11 September 2026:
+        # a trade expecting ₹212,000 took ₹414,400 and closed quietly).
+        if expected is not None and total > expected:
+            await self.to_bridge(
+                f"OVERPAID — {trade['reference']}\n\n"
+                f"Expected ₹{fmt_inr(expected)}\n"
+                f"Received ₹{fmt_inr(total)}\n"
+                f"Over by ₹{fmt_inr(total - expected)}\n\n"
+                "The trade is closed. The difference needs resolving with the "
+                "client."
+            )
         await self.to_party(
             trade["supplier_id"],
             render_supplier_summary(payments, expected_inr=trade["inr_expected"] or None),

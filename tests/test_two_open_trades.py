@@ -104,6 +104,45 @@ class TestNoHandlerStillPicksByRecency:
             "/done must not pick a trade when several are open"
 
 
+class TestOverpaymentIsNotCalledSentInFull:
+    """
+    Live, 11 September 2026. SUPB1 expected ₹212,000 and received ₹414,400.
+    The summary correctly said "Over by ₹202,400" and the very next message
+    said "₹414,400 sent in full" — two contradictory statements one after the
+    other, which is how a correct arithmetic result got reported as a fault.
+    """
+
+    def test_an_overpayment_says_so(self):
+        from decimal import Decimal as D
+        from core.summary import render_completion_notice
+
+        out = render_completion_notice(D("414400"), D("212000"))
+        assert "OVERPAID" in out
+        assert "202,400" in out
+        assert "sent in full" not in out
+
+    def test_a_shortfall_says_so(self):
+        from decimal import Decimal as D
+        from core.summary import render_completion_notice
+
+        out = render_completion_notice(D("200000"), D("212000"))
+        assert "Short by" in out and "sent in full" not in out
+
+    def test_an_exact_payment_keeps_the_clients_wording(self):
+        """Their own phrasing, unchanged, for the case it was written for."""
+        from decimal import Decimal as D
+        from core.summary import render_completion_notice
+
+        out = render_completion_notice(D("212000"), D("212000"))
+        assert out == "This order is completed — ₹212,000 sent in full."
+
+    def test_it_still_works_without_an_expected_figure(self):
+        from decimal import Decimal as D
+        from core.summary import render_completion_notice
+
+        assert "sent in full" in render_completion_notice(D("212000"))
+
+
 class TestRecordingSpansTrades:
     """
     One pasted message can legitimately pay both suppliers. Each payment is

@@ -210,11 +210,37 @@ def render_collection_progress(
     ])
 
 
-def render_completion_notice(total_inr: Decimal) -> str:
+def render_completion_notice(
+    total_inr: Decimal, expected_inr: Decimal | None = None
+) -> str:
     """
     The short confirmation the client asked for, quoting their own wording:
     "This order is completed - Rs 1,499,297 sent in full."
+
+    "Sent in full" is only true when the total matches what was expected. On
+    11 September 2026 a trade expecting ₹212,000 received ₹414,400 and this
+    said "₹414,400 sent in full" directly beneath a line reading "Over by
+    ₹202,400" — two contradictory statements in adjacent messages, which is
+    how the client came to read a correct arithmetic result as a bot fault.
+
+    An overpayment is not a completion to celebrate; it is money someone has
+    to get back. It says so.
     """
+    if expected_inr is not None and total_inr != expected_inr:
+        difference = total_inr - expected_inr
+        if difference > 0:
+            return (
+                f"This order is closed — ₹{fmt_inr(expected_inr)} was expected "
+                f"and ₹{fmt_inr(total_inr)} was received.\n"
+                f"OVERPAID by ₹{fmt_inr(difference)}. Please raise this with "
+                "the Bridge."
+            )
+        return (
+            f"This order is closed — ₹{fmt_inr(expected_inr)} was expected "
+            f"and ₹{fmt_inr(total_inr)} was received.\n"
+            f"Short by ₹{fmt_inr(abs(difference))}."
+        )
+
     return f"This order is completed — ₹{fmt_inr(total_inr)} sent in full."
 
 
