@@ -437,23 +437,52 @@ class Repo:
 
     async def open_trade_accounts_for_client(self, client_id: int) -> list[asyncpg.Record]:
         """
-        Every account this client could be paying, each carrying its trade.
+        The accounts this client could be paying, each carrying its trade.
 
         This is what makes a payment attributable. A bank account belongs to
         exactly one supplier, and a supplier's open trade is one trade — so the
         account named on a payment identifies the trade it belongs to, with no
         guessing and nothing for the client to select.
+
+        SCOPE, and why it is narrow (client complaint, 11 September 2026)
+        ----------------------------------------------------------------
+        Only suppliers this client has actually been INSTRUCTED to pay. An
+        instruction means a payment slot has been issued on an open trade.
+
+        Widening this to every open trade leaked the Bridge's book: the client
+        was shown a list containing both suppliers' names and all five of their
+        account holders, in their own group, having been instructed to pay only
+        one. A counterparty must not learn who else the Bridge deals with, how
+        many accounts they hold, or whose names are on them.
+
+        If nothing has been instructed yet there is nothing to leak and nothing
+        to narrow by, so the open trades' accounts are used — the client can
+        only be paying one of those.
         """
         async with self.pool.acquire() as conn:
+            instructed = await conn.fetch(
+                """
+                SELECT DISTINCT b.id, b.account_name, b.account_number, b.ifsc,
+                       t.id AS trade_id, t.reference
+                FROM trades t
+                JOIN payment_slots ps ON ps.trade_id = t.id
+                JOIN bank_accounts b ON b.party_id = t.supplier_id AND b.is_active
+                WHERE t.client_id = $1 AND t.status IN ('open', 'awaiting_payment')
+                ORDER BY b.account_name
+                """,
+                client_id,
+            )
+            if instructed:
+                return instructed
+
             return await conn.fetch(
                 """
                 SELECT b.id, b.account_name, b.account_number, b.ifsc,
-                       t.id AS trade_id, t.reference, s.label AS supplier_label
+                       t.id AS trade_id, t.reference
                 FROM trades t
-                JOIN parties s ON s.id = t.supplier_id
                 JOIN bank_accounts b ON b.party_id = t.supplier_id AND b.is_active
                 WHERE t.client_id = $1 AND t.status IN ('open', 'awaiting_payment')
-                ORDER BY s.label, b.account_name
+                ORDER BY b.account_name
                 """,
                 client_id,
             )

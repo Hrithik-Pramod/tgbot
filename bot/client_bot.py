@@ -60,9 +60,16 @@ class PastedPayment(StatesGroup):
 
 # --------------------------------------------------------------- /accounts
 
-def _render_accounts(supplier_label: str, accounts) -> list[str]:
-    """D4: the supplier is shown by label only, never by real identity."""
-    lines = [f"Accounts under {supplier_label}:", ""]
+def _render_accounts(accounts) -> list[str]:
+    """
+    The accounts, and nothing about who is behind them.
+
+    Grouping these under supplier labels told the client how many suppliers
+    the Bridge uses and which accounts belong to which — the shape of someone
+    else's book, in a counterparty's group (client complaint, 11 September
+    2026). The client needs the details to pay; they do not need the structure.
+    """
+    lines: list[str] = []
     for a in accounts:
         lines.append(a["account_name"])
         lines.append(f"Acc num - {a['account_number']}")
@@ -74,42 +81,36 @@ def _render_accounts(supplier_label: str, accounts) -> list[str]:
 @router.message(Command("accounts"))
 async def cmd_accounts(message: Message, party, repo) -> None:
     """
-    Show the supplier accounts this client can pay into.
+    Show the accounts this client can pay into.
 
-    With a trade open this is the one supplier that trade belongs to. Without
-    one it lists every supplier the client is paired with, rather than refusing.
-    Answering "you have no open trade" to someone asking where they pay reads
-    as a broken bot, and it is not what they asked (reported 10 Sep 2026).
+    Answering "you have no open trade" to someone asking where to pay reads as
+    a broken bot, and is not what they asked (reported 10 Sep 2026) — so with
+    nothing open it still lists what is registered.
+
+    No supplier labels anywhere in the output. The client needs the details to
+    make a payment; how many suppliers sit behind them, and which account
+    belongs to which, is the Bridge's business (client complaint, 11 Sep 2026).
     """
-    # Grouped by supplier, because a client can be running a trade with more
-    # than one at the same time and needs to see whose account is whose.
     open_accounts = await repo.open_trade_accounts_for_client(party["id"])
     if open_accounts:
-        by_supplier: dict[str, list] = {}
-        for a in open_accounts:
-            by_supplier.setdefault(a["supplier_label"], []).append(a)
-        await message.answer("\n\n".join(
-            "\n".join(_render_accounts(label, accs)).rstrip()
-            for label, accs in by_supplier.items()
-        ))
+        await message.answer(
+            "Accounts you can pay into:\n\n"
+            + "\n".join(_render_accounts(open_accounts)).rstrip()
+        )
         return
 
-    open_trades = await repo.open_trades_for_client(party["id"])
-    if open_trades:
+    if await repo.open_trades_for_client(party["id"]):
         await message.answer(
             "No accounts are registered for this supplier yet. "
             "The supplier needs to add one with /account."
         )
         return
 
-    suppliers = await repo.suppliers_for_client(party["id"])
-    blocks: list[str] = []
-    for s in suppliers:
-        accounts = await repo.list_bank_accounts(s["id"])
-        if accounts:
-            blocks.append("\n".join(_render_accounts(s["label"], accounts)).rstrip())
+    accounts = []
+    for s in await repo.suppliers_for_client(party["id"]):
+        accounts.extend(await repo.list_bank_accounts(s["id"]))
 
-    if not blocks:
+    if not accounts:
         await message.answer(
             "No accounts have been registered yet. Each supplier adds their "
             "own with /account in their group."
@@ -118,7 +119,7 @@ async def cmd_accounts(message: Message, party, repo) -> None:
 
     await message.answer(
         "No trade is open at the moment. Registered accounts:\n\n"
-        + "\n\n".join(blocks)
+        + "\n".join(_render_accounts(accounts)).rstrip()
     )
 
 
@@ -174,12 +175,10 @@ async def add_utr(message: Message, state: FSMContext, repo) -> None:
     await state.update_data(utr=utr)
     await state.set_state(AddPayment.account)
 
-    multi = len({a["trade_id"] for a in accounts}) > 1
+    # Account names only — see the note on the pasted-payment keyboard.
     kb = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(
-            text=(f"{a['supplier_label']} — {a['account_name']}"
-                  if multi else a["account_name"]),
-            callback_data=f"acct:{a['id']}")]
+        [InlineKeyboardButton(text=a["account_name"],
+                              callback_data=f"acct:{a['id']}")]
         for a in accounts
     ])
     await message.answer("Which account did you send it to?", reply_markup=kb)
@@ -301,7 +300,6 @@ async def on_pasted_payment(message: Message, state: FSMContext, party, repo,
     # account id -> (name, trade id). The account carries its trade, so
     # matching the name resolves both at once.
     by_id = {a["id"]: a for a in accounts}
-    multi = len({a["trade_id"] for a in accounts}) > 1
 
     staged, lines = [], ["Read this as:", ""]
     for p in result.payments:
@@ -314,11 +312,11 @@ async def on_pasted_payment(message: Message, state: FSMContext, party, repo,
         lines.append(p.utr)
         lines.append(fmt_inr_plain(p.amount_inr))
         if row:
-            # With more than one trade running, name the supplier too — the
-            # client should be able to see which trade their money landed on
-            # rather than trusting it silently.
-            lines.append(f"to {row['account_name']}"
-                         + (f"  ({row['supplier_label']})" if multi else ""))
+            # The account only. Naming the supplier here tells the client who
+            # else the Bridge deals with, which is not theirs to know — the
+            # trade is resolved from the account internally and does not need
+            # saying out loud (client complaint, 11 September 2026).
+            lines.append(f"to {row['account_name']}")
         else:
             lines.append("to ?  (account not recognised)")
             # Log what was actually written.
@@ -352,11 +350,14 @@ async def on_pasted_payment(message: Message, state: FSMContext, party, repo,
         # here to be asked. This is the one case that still stops and waits,
         # whatever the confirmation setting.
         await state.set_state(PastedPayment.account)
+        # Account names only — never the supplier. This list went out to the
+        # client on 11 September 2026 reading "Supplier A — …" and
+        # "Supplier B — …", which told a counterparty the shape of the
+        # Bridge's book. The names alone are enough to choose between, and
+        # they are accounts the client has been instructed to pay anyway.
         kb = InlineKeyboardMarkup(inline_keyboard=[
-            [InlineKeyboardButton(
-                text=(f"{a['supplier_label']} — {a['account_name']}"
-                      if multi else a["account_name"]),
-                callback_data=f"pacct:{a['id']}")]
+            [InlineKeyboardButton(text=a["account_name"],
+                                  callback_data=f"pacct:{a['id']}")]
             for a in accounts
         ])
         lines.append("Which account did these go to?")

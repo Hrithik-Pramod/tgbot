@@ -309,9 +309,16 @@ def match_account(name: Optional[str], accounts) -> Optional[int]:
         return None  # genuinely ambiguous; make the client choose
 
     # One-sided containment, e.g. "Ekta" against "Ekta Traders Pvt Ltd".
+    #
+    # A fragment must be at least three characters to count. "STC" is a name
+    # somebody meant; "Su" is two letters that happen to appear inside one, and
+    # matching on it would be luck rather than intent. The other direction —
+    # a full account name appearing inside a longer pasted string — needs no
+    # floor, because the account name itself supplies the length.
     partial = [
         a for a in accounts
-        if target in norm(a["account_name"]) or norm(a["account_name"]) in target
+        if (len(target) >= 3 and target in norm(a["account_name"]))
+        or norm(a["account_name"]) in target
     ]
     if len(partial) == 1:
         return partial[0]["id"]
