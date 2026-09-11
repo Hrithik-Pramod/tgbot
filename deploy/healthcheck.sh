@@ -303,7 +303,13 @@ echo "  $(q 'SELECT count(*) FROM trades') trade(s), \
 $(q 'SELECT count(*) FROM payments') payment(s), \
 $(q 'SELECT count(*) FROM deposits') deposit(s)"
 
-ORPHAN="$(q "SELECT count(*) FROM deposits WHERE trade_id IS NULL AND status <> 'unallocated'")"
+# Only INTERNAL wallets open trades. A deposit on a counterparty wallet is the
+# Bridge paying a client onward — it is supposed to have no trade, and flagging
+# it trained the eye to ignore this line, which is worse than not having it.
+ORPHAN="$(q "SELECT count(*) FROM deposits d
+             JOIN wallets w ON w.id = d.wallet_id
+             WHERE d.trade_id IS NULL AND d.status <> 'unallocated'
+               AND w.is_internal")"
 if [ "${ORPHAN:-0}" -eq 0 ]; then
     ok "no deposit is missing its trade"
 else
