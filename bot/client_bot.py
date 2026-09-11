@@ -159,7 +159,7 @@ async def add_amount(message: Message, state: FSMContext) -> None:
 
 
 @router.message(AddPayment.utr)
-async def add_utr(message: Message, state: FSMContext, repo) -> None:
+async def add_utr(message: Message, state: FSMContext, party, repo) -> None:
     try:
         utr = normalise_utr(message.text or "")
     except MoneyError as exc:
