@@ -275,8 +275,26 @@ head_ "Monitor"
 
 TOTAL_W="$(q 'SELECT count(*) FROM wallets WHERE is_monitored')"
 ADOPTED="$(q 'SELECT count(*) FROM monitor_state WHERE adopted_at_ms IS NOT NULL')"
+
+# How long the bot has been up. Adoption is staggered across the poll interval
+# — roughly a few seconds per wallet — so immediately after a restart most
+# wallets legitimately have no cursor yet.
+#
+# Reporting that as a failure is worse than not checking: a check that cries
+# wolf teaches you to skim past it, and this one exists to catch a wallet that
+# genuinely is not being watched.
+UPTIME_S=0
+STARTED="$(docker inspect -f '{{.State.StartedAt}}' \
+           "$(docker compose ps -q bot 2>/dev/null)" 2>/dev/null)"
+if [ -n "$STARTED" ]; then
+    STARTED_EPOCH="$(date -d "$STARTED" +%s 2>/dev/null || echo 0)"
+    [ "$STARTED_EPOCH" -gt 0 ] && UPTIME_S=$(( $(date +%s) - STARTED_EPOCH ))
+fi
+
 if [ "${ADOPTED:-0}" -eq "${TOTAL_W:-0}" ] && [ "${TOTAL_W:-0}" -gt 0 ]; then
     ok "all $TOTAL_W monitored wallet(s) adopted"
+elif [ "$UPTIME_S" -lt 90 ]; then
+    warn "$ADOPTED of $TOTAL_W wallet(s) adopted, but the bot started ${UPTIME_S}s ago — still working through them, re-run in a minute"
 else
     bad "$ADOPTED of $TOTAL_W wallet(s) adopted — the rest are not being watched"
 fi
