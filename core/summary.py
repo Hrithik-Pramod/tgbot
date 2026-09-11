@@ -17,6 +17,7 @@ Client's example:
 
 from __future__ import annotations
 
+import os
 from dataclasses import dataclass
 from decimal import Decimal
 from typing import Sequence
@@ -96,6 +97,27 @@ def render_payment_slot(slot: PaymentSlot, *, html: bool = False) -> str:
         f"Acc name - {esc(slot.account_name)}\n"
         f"{fmt_inr_plain(slot.amount_inr)}"
     )
+
+
+# Whether the client is sent anything when a trade closes.
+#
+# Off from 11 September 2026, at the Bridge's request: "stop for client / any
+# completion message". Until 10 September a trade only closed when someone
+# typed /done, so the closing summary was rare and expected. Auto-completion
+# made it arrive unannounced — 33 lines into an 18-member group the moment the
+# last payment landed — and the Bridge does not want the client receiving the
+# same document he does.
+#
+# The Bridge and the supplier are unaffected; both still get the full itemised
+# summary, which is what they reconcile against.
+#
+# A switch rather than a deletion: the itemised format came from the client's
+# own specification, and a request to turn it back on should be an env change
+# and a restart, not a code change and a deploy.
+CLIENT_CLOSING_SUMMARY = (
+    os.environ.get("CLIENT_CLOSING_SUMMARY", "false").strip().lower()
+    in ("1", "true", "yes")
+)
 
 
 def render_trade_summary(

@@ -16,8 +16,8 @@ from aiogram.types import LinkPreviewOptions
 
 from core.money import fmt_inr, inr_to_usdt, margin_usdt, usdt_to_inr
 from core.summary import (
-    Payment, render_completion_notice, render_deposit_notification,
-    render_supplier_summary, render_trade_summary,
+    CLIENT_CLOSING_SUMMARY, Payment, render_completion_notice,
+    render_deposit_notification, render_supplier_summary, render_trade_summary,
 )
 
 log = logging.getLogger(__name__)
@@ -167,10 +167,18 @@ class Notifier:
             payments, expected_inr=expected, include_header=False
         )
 
-        await self.to_party(trade["client_id"], counterparty_summary)
-        await self.to_party(
-            trade["client_id"], render_completion_notice(total, expected)
-        )
+        # The client is told nothing when a trade closes by itself.
+        #
+        # Bridge request, 11 September 2026: "stop for client / any completion
+        # message". Their team already has a thumbs up against every payment
+        # they sent, which is the acknowledgement they asked for and the one
+        # they act on; the closing document is for the two parties who have to
+        # reconcile it.
+        if CLIENT_CLOSING_SUMMARY:
+            await self.to_party(trade["client_id"], counterparty_summary)
+            await self.to_party(
+                trade["client_id"], render_completion_notice(total, expected)
+            )
         await self.to_bridge(summary)
 
         # An overpayment is money that has to go back to someone. It closes —

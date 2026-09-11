@@ -207,6 +207,62 @@ def classify(line: str) -> tuple[str, str]:
     return "noise", raw
 
 
+def _carry_beneficiary(records: list[dict[str, str]]) -> None:
+    """
+    A beneficiary named once in a block applies to the whole block.
+
+    THE BUG THIS FIXES (live, 11 September 2026)
+
+    A new payment starts whenever a field repeats, so the client's habitual
+    shorthand —
+
+        to Ekta traders
+        BKIDR...5860
+        213460
+        BKIDR...7436
+        233000
+
+    — gives the account to the FIRST payment and nothing to any of the others.
+    Each of those then reaches match_account as None, the bot cannot attribute
+    them, and it stops to ask which account they went to.
+
+    Nobody tapped. The pending conversation lived in memory and a restart threw
+    it away: four payments totalling ₹902,460 were lost exactly this way, and
+    the first anyone knew was the client asking why a completed trade had not
+    closed. The Bridge, on being shown the prompt: "why did they see the other
+    message about choosing account to use?"
+
+    WHY INFERRING IS SAFER THAN ASKING
+
+    Guessing an account is normally forbidden here, because a wrong one puts
+    money against the wrong trade. This is not a guess. The name is one the
+    client wrote, in this message, above these payments — it is the only
+    reading of what they sent. Set against that, asking has a known and
+    expensive failure mode: the question goes unanswered and the money
+    disappears from the ledger entirely.
+
+    HOW FAR IT CARRIES
+
+    Forward, then backwards into any leading gap. A block that names two
+    different accounts still splits at the second name, so each payment takes
+    the account written above it — filling gaps never overrides a name that is
+    actually there.
+    """
+    last: Optional[str] = None
+    for rec in records:
+        if rec.get("beneficiary"):
+            last = rec["beneficiary"]
+        elif last is not None:
+            rec["beneficiary"] = last
+
+    # Payments listed before the name was written. Only reachable when no
+    # earlier name exists, so this cannot overwrite anything.
+    first = next((r["beneficiary"] for r in records if r.get("beneficiary")), None)
+    if first is not None:
+        for rec in records:
+            rec.setdefault("beneficiary", first)
+
+
 def parse_payments(text: str) -> ParseResult:
     """
     Read one or more payments out of a pasted block.
@@ -237,6 +293,8 @@ def parse_payments(text: str) -> ParseResult:
             flush()
         current[kind] = value
     flush()
+
+    _carry_beneficiary(records)
 
     if not records:
         result.problems.append(

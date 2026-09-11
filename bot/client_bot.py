@@ -30,8 +30,8 @@ from core.money import (
 )
 from core.parse import match_account, parse_payments
 from core.summary import (
-    Payment, render_completion_notice, render_supplier_summary,
-    render_trade_summary,
+    CLIENT_CLOSING_SUMMARY, Payment, render_completion_notice,
+    render_supplier_summary, render_trade_summary,
 )
 
 log = logging.getLogger(__name__)
@@ -698,9 +698,15 @@ async def cmd_done(message: Message, party, repo, notifier) -> None:
 
     await repo.complete_trade(trade["id"], party["id"])
 
-    # The client sees the summary plus their own confirmation wording.
-    await message.answer(counterparty_summary)
-    await message.answer(render_completion_notice(total, expected))
+    # The client asked for this one, so it is answered — a command that does
+    # its work in silence reads as a broken bot. But it is an acknowledgement,
+    # not the closing document: no itemised list, no figures (Bridge request,
+    # 11 September 2026, "stop for client / any completion message").
+    if CLIENT_CLOSING_SUMMARY:
+        await message.answer(counterparty_summary)
+        await message.answer(render_completion_notice(total, expected))
+    else:
+        await message.answer("Closed. The Bridge has the details.")
 
     await notifier.to_bridge(summary)
     await notifier.to_party(
