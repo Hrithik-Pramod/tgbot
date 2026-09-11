@@ -270,6 +270,21 @@ async def send_account(call: CallbackQuery, state: FSMContext, party, repo, noti
             f"Noted. INR for your current trade will go to "
             f"{account['account_name']}."
         )
+
+        # This is the moment the trade becomes actionable.
+        #
+        # The deposit landed first — it always does — and its notification
+        # was held back because there was no account on it. Now there is, so
+        # the Bridge gets one complete message instead of a bare deposit
+        # followed later by the part he needed (Bridge request, 11 September
+        # 2026: "can we delay notification until the supplier enters the
+        # details of the trade?").
+        #
+        # announce_trade is a no-op if the wait already ran out and the
+        # monitor sent it, so the two paths cannot double up.
+        trade_id = await repo.open_trade_id_for_reference(attached)
+        if trade_id is not None:
+            await notifier.announce_trade(trade_id)
     else:
         await call.message.edit_text(
             "Noted. This will be applied once your deposit is detected."

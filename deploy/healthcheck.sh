@@ -357,6 +357,27 @@ else
     bad "trades.instructed_at MISSING — run deploy/migrate-003-instructed.sql"
 fi
 
+HAS_ANN="$(q "SELECT count(*) FROM information_schema.columns
+              WHERE table_name='trades' AND column_name='announced_at'")"
+if [ "${HAS_ANN:-0}" -eq 1 ]; then
+    ok "trades.announced_at present (migration 004 applied)"
+else
+    bad "trades.announced_at MISSING — run deploy/migrate-004-announced.sql"
+fi
+
+# A deposit whose notification has been held far past the release window
+# means the sweep is not running. The money is recorded either way, but the
+# Bridge does not know it is there.
+STUCK="$(q "SELECT count(*) FROM trades
+            WHERE announced_at IS NULL
+              AND status IN ('open','awaiting_payment')
+              AND opened_at < now() - interval '30 minutes'")"
+if [ "${STUCK:-0}" -eq 0 ]; then
+    ok "no deposit is waiting unannounced"
+else
+    bad "$STUCK trade(s) held unannounced for over 30 minutes — sweep not running"
+fi
+
 # ---------------------------------------------------------------- logs
 head_ "Recent log"
 

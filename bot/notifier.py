@@ -203,6 +203,59 @@ class Notifier:
                  trade["reference"], total)
         return True
 
+    # ------------------------------------------------ held announcements
+
+    async def announce_trade(self, trade_id: int, *, waited: bool = False) -> bool:
+        """
+        Send the deposit notification that was held back, once.
+
+        A trade is announced when it becomes actionable — the supplier has
+        run /send and named an account — or when the wait runs out, whichever
+        comes first. `waited` says which, because the Bridge needs to know
+        whether he is looking at a complete instruction or at a supplier who
+        has gone quiet.
+
+        The figures come from the trade as it now stands rather than from the
+        deposit that triggered it. If two transfers arrived before the
+        supplier said anything, that is one trade with one total, and one
+        message describing it is both truer and less to read than two.
+
+        Returns False when somebody else already announced it.
+        """
+        trade = await self.repo.claim_trade_announcement(trade_id)
+        if trade is None:
+            return False
+
+        from bot.bridge_trade import confirm_keyboard
+
+        note = ""
+        if waited:
+            note = (
+                "\n\nThe supplier has not entered the trade details yet. "
+                "This is being reported anyway so the deposit is not sitting "
+                "here unseen — chase them for the account before confirming."
+            )
+
+        await self.to_bridge(
+            render_deposit_notification(
+                reference=trade["reference"],
+                supplier_label=trade["supplier_label"],
+                client_label=trade["client_label"],
+                usdt_in=trade["usdt_received"],
+                inr_out=trade["inr_expected"],
+                tx_hash=trade["tx_hash"],
+                wallet_address=trade["wallet_address"],
+                supply_rate=trade["supply_rate"],
+                sell_rate=trade["sell_rate"],
+                usdt_out=trade["usdt_owed_client"],
+                nominated_account=trade["nominated_name"],
+            )
+            + note,
+            reply_markup=confirm_keyboard(trade_id),
+        )
+        log.info("announced trade %s (waited=%s)", trade["reference"], waited)
+        return True
+
     # ------------------------------------------------- deposit → trade flow
 
     async def on_supplier_deposit(
@@ -345,6 +398,33 @@ class Notifier:
                 """,
                 trade_id,
             )
+
+        # Hold the message when there is nothing to act on yet.
+        #
+        # The intended order was /send first, deposit second. Suppliers do the
+        # opposite every time (Bridge, 11 September 2026: "they are always
+        # sending usdt first then entering the details"), so announcing on
+        # detection hands the Bridge a trade with no account on it, followed
+        # later by the part he actually needed.
+        #
+        # So: if this trade has never been announced and nobody has nominated
+        # an account, say nothing now. /send releases it with the account
+        # filled in; the monitor releases it anyway once the wait runs out.
+        # The deposit is already recorded either way — only the message waits.
+        #
+        # A trade that HAS been announced keeps notifying on every further
+        # deposit, as before. The Bridge already knows it exists, and a second
+        # tranche changing the total is exactly what he needs telling about.
+        already_announced = trade is not None and trade["announced_at"] is not None
+
+        if not already_announced and nominated_name is None:
+            log.info(
+                "holding announcement for %s — no account nominated yet",
+                reference,
+            )
+            return
+
+        await self.repo.mark_trade_announced(trade_id)
 
         # The confirm button is attached here so the Bridge can go straight from
         # "a deposit landed" to issuing the client's payment instruction without

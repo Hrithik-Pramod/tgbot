@@ -225,6 +225,96 @@ class Repo:
                 """
             )
 
+    async def claim_trade_announcement(self, trade_id: int) -> Optional[asyncpg.Record]:
+        """
+        Win the right to announce this trade, exactly once.
+
+        Two things race to release a held notification: the supplier running
+        /send, and the monitor's timeout sweep. Both can fire in the same
+        second — a supplier who runs /send nine minutes and fifty-nine
+        seconds after sending is not a rare case, it is a normal one.
+
+        Setting the stamp inside the same statement that reads it means only
+        one caller ever gets a row back. The other gets None and does
+        nothing, so the Bridge is told once rather than twice about the same
+        deposit.
+
+        Returns everything the notification needs, so the caller does not
+        have to go back for labels and hashes.
+        """
+        async with self.pool.acquire() as conn:
+            return await conn.fetchrow(
+                """
+                WITH claimed AS (
+                    UPDATE trades SET announced_at = now()
+                    WHERE id = $1 AND announced_at IS NULL
+                    RETURNING *
+                )
+                SELECT c.*,
+                       s.label AS supplier_label,
+                       cl.label AS client_label,
+                       b.account_name AS nominated_name,
+                       w.address AS wallet_address,
+                       (SELECT d.tx_hash FROM deposits d
+                        WHERE d.trade_id = c.id
+                        ORDER BY d.detected_at DESC LIMIT 1) AS tx_hash
+                FROM claimed c
+                JOIN parties s  ON s.id  = c.supplier_id
+                JOIN parties cl ON cl.id = c.client_id
+                JOIN wallets w  ON w.id  = c.wallet_id
+                LEFT JOIN bank_accounts b ON b.id = c.nominated_account_id
+                """,
+                trade_id,
+            )
+
+    async def open_trade_id_for_reference(self, reference: str) -> Optional[int]:
+        """
+        nominate_account returns the reference it attached to, because that
+        is what the supplier's confirmation used to print. Releasing a held
+        announcement needs the id, and looking it up here avoids changing
+        that return type and every caller that reads it.
+        """
+        async with self.pool.acquire() as conn:
+            return await conn.fetchval(
+                "SELECT id FROM trades WHERE reference = $1", reference
+            )
+
+    async def mark_trade_announced(self, trade_id: int) -> None:
+        """
+        Record that the Bridge has been told, when the notification went out
+        on the ordinary path rather than through a held release.
+
+        Without this a deposit that arrived WITH a nomination already in
+        place would be announced immediately and then announced a second
+        time by the timeout sweep, which still saw a null stamp.
+        """
+        async with self.pool.acquire() as conn:
+            await conn.execute(
+                "UPDATE trades SET announced_at = COALESCE(announced_at, now()) "
+                "WHERE id = $1",
+                trade_id,
+            )
+
+    async def trades_awaiting_announcement(self, older_than_minutes: int) -> list[asyncpg.Record]:
+        """
+        Trades whose notification has been held long enough.
+
+        The floor under the wait. A supplier who sends USDT and then never
+        runs /send would otherwise leave money recorded and nobody told —
+        which is the failure this whole day was about.
+        """
+        async with self.pool.acquire() as conn:
+            return await conn.fetch(
+                """
+                SELECT id FROM trades
+                WHERE announced_at IS NULL
+                  AND status IN ('open', 'awaiting_payment')
+                  AND opened_at < now() - ($1 || ' minutes')::interval
+                ORDER BY opened_at
+                """,
+                str(older_than_minutes),
+            )
+
     async def party_label(self, party_id: int) -> Optional[str]:
         """The name a party is known by. Used to say whose wallet a payout
         reached, rather than describing it as 'non-internal'."""

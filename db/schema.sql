@@ -177,6 +177,19 @@ CREATE TABLE trades (
     -- deposit is a new trade."
     instructed_at   TIMESTAMPTZ,
 
+    -- When the Bridge was told this trade exists.
+    --
+    -- Null means a deposit has landed and is recorded, but the message has
+    -- not gone out yet because the supplier has not said which account the
+    -- INR goes to. Suppliers send the USDT first and run /send afterwards
+    -- every time (Bridge, 11 September 2026), so announcing on detection
+    -- produced a message he could not act on.
+    --
+    -- The wait has a floor: the monitor announces anything still unannounced
+    -- after ANNOUNCE_AFTER_MINUTES regardless, marked as not yet entered. A
+    -- supplier who sends and goes quiet must never be invisible.
+    announced_at    TIMESTAMPTZ,
+
     status          trade_status NOT NULL DEFAULT 'open',
     opened_at       TIMESTAMPTZ NOT NULL DEFAULT now(),
     completed_at    TIMESTAMPTZ,
@@ -195,6 +208,10 @@ CREATE TABLE trades (
 CREATE UNIQUE INDEX trades_one_uninstructed_per_wallet
     ON trades (wallet_id)
     WHERE status IN ('open', 'awaiting_payment') AND instructed_at IS NULL;
+
+-- The monitor asks for these on every cycle, so it stays cheap.
+CREATE INDEX trades_unannounced_idx ON trades (opened_at)
+    WHERE announced_at IS NULL;
 
 CREATE INDEX trades_supplier_idx ON trades (supplier_id, opened_at DESC);
 CREATE INDEX trades_client_idx   ON trades (client_id, opened_at DESC);

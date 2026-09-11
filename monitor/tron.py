@@ -102,6 +102,16 @@ UNCONFIRMED_ALERT_MINUTES = 15
 # enough to still be actionable the same morning.
 UNMATCHED_SEND_MINUTES = 30
 
+# How long a deposit's notification is held while we wait for the supplier to
+# run /send and name an account. Suppliers send the USDT first and enter the
+# details afterwards, so announcing on detection gives the Bridge a trade he
+# cannot act on (his request, 11 September 2026).
+#
+# This is a delay, never a condition. Whatever is still unannounced after it
+# goes out anyway, marked as not yet entered — a supplier who sends and then
+# says nothing must not leave money recorded and nobody told.
+ANNOUNCE_AFTER_MINUTES = 10
+
 
 def units_to_usdt(raw: Any) -> Decimal:
     """
@@ -432,6 +442,35 @@ class DepositMonitor:
 
         await self._report_unconfirmed()
         await self._report_unmatched_sends()
+        await self._release_held_announcements()
+
+    async def _release_held_announcements(self) -> None:
+        """
+        The floor under the wait.
+
+        A deposit's notification is held until the supplier names an account.
+        If they never do, this sends it anyway — the Bridge is told the
+        details are missing rather than told nothing at all.
+
+        Wrapped in its own try/except for the same reason every other sweep
+        is: a failure here must not stop the poll loop, because the poll loop
+        is what notices money arriving.
+        """
+        try:
+            waiting = await self.repo.trades_awaiting_announcement(
+                ANNOUNCE_AFTER_MINUTES
+            )
+        except Exception:
+            log.exception("could not check for held announcements")
+            return
+
+        for row in waiting:
+            try:
+                await self.notifier.announce_trade(row["id"], waited=True)
+            except Exception:
+                # One bad trade must not hold up the rest, and the stamp is
+                # only set on success, so it will be retried next cycle.
+                log.exception("could not announce held trade %s", row["id"])
 
     async def _report_unmatched_sends(self) -> None:
         """
