@@ -596,6 +596,21 @@ class Repo:
                 )
                 return True, f"Recorded {utr}."
 
+    async def existing_utrs(self, utrs: Sequence[str]) -> set:
+        """
+        Which of these references are already in the ledger.
+
+        Used when a client edits a payment message: the edit has to be told
+        apart from a new payment, and the UTR is what distinguishes them.
+        """
+        if not utrs:
+            return set()
+        async with self.pool.acquire() as conn:
+            rows = await conn.fetch(
+                "SELECT utr FROM payments WHERE utr = ANY($1::text[])", list(utrs)
+            )
+            return {r["utr"] for r in rows}
+
     async def trade_payments(self, trade_id: int) -> list[asyncpg.Record]:
         async with self.pool.acquire() as conn:
             return await conn.fetch(

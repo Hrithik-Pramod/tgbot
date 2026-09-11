@@ -313,4 +313,43 @@ def match_account(name: Optional[str], accounts) -> Optional[int]:
         a for a in accounts
         if target in norm(a["account_name"]) or norm(a["account_name"]) in target
     ]
-    return partial[0]["id"] if len(partial) == 1 else None
+    if len(partial) == 1:
+        return partial[0]["id"]
+    if len(partial) > 1:
+        return None
+
+    # Leading words, e.g. "Super Trading Company Pvt" against
+    # "SUPER TRADING COMPANY (STC)". Neither contains the other, so
+    # containment misses it, but they plainly mean the same account.
+    #
+    # Client request, 11 September 2026: "does not need to be full word match,
+    # only first of the word Super etc". People type the start of a name and
+    # stop.
+    #
+    # Still strict in the way that matters: a candidate only counts if it is
+    # the ONLY one that fits. Two accounts sharing an opening word send the
+    # client back to the buttons rather than guessing between them, because a
+    # wrong match puts money against the wrong account and now the wrong trade.
+    def first_word(s: str) -> str:
+        for token in re.split(r"[^A-Za-z0-9]+", s.lower()):
+            if token:
+                return token
+        return ""
+
+    head = first_word(name)
+    if len(head) >= 3:
+        by_head = [a for a in accounts if first_word(a["account_name"]) == head]
+        if len(by_head) == 1:
+            return by_head[0]["id"]
+
+    # Last resort: a shared opening run of characters, long enough not to be a
+    # coincidence. "supertrading…" against "supertradingcompanystc".
+    if len(target) >= 5:
+        by_prefix = [
+            a for a in accounts
+            if norm(a["account_name"])[:5] == target[:5]
+        ]
+        if len(by_prefix) == 1:
+            return by_prefix[0]["id"]
+
+    return None

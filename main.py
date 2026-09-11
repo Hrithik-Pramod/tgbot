@@ -41,6 +41,10 @@ def build_dispatcher(routers, repo, notifier, role: str, config) -> Dispatcher:
     )
     dp.message.middleware(middleware)
     dp.callback_query.middleware(middleware)
+    # Edits arrive on their own observer. Without this the handler runs with no
+    # `party` injected and raises — and worse, an unregistered chat would not
+    # be filtered out, which is the one thing the middleware exists to do.
+    dp.edited_message.middleware(middleware)
 
     # Handlers receive these by name rather than reaching for globals.
     dp["repo"] = repo

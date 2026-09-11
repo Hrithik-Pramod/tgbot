@@ -321,6 +321,18 @@ async def on_pasted_payment(message: Message, state: FSMContext, party, repo,
                          + (f"  ({row['supplier_label']})" if multi else ""))
         else:
             lines.append("to ?  (account not recognised)")
+            # Log what was actually written.
+            #
+            # When this happened live on 11 September 2026 the only record was
+            # "account not recognised" — the name the client typed was nowhere,
+            # so diagnosing it meant asking someone to find the message. The
+            # text that failed is the single most useful thing to know, and it
+            # costs one line.
+            log.warning(
+                "unmatched beneficiary %r in chat %s (candidates: %s)",
+                p.beneficiary, message.chat.id,
+                [a["account_name"] for a in accounts],
+            )
         lines.append("")
 
     if len(staged) > 1:
@@ -377,6 +389,66 @@ async def on_pasted_payment(message: Message, state: FSMContext, party, repo,
     await state.clear()
     await _record(message, staged, party, repo, acknowledge=True,
                   notifier=notifier)
+
+
+# ------------------------------------------------------- edited payments
+#
+# People correct a mistake by editing the message. It looks fixed on screen and
+# is invisible to a bot listening only for new messages — on 11 September 2026
+# a client pasted a payment, the bot reported "account not recognised", and
+# they edited the message to add the account. The message now reads perfectly
+# and the bot never saw a word of the correction.
+#
+# Editing cannot un-record something already logged, so the two cases are
+# separated: a reference already in the ledger gets a plain explanation, and
+# one that is not gets read like any other payment.
+
+
+@router.edited_message(
+    (F.text & ~F.text.startswith("/")) | (F.caption & ~F.caption.startswith("/"))
+)
+async def on_edited_payment(message: Message, party, repo, notifier) -> None:
+    body = message.text or message.caption or ""
+
+    accounts = await repo.open_trade_accounts_for_client(party["id"])
+    if not accounts:
+        return
+
+    result = parse_payments(body)
+    if not result.payments:
+        return  # same rule as a new message: silence unless it was a payment
+
+    already = await repo.existing_utrs([p.utr for p in result.payments])
+    fresh = [p for p in result.payments if p.utr not in already]
+
+    if not fresh:
+        await message.reply(
+            "That payment is already recorded — editing the message does not "
+            "change what was logged.\n\n"
+            "If something was wrong, tell the Bridge rather than editing."
+        )
+        return
+
+    by_id = {a["id"]: a for a in accounts}
+    staged = []
+    for p in fresh:
+        account_id = match_account(p.beneficiary, accounts)
+        row = by_id.get(account_id)
+        if row is None:
+            # An edit cannot open a conversation — the buttons would attach to
+            # a message whose text may change again. Ask for a fresh message,
+            # which takes the normal path with all its checks.
+            await message.reply(
+                "I still cannot tell which account this went to.\n\n"
+                "Please send it as a NEW message rather than editing this one."
+            )
+            return
+        staged.append({
+            "utr": p.utr, "amount": str(p.amount_inr),
+            "account_id": account_id, "trade_id": row["trade_id"],
+        })
+
+    await _record(message, staged, party, repo, acknowledge=True, notifier=notifier)
 
 
 async def _acknowledge(message: Message) -> None:
