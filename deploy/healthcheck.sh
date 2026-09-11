@@ -334,13 +334,27 @@ else
     warn "$ORPHAN deposit(s) with no trade attached"
 fi
 
+# A wallet may legitimately have two open trades since 11 Sep 2026: one
+# awaiting payment against an issued instruction, and a newer one collecting
+# deposits. What must never happen is two trades both open to deposits, because
+# then nothing decides which one an arriving deposit belongs to.
 MULTI="$(q "SELECT count(*) FROM (SELECT wallet_id FROM trades
-            WHERE status IN ('open','awaiting_payment')
+            WHERE status IN ('open','awaiting_payment') AND instructed_at IS NULL
             GROUP BY wallet_id HAVING count(*) > 1) t")"
 if [ "${MULTI:-0}" -eq 0 ]; then
-    ok "at most one open trade per wallet"
+    ok "at most one uninstructed open trade per wallet"
 else
-    bad "$MULTI wallet(s) with more than one open trade"
+    bad "$MULTI wallet(s) with more than one trade open to deposits"
+fi
+
+# The migration must actually have been applied. Without the column the bot
+# raises on every deposit, and the failure looks like a monitor outage.
+HAS_COL="$(q "SELECT count(*) FROM information_schema.columns
+              WHERE table_name='trades' AND column_name='instructed_at'")"
+if [ "${HAS_COL:-0}" -eq 1 ]; then
+    ok "trades.instructed_at present (migration 003 applied)"
+else
+    bad "trades.instructed_at MISSING — run deploy/migrate-003-instructed.sql"
 fi
 
 # ---------------------------------------------------------------- logs

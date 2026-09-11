@@ -166,6 +166,17 @@ CREATE TABLE trades (
     -- without this the supplier is told on every one of them.
     nearing_completion_notified BOOLEAN NOT NULL DEFAULT FALSE,
 
+    -- When the client was first told what to pay. A trade with this set is
+    -- CLOSED TO NEW DEPOSITS: the client is holding an instruction for a
+    -- specific figure, and moving the goalposts underneath it means the trade
+    -- can never close on the amount actually asked for.
+    --
+    -- 11 September 2026: 1,859 USDT opened SUPB1, the client was instructed to
+    -- pay ₹197,054, and a 3,000 USDT deposit ten minutes later grew the same
+    -- trade to ₹515,054. Client rule: "once the trade is issued, any new
+    -- deposit is a new trade."
+    instructed_at   TIMESTAMPTZ,
+
     status          trade_status NOT NULL DEFAULT 'open',
     opened_at       TIMESTAMPTZ NOT NULL DEFAULT now(),
     completed_at    TIMESTAMPTZ,
@@ -173,10 +184,17 @@ CREATE TABLE trades (
     CONSTRAINT trades_reference_unique UNIQUE (reference)
 );
 
--- B6: deposits accumulate against one open trade per pairing, so there can only
--- be one open trade per wallet at a time.
-CREATE UNIQUE INDEX trades_one_open_per_wallet
-    ON trades (wallet_id) WHERE status IN ('open', 'awaiting_payment');
+-- B6, as amended 11 September 2026.
+--
+-- A wallet may now have several open trades at once — one awaiting payment
+-- against an issued instruction, and a later one accumulating fresh deposits.
+-- What must never happen is two trades both collecting deposits, because then
+-- there is no answer to which one a deposit belongs in.
+--
+-- So the uniqueness is on the UNINSTRUCTED open trade: exactly one per wallet.
+CREATE UNIQUE INDEX trades_one_uninstructed_per_wallet
+    ON trades (wallet_id)
+    WHERE status IN ('open', 'awaiting_payment') AND instructed_at IS NULL;
 
 CREATE INDEX trades_supplier_idx ON trades (supplier_id, opened_at DESC);
 CREATE INDEX trades_client_idx   ON trades (client_id, opened_at DESC);

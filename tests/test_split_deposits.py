@@ -11,6 +11,22 @@ USDT?" Three cases, and only one of them is dangerous:
                        old instruction in their chat.
 
 The third case is where someone pays twice, so most of this file is about it.
+
+RESOLVED 11 September 2026
+--------------------------
+The third case no longer happens. It happened live — 1,859 USDT instructed at
+₹197,054, then 3,000 USDT ten minutes later took the same trade to ₹515,054 —
+and the rule now is that a deposit landing after instructions have gone out
+opens the next trade instead. See test_trade_splitting.py.
+
+Everything here still holds and still matters:
+
+  * the accumulation arithmetic, because two tranches BEFORE instructions are
+    issued are still one trade, and still have to be priced off the running
+    total rather than added up;
+  * "ADDITIONAL deposit" in the notification, for that same case;
+  * allocating only what is outstanding, because /issue can re-issue against a
+    trade the client has already part-paid.
 """
 
 import sys

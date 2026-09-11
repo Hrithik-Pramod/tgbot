@@ -15,6 +15,15 @@ order things happened in that morning.
 The fix rests on one fact: a bank account belongs to exactly one supplier, and
 a supplier has at most one open trade. So the account a payment went to
 identifies its trade, with nothing to guess and nothing to ask.
+
+AMENDED 11 September 2026, later the same day
+---------------------------------------------
+The second half of that fact stopped being true. A deposit arriving after an
+instruction now opens a new trade, so one supplier can have two trades open and
+the same account sits on both. The account still resolves a trade, but the
+resolution needs a tie-break: oldest instructed, not yet fully paid. That is
+tested in test_trade_splitting.py; everything below still holds, because it is
+about never resolving by recency.
 """
 
 import inspect

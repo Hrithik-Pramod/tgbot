@@ -228,10 +228,29 @@ class Notifier:
 
         async with self.repo.pool.acquire() as conn:
             async with conn.transaction():
+                # Only a trade that has NOT been instructed can take a new
+                # deposit.
+                #
+                # Once the client has been told to pay a figure, that figure is
+                # the trade. A deposit landing afterwards is the start of the
+                # next one (client rule, 11 September 2026: "once the trade is
+                # issued, any new deposit is a new trade"). Before this, 3,000
+                # USDT arriving ten minutes after an instruction for ₹197,054
+                # grew the same trade to ₹515,054, leaving a trade that could
+                # not close on the amount the client had actually been asked
+                # for.
+                #
+                # ORDER BY opened_at with the uniqueness index behind it means
+                # there is at most one such row, but the ordering makes the
+                # intent explicit rather than relying on the index to hold.
                 trade = await conn.fetchrow(
                     """
                     SELECT * FROM trades
-                    WHERE wallet_id = $1 AND status IN ('open', 'awaiting_payment')
+                    WHERE wallet_id = $1
+                      AND status IN ('open', 'awaiting_payment')
+                      AND instructed_at IS NULL
+                    ORDER BY opened_at
+                    LIMIT 1
                     FOR UPDATE
                     """,
                     wallet["id"],

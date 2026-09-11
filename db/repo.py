@@ -458,17 +458,48 @@ class Repo:
         If nothing has been instructed yet there is nothing to leak and nothing
         to narrow by, so the open trades' accounts are used — the client can
         only be paying one of those.
+
+        WHICH trade, when an account maps to more than one (11 Sep 2026)
+        ----------------------------------------------------------------
+        Since a deposit arriving after an instruction opens a NEW trade, one
+        supplier can have two trades open at once — SUPB1 awaiting payment and
+        SUPB2 behind it — and the same bank account sits on both. The account
+        alone no longer names the trade.
+
+        The tie-break is FIFO, which is what the client is actually doing:
+        they pay the instruction they were given, and instructions go out in
+        order. So a payment is attributed to the OLDEST instructed trade for
+        that account that is not yet fully paid. Once SUPB1 is covered, the
+        next payment to the same account falls through to SUPB2.
+
+        Fully-paid trades stay in the list rather than being filtered out, so
+        that a late or duplicate payment still resolves to a real trade and is
+        rejected by the UTR constraint, rather than resolving to nothing and
+        being reported as an unrecognised account.
         """
         async with self.pool.acquire() as conn:
             instructed = await conn.fetch(
                 """
-                SELECT DISTINCT b.id, b.account_name, b.account_number, b.ifsc,
-                       t.id AS trade_id, t.reference
-                FROM trades t
-                JOIN payment_slots ps ON ps.trade_id = t.id
-                JOIN bank_accounts b ON b.party_id = t.supplier_id AND b.is_active
-                WHERE t.client_id = $1 AND t.status IN ('open', 'awaiting_payment')
-                ORDER BY b.account_name
+                SELECT id, account_name, account_number, ifsc, trade_id, reference
+                FROM (
+                    SELECT DISTINCT ON (b.id)
+                           b.id, b.account_name, b.account_number, b.ifsc,
+                           t.id AS trade_id, t.reference
+                    FROM trades t
+                    JOIN payment_slots ps ON ps.trade_id = t.id
+                    JOIN bank_accounts b ON b.party_id = t.supplier_id AND b.is_active
+                    WHERE t.client_id = $1
+                      AND t.status IN ('open', 'awaiting_payment')
+                    ORDER BY
+                        b.id,
+                        -- unpaid trades first, oldest instruction first
+                        (COALESCE((SELECT sum(p.amount_inr) FROM payments p
+                                   WHERE p.trade_id = t.id), 0)
+                         >= t.inr_expected),
+                        t.instructed_at,
+                        t.opened_at
+                ) picked
+                ORDER BY account_name
                 """,
                 client_id,
             )
@@ -501,7 +532,14 @@ class Repo:
                 FROM trades t
                 JOIN parties c ON c.id = t.client_id
                 WHERE t.supplier_id = $1 AND t.status IN ('open', 'awaiting_payment')
-                ORDER BY t.opened_at DESC
+                -- A supplier can now have two trades open: one being collected
+                -- against an issued instruction, and a newer one holding a
+                -- deposit that has not been instructed yet. "Progress" means
+                -- the one money is actually coming in on, so instructed trades
+                -- come first and the oldest of those wins — the same FIFO order
+                -- the client pays in. Newest-first would have answered with the
+                -- untouched trade and reported no progress at all.
+                ORDER BY (t.instructed_at IS NULL), t.instructed_at, t.opened_at
                 LIMIT 1
                 """,
                 supplier_id,
@@ -728,7 +766,23 @@ class Repo:
                     UPDATE trades SET nominated_account_id = $2
                     WHERE id = (
                         SELECT id FROM trades
-                        WHERE supplier_id = $1 AND status IN ('open', 'awaiting_payment')
+                        WHERE supplier_id = $1
+                          AND status IN ('open', 'awaiting_payment')
+                          -- Never re-nominate a trade whose instruction has
+                          -- already been sent. The client is holding a message
+                          -- naming an account; changing it here changes nothing
+                          -- in their chat and leaves the record disagreeing
+                          -- with what they were actually told.
+                          --
+                          -- Live on 11 September 2026: SUPB1 was instructed at
+                          -- 16:37 and re-nominated at 17:14 by a /send that was
+                          -- really about the next deposit.
+                          --
+                          -- With no uninstructed trade this returns nothing,
+                          -- which is the correct answer — the nomination is
+                          -- kept in the audit log and picked up by
+                          -- latest_nomination when the next trade opens.
+                          AND instructed_at IS NULL
                         ORDER BY opened_at DESC LIMIT 1
                     )
                     RETURNING reference
@@ -892,8 +946,16 @@ class Repo:
                         """,
                         trade_id, account_id, amount,
                     )
+                # instructed_at is set once and never moved. Re-issuing a
+                # corrected instruction for the same trade must not reopen it
+                # to deposits — COALESCE keeps the original moment.
                 await conn.execute(
-                    "UPDATE trades SET status = 'awaiting_payment' WHERE id = $1",
+                    """
+                    UPDATE trades
+                    SET status = 'awaiting_payment',
+                        instructed_at = COALESCE(instructed_at, now())
+                    WHERE id = $1
+                    """,
                     trade_id,
                 )
                 await self.audit(
