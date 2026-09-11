@@ -37,7 +37,21 @@ from monitor import tron  # noqa: E402
 
 
 def _src():
-    return inspect.getsource(tron.DepositMonitor._handle_deposit)
+    """
+    The handler's CODE, with docstring and comments stripped out.
+
+    These tests assert that certain wording is gone. The comments explaining
+    why it is gone necessarily quote it, so matching against raw source makes
+    the test fail on its own explanation — which it did, the first time it
+    ran.
+    """
+    fn = tron.DepositMonitor._handle_deposit
+    src = inspect.getsource(fn)
+    if fn.__doc__:
+        src = src.replace(fn.__doc__, "")
+    return "\n".join(
+        line for line in src.splitlines() if not line.strip().startswith("#")
+    )
 
 
 class TestTheWordingDescribesWhatHappened:

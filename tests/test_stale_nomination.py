@@ -53,7 +53,21 @@ from db.repo import Repo  # noqa: E402
 
 
 def _sql(fn) -> str:
-    return re.sub(r"\s+", " ", inspect.getsource(fn))
+    """
+    The function's CODE with whitespace flattened — docstring and comments
+    removed first.
+
+    The docstring below explains which mechanism was abandoned and names it,
+    so matching against raw source fails on the explanation rather than the
+    implementation. That happened on the first run of this file.
+    """
+    src = inspect.getsource(fn)
+    if fn.__doc__:
+        src = src.replace(fn.__doc__, "")
+    src = "\n".join(
+        line for line in src.splitlines() if not line.strip().startswith("#")
+    )
+    return re.sub(r"\s+", " ", src)
 
 
 class TestANominationIsOfferedOnce:
