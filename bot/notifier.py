@@ -96,10 +96,12 @@ class Notifier:
         paid = await self.repo.trade_paid_total(trade_id)
         outstanding = trade["inr_expected"] - paid
 
+        # No deal reference. The supplier's completion summary already omits it
+        # (client request, 10 September 2026: "remove the SUPA1 as dont want
+        # them to see that") and this message was still carrying it.
         await self.to_party(
             trade["supplier_id"],
             "Prepare next batch — close to completion\n\n"
-            f"Transaction {trade['reference']}\n"
             f"Outstanding: ₹{fmt_inr(outstanding)} of ₹{fmt_inr(trade['inr_expected'])}",
         )
         await self.to_bridge(
@@ -146,15 +148,26 @@ class Notifier:
         ]
         total = sum(p.amount_inr for p in payments)
 
+        expected = trade["inr_expected"] or None
+
+        # The deal reference goes to the Bridge only.
+        #
+        # "SUPA1" names the supplier: SUPA is Supplier A, SUPB is Supplier B.
+        # A client holding summaries for both can read off how many suppliers
+        # sit behind the Bridge and tell one from the other — the same
+        # disclosure as the labelled account list, in a different place. The
+        # supplier's copy already omits it at the client's request on
+        # 10 September 2026; the client's copy should never have carried it.
         summary = render_trade_summary(
             payments,
             reference=trade["reference"],
-            expected_inr=trade["inr_expected"] or None,
+            expected_inr=expected,
+        )
+        counterparty_summary = render_trade_summary(
+            payments, expected_inr=expected, include_header=False
         )
 
-        expected = trade["inr_expected"] or None
-
-        await self.to_party(trade["client_id"], summary)
+        await self.to_party(trade["client_id"], counterparty_summary)
         await self.to_party(
             trade["client_id"], render_completion_notice(total, expected)
         )

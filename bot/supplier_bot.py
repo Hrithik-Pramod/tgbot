@@ -263,8 +263,12 @@ async def send_account(call: CallbackQuery, state: FSMContext, party, repo, noti
     )
 
     if attached:
+        # Their own account, not the deal reference. "SUPA1" is the Bridge's
+        # internal numbering and the client asked on 10 September 2026 that
+        # suppliers not see it; this message was still printing it.
         await call.message.edit_text(
-            f"Noted. INR for {attached} will go to {account['account_name']}."
+            f"Noted. INR for your current trade will go to "
+            f"{account['account_name']}."
         )
     else:
         await call.message.edit_text(

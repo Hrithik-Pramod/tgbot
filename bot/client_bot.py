@@ -633,15 +633,16 @@ async def cmd_done(message: Message, party, repo, notifier) -> None:
         # several running there is no "the" trade to close, and guessing would
         # close the wrong supplier's — which is the same class of mistake that
         # misattributed payments (11 September 2026).
+        #
+        # The count is all the client is told. Listing the trades would name
+        # the references and the suppliers behind them, which is exactly the
+        # disclosure the labelled account list made.
         await message.answer(
-            "You have more than one trade open, so I cannot tell which to "
-            "close:\n\n"
-            + "\n".join(
-                f"  {t['reference']} — {t['supplier_label']}" for t in open_trades
-            )
-            + "\n\nA trade closes itself as soon as its payments cover the "
-              "expected total. Use this only for one that will never be paid "
-              "in full, and tell the Bridge which."
+            f"You have {len(open_trades)} trades open, so I cannot tell which "
+            "to close.\n\n"
+            "A trade closes itself as soon as its payments cover the expected "
+            "total. Use this only for one that will never be paid in full, "
+            "and ask the Bridge to close it."
         )
         return
 
@@ -660,20 +661,23 @@ async def cmd_done(message: Message, party, repo, notifier) -> None:
         for r in rows
     ]
 
-    summary = render_trade_summary(
-        payments,
-        reference=trade["reference"],
-        expected_inr=trade["inr_expected"] or None,
-    )
+    expected = trade["inr_expected"] or None
     total = sum(p.amount_inr for p in payments)
+
+    # The deal reference goes to the Bridge only — "SUPA1" names the supplier.
+    # See the note in Notifier.check_completion.
+    summary = render_trade_summary(
+        payments, reference=trade["reference"], expected_inr=expected
+    )
+    counterparty_summary = render_trade_summary(
+        payments, expected_inr=expected, include_header=False
+    )
 
     await repo.complete_trade(trade["id"], party["id"])
 
     # The client sees the summary plus their own confirmation wording.
-    await message.answer(summary)
-    await message.answer(
-        render_completion_notice(total, trade["inr_expected"] or None)
-    )
+    await message.answer(counterparty_summary)
+    await message.answer(render_completion_notice(total, expected))
 
     await notifier.to_bridge(summary)
     await notifier.to_party(
