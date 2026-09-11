@@ -672,6 +672,81 @@ class Repo:
                 str(supplier_id),
             )
 
+    # ----------------------------------------------------------- pending sends
+
+    async def record_pending_send(
+        self, *, supplier_id: int, account_id: int, hash_url: str | None,
+    ) -> None:
+        """A supplier's claim that they have sent. Quiet until funds land."""
+        async with self.pool.acquire() as conn:
+            async with conn.transaction():
+                await conn.execute(
+                    """
+                    INSERT INTO pending_sends (supplier_id, bank_account_id, hash_url)
+                    VALUES ($1, $2, $3)
+                    """,
+                    supplier_id, account_id, hash_url,
+                )
+                await self.audit(
+                    conn, actor_party_id=supplier_id, action="send.claimed",
+                    entity_type="party", entity_id=supplier_id,
+                    detail={"account_id": account_id, "hash": hash_url},
+                )
+
+    async def match_pending_send(self, *, supplier_id: int, trade_id: int) -> None:
+        """
+        Tie the oldest outstanding claim from this supplier to a real deposit.
+
+        Oldest first, so two sends in quick succession resolve in the order
+        they were made rather than leaving the earlier one to be reported as
+        missing while the later one is matched.
+        """
+        async with self.pool.acquire() as conn:
+            await conn.execute(
+                """
+                UPDATE pending_sends SET matched_trade_id = $2
+                WHERE id = (
+                    SELECT id FROM pending_sends
+                    WHERE supplier_id = $1 AND matched_trade_id IS NULL
+                    ORDER BY created_at
+                    LIMIT 1
+                )
+                """,
+                supplier_id, trade_id,
+            )
+
+    async def stale_pending_sends(self, older_than_minutes: int) -> list[asyncpg.Record]:
+        """Claims with no deposit behind them, not yet reported."""
+        async with self.pool.acquire() as conn:
+            return await conn.fetch(
+                """
+                SELECT ps.id, ps.hash_url, ps.created_at,
+                       p.label AS supplier_label,
+                       b.account_name
+                FROM pending_sends ps
+                JOIN parties p ON p.id = ps.supplier_id
+                LEFT JOIN bank_accounts b ON b.id = ps.bank_account_id
+                WHERE ps.matched_trade_id IS NULL
+                  AND ps.alerted_at IS NULL
+                  AND ps.created_at < now() - make_interval(mins => $1)
+                ORDER BY ps.created_at
+                """,
+                older_than_minutes,
+            )
+
+    async def mark_pending_alerted(self, pending_id: int) -> bool:
+        """Claim the right to report this one, exactly once."""
+        async with self.pool.acquire() as conn:
+            row = await conn.fetchrow(
+                """
+                UPDATE pending_sends SET alerted_at = now()
+                WHERE id = $1 AND alerted_at IS NULL
+                RETURNING id
+                """,
+                pending_id,
+            )
+            return row is not None
+
     async def issue_slots(
         self, *, trade_id: int, slots: Sequence[tuple[int, Decimal]], actor_party_id: int,
     ) -> None:

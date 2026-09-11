@@ -264,6 +264,11 @@ class Notifier:
                     },
                 )
 
+        # This deposit answers the supplier's claim, if they made one.
+        await self.repo.match_pending_send(
+            supplier_id=supplier_id, trade_id=trade_id
+        )
+
         async with self.repo.pool.acquire() as conn:
             labels = await conn.fetchrow(
                 """
@@ -271,6 +276,16 @@ class Notifier:
                 FROM parties s, parties c WHERE s.id = $1 AND c.id = $2
                 """,
                 supplier_id, client_id,
+            )
+            # The supplier's nominated account, named on the notification the
+            # Bridge acts on rather than in a message of its own.
+            nominated_name = await conn.fetchval(
+                """
+                SELECT b.account_name FROM trades t
+                JOIN bank_accounts b ON b.id = t.nominated_account_id
+                WHERE t.id = $1
+                """,
+                trade_id,
             )
 
         # The confirm button is attached here so the Bridge can go straight from
@@ -296,6 +311,7 @@ class Notifier:
                 # Set only when this lands on a trade that was already open, so
                 # the message distinguishes a second tranche from a new trade.
                 previous_usdt=trade["usdt_received"] if trade else None,
+                nominated_account=nominated_name,
             )
             + stale_note,
             reply_markup=confirm_keyboard(trade_id),

@@ -260,6 +260,36 @@ CREATE TABLE payment_slots (
 CREATE INDEX payment_slots_trade_idx ON payment_slots (trade_id);
 
 
+-- ---------------------------------------------------------------- pending sends
+-- A supplier running /send is making a CLAIM: "I have sent, pay this account".
+-- Funds arriving on chain is a FACT. The Bridge should act on the fact, so the
+-- claim is recorded here quietly and surfaces attached to the deposit when it
+-- lands (client request, 11 September 2026: "only when validation of funds
+-- landing does the bot notify me").
+--
+-- The row also makes the opposite case visible. A supplier who says they have
+-- sent and never does would otherwise be invisible, because nothing is
+-- announced at the moment of claiming. Anything still unmatched after the
+-- configured window is reported once.
+
+CREATE TABLE pending_sends (
+    id              BIGSERIAL PRIMARY KEY,
+    supplier_id     BIGINT      NOT NULL REFERENCES parties(id),
+    bank_account_id BIGINT      REFERENCES bank_accounts(id),
+    hash_url        TEXT,
+    created_at      TIMESTAMPTZ NOT NULL DEFAULT now(),
+
+    -- Set when a deposit from this supplier opens or extends a trade.
+    matched_trade_id BIGINT     REFERENCES trades(id),
+    -- Set when the Bridge has been told this one never arrived, so they are
+    -- told once rather than on every poll.
+    alerted_at      TIMESTAMPTZ
+);
+
+CREATE INDEX pending_sends_open_idx ON pending_sends (created_at)
+    WHERE matched_trade_id IS NULL;
+
+
 -- ---------------------------------------------------------------- audit log
 -- H4 asked only for basic logging, but E5 allows a completed trade to be
 -- corrected "with a correction recorded in the audit log" - which cannot work

@@ -246,6 +246,22 @@ async def send_account(call: CallbackQuery, state: FSMContext, party, repo, noti
         supplier_id=party["id"], account_id=account_id, actor_party_id=party["id"]
     )
 
+    # Recorded, not announced.
+    #
+    # This used to notify the Bridge the moment a supplier said they had sent.
+    # That is a claim; funds arriving on chain is a fact, and the Bridge should
+    # be acting on facts (client request, 11 September 2026: "only when
+    # validation of funds landing does the bot notify me").
+    #
+    # The claim is stored so it can surface attached to the deposit when it
+    # lands, and so a claim that never materialises can be reported instead of
+    # vanishing.
+    await repo.record_pending_send(
+        supplier_id=party["id"],
+        account_id=account_id,
+        hash_url=data.get("hash_url"),
+    )
+
     if attached:
         await call.message.edit_text(
             f"Noted. INR for {attached} will go to {account['account_name']}."
@@ -254,13 +270,4 @@ async def send_account(call: CallbackQuery, state: FSMContext, party, repo, noti
         await call.message.edit_text(
             "Noted. This will be applied once your deposit is detected."
         )
-
-    await notifier.to_bridge(
-        f"Send instruction from {party['label']}"
-        + (f" — {attached}" if attached else " (no open trade yet)")
-        + f"\nHash {data['hash_url']}\n"
-        f"Send to Account name {account['account_name']} "
-        f"Account Number {account['account_number']} "
-        f"IFSC {account['ifsc']}"
-    )
     await call.answer()

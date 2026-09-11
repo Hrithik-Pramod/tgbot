@@ -96,6 +96,12 @@ ESCALATE_AFTER_FAILURES = 5
 # already have acted on the detection notice.
 UNCONFIRMED_ALERT_MINUTES = 15
 
+# How long a supplier's claim to have sent can go unanswered by an actual
+# deposit before the Bridge is told. Chosen by the client on 11 September 2026:
+# long enough that a slow confirmation is not reported as a no-show, short
+# enough to still be actionable the same morning.
+UNMATCHED_SEND_MINUTES = 30
+
 
 def units_to_usdt(raw: Any) -> Decimal:
     """
@@ -425,6 +431,45 @@ class DepositMonitor:
                 await asyncio.sleep(gap)
 
         await self._report_unconfirmed()
+        await self._report_unmatched_sends()
+
+    async def _report_unmatched_sends(self) -> None:
+        """
+        A supplier said they had sent, and nothing arrived.
+
+        The Bridge is no longer told the moment a supplier claims to have sent
+        — they are told when funds land (client request, 11 September 2026).
+        The cost of that is a claim which never materialises would simply
+        vanish, so it is reported here instead.
+
+        Each is reported once. The claim itself is a fact worth keeping even
+        after it is reported, so the row stays and is only marked.
+        """
+        try:
+            stale = await self.repo.stale_pending_sends(UNMATCHED_SEND_MINUTES)
+        except Exception:
+            log.exception("could not check for unmatched sends")
+            return
+
+        for row in stale:
+            # Claim it first: the alert must not be sent twice if a poll
+            # overlaps, and losing one alert is better than repeating it.
+            if not await self.repo.mark_pending_alerted(row["id"]):
+                continue
+
+            account = row["account_name"] or "an unnamed account"
+            await self.notifier.to_bridge(
+                f"{row['supplier_label']} said they had sent "
+                f"{UNMATCHED_SEND_MINUTES} minutes ago, but no deposit has "
+                f"arrived.\n\n"
+                f"They nominated: {account}\n"
+                + (f"Hash they gave: {row['hash_url']}\n" if row["hash_url"] else "")
+                + "\nNothing has been opened. Worth checking with them."
+            )
+            log.warning(
+                "unmatched send from %s after %s minutes",
+                row["supplier_label"], UNMATCHED_SEND_MINUTES,
+            )
 
     async def _report_unconfirmed(self) -> None:
         """

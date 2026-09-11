@@ -231,6 +231,7 @@ def render_deposit_notification(
     sell_rate: Decimal | None = None,
     usdt_out: Decimal | None = None,
     previous_usdt: Decimal | None = None,
+    nominated_account: str | None = None,
     html: bool = False,
 ) -> str:
     """
@@ -288,6 +289,12 @@ def render_deposit_notification(
         if sell_rate is not None:
             line += f" at {fmt_usdt_plain(sell_rate)}"
         body.append(line)
+
+    # The supplier's own choice of account, surfaced here rather than in a
+    # separate message when they claimed to have sent. One notification, at the
+    # point the Bridge can actually act (client request, 11 September 2026).
+    if nominated_account:
+        body.append(f"Supplier nominated: {esc(nominated_account)}")
 
     body.append(f"Hash {tx_link(tx_hash, html=html)}")
     return "\n".join(header) + "\n" + "\n".join(body)

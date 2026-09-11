@@ -33,7 +33,7 @@ from aiogram.types import (
     InlineKeyboardMarkup, Message,
 )
 
-from core.money import MoneyError, fmt_inr, round_inr, to_decimal
+from core.money import MoneyError, fmt_inr, fmt_usdt_plain, round_inr, to_decimal
 from core.slots import check_new_slot
 from core.summary import (
     PaymentSlot, render_payment_slot, render_send_instruction,
@@ -362,6 +362,20 @@ async def confirm_final(call: CallbackQuery, state: FSMContext, party, repo, not
         ),
         parse_mode="HTML",
     )
+
+    # The amount on its own, as its own message.
+    #
+    # Tap-to-copy works on desktop but not reliably on iPhone, where copying
+    # tends to take the whole message (client, 11 September 2026: "i am unable
+    # to easily copy this, as iPhone has restrictions, it always picks up the
+    # whole message"). A message containing nothing but the number sidesteps
+    # every client's quirks: copy the message and you have the figure, with no
+    # label, no currency, and nothing to trim off.
+    #
+    # Sent after the instruction so it is the last thing on screen, which is
+    # also where a thumb lands.
+    await call.message.answer(fmt_usdt_plain(trade["usdt_owed_client"]))
+
     await call.answer()
     log.info("trade %s slots issued and sent to client", trade["reference"])
 
