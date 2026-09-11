@@ -677,15 +677,36 @@ class Repo:
     async def record_pending_send(
         self, *, supplier_id: int, account_id: int, hash_url: str | None,
     ) -> None:
-        """A supplier's claim that they have sent. Quiet until funds land."""
+        """
+        A supplier's claim that they have sent. Quiet until funds land.
+
+        If a trade for this supplier is ALREADY open, the funds have landed
+        first and the claim is answered the moment it is made.
+
+        Suppliers do it in both orders, and the deposit arriving first is the
+        common one — the monitor sees the chain within seconds, while /send is
+        typed by a person afterwards. Matching only on the deposit side left
+        those claims unmatched for ever, and thirty minutes later the Bridge
+        was told a supplier had not sent when the money was already in.
+        That happened live on 11 September 2026 with SUPA1.
+        """
         async with self.pool.acquire() as conn:
             async with conn.transaction():
+                open_trade = await conn.fetchval(
+                    """
+                    SELECT id FROM trades
+                    WHERE supplier_id = $1 AND status IN ('open', 'awaiting_payment')
+                    ORDER BY opened_at DESC LIMIT 1
+                    """,
+                    supplier_id,
+                )
                 await conn.execute(
                     """
-                    INSERT INTO pending_sends (supplier_id, bank_account_id, hash_url)
-                    VALUES ($1, $2, $3)
+                    INSERT INTO pending_sends (supplier_id, bank_account_id,
+                                               hash_url, matched_trade_id)
+                    VALUES ($1, $2, $3, $4)
                     """,
-                    supplier_id, account_id, hash_url,
+                    supplier_id, account_id, hash_url, open_trade,
                 )
                 await self.audit(
                     conn, actor_party_id=supplier_id, action="send.claimed",
@@ -729,6 +750,15 @@ class Repo:
                 WHERE ps.matched_trade_id IS NULL
                   AND ps.alerted_at IS NULL
                   AND ps.created_at < now() - make_interval(mins => $1)
+                  -- Belt and braces. Even if a claim somehow escaped matching,
+                  -- a supplier with a live trade has plainly sent, and telling
+                  -- the Bridge otherwise is worse than staying quiet: a false
+                  -- "they have not sent" makes them doubt every true one.
+                  AND NOT EXISTS (
+                      SELECT 1 FROM trades t
+                      WHERE t.supplier_id = ps.supplier_id
+                        AND t.status IN ('open', 'awaiting_payment')
+                  )
                 ORDER BY ps.created_at
                 """,
                 older_than_minutes,

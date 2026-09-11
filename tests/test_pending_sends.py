@@ -60,6 +60,48 @@ class TestTheDepositNotificationCarriesTheNomination:
         assert "Smith &amp; Co" in out
 
 
+class TestTheClaimCanArriveEitherSideOfTheDeposit:
+    """
+    Suppliers do it in both orders, and the deposit usually wins.
+
+    The monitor sees the chain within seconds; /send is typed by a person
+    afterwards. Matching only when a deposit arrives left every
+    deposit-then-claim sequence unmatched for ever, and thirty minutes later
+    the Bridge was told the supplier had not sent — while their 18,868 USDT
+    was already recorded against SUPA1. That went out live on 11 September
+    2026 and is the reason for both guards below.
+
+    Stated as the property rather than the mechanism: a supplier with a live
+    trade is never reported as having failed to send.
+    """
+
+    def test_a_claim_made_after_the_deposit_is_matched_immediately(self):
+        """
+        record_pending_send looks for an open trade and attaches to it, so the
+        claim is answered the moment it is made rather than never.
+        """
+        import inspect
+        from db.repo import Repo
+
+        src = inspect.getsource(Repo.record_pending_send)
+        assert "status IN ('open', 'awaiting_payment')" in src, \
+            "the claim no longer looks for an already-open trade"
+        assert "matched_trade_id" in src
+
+    def test_a_supplier_with_a_live_trade_is_never_reported(self):
+        """
+        The second guard, independent of the first. Even if a claim escaped
+        matching, a supplier with money in is not a supplier who failed to
+        send — and a false accusation costs more than a missed alert.
+        """
+        import inspect
+        from db.repo import Repo
+
+        src = inspect.getsource(Repo.stale_pending_sends)
+        assert "NOT EXISTS" in src and "trades" in src, \
+            "stale sends are no longer filtered against live trades"
+
+
 class TestUnmatchedSendsAreReported:
     """
     The half that only matters when something is wrong.
