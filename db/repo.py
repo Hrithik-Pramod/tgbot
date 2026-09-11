@@ -684,7 +684,9 @@ class Repo:
             return await conn.fetch(
                 """
                 SELECT t.id, t.reference, t.inr_expected,
-                       s.label AS supplier_label, c.label AS client_label
+                       s.label AS supplier_label, c.label AS client_label,
+                       COALESCE((SELECT sum(p.amount_inr) FROM payments p
+                                 WHERE p.trade_id = t.id), 0) AS paid_inr
                 FROM trades t
                 JOIN parties s ON s.id = t.supplier_id
                 JOIN parties c ON c.id = t.client_id

@@ -74,6 +74,42 @@ def confirm_keyboard(trade_id: int) -> InlineKeyboardMarkup:
     ]])
 
 
+@router.message(Command("issue"))
+async def cmd_issue(message: Message, repo) -> None:
+    """
+    Issue — or re-issue — the payment instruction for an open trade.
+
+    Until now the only route to the confirmation flow was the button attached
+    to the deposit notification. That works right up until the message is
+    scrolled past, or the trade changes after it was posted, and then there is
+    no way to reach it at all.
+
+    On 11 September 2026 the Bridge had a deposit he needed to send an
+    instruction for, could not find the button, tried /send instead — which
+    only writes a note to his own channel — and was stuck mid-trade with the
+    client waiting. The flow existed; the door to it did not.
+    """
+    trades = await repo.list_open_trades()
+    if not trades:
+        await message.answer("There are no open trades.")
+        return
+
+    rows = []
+    for t in trades:
+        paid = t["paid_inr"] or Decimal(0)
+        outstanding = round_inr(t["inr_expected"] or Decimal(0)) - round_inr(paid)
+        rows.append([InlineKeyboardButton(
+            text=f"{t['reference']} — {t['supplier_label']} — ₹{fmt_inr(outstanding)}",
+            callback_data=f"cf:{t['id']}",
+        )])
+
+    await message.answer(
+        "Which trade do you want to issue an instruction for?\n\n"
+        "The amount shown is what is still outstanding.",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=rows),
+    )
+
+
 @router.callback_query(F.data.startswith("cf:"))
 async def confirm_start(call: CallbackQuery, state: FSMContext, repo) -> None:
     trade_id = int(call.data.split(":", 1)[1])

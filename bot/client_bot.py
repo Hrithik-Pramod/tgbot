@@ -362,6 +362,29 @@ async def on_pasted_payment(message: Message, state: FSMContext, party, repo,
         ])
         lines.append("Which account did these go to?")
         await message.answer("\n".join(lines), reply_markup=kb)
+
+        # Tell the Bridge that money is in limbo.
+        #
+        # Until someone taps one of those buttons the payment is NOT recorded.
+        # The client often does not tap — they correct the message by editing
+        # it instead, or simply move on — and the pending conversation lives in
+        # memory, so a restart discards it without trace. On 11 September 2026
+        # four payments totalling ₹902,460 were lost exactly this way, and the
+        # first anyone knew was the client asking why their completed trade had
+        # not closed.
+        #
+        # The Bridge can see it and chase. Silence here is the expensive option.
+        if notifier is not None:
+            await notifier.to_bridge(
+                "A payment could not be matched to an account and is NOT "
+                "recorded yet.\n\n"
+                + "\n".join(
+                    f"  {s['utr']}  ₹{fmt_inr(to_decimal(s['amount']))}"
+                    for s in staged
+                )
+                + "\n\nThe client has been asked which account it went to. "
+                  "Nothing is logged until they answer."
+            )
         return
 
     if result.problems:
