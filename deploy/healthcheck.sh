@@ -251,14 +251,24 @@ else
                                  AND r.client_id = w.client_id)"
 fi
 
+# The same threshold the bot itself uses, read from the same place.
+#
+# This was hardcoded at 24 hours while the bot read RATE_STALENESS_HOURS, so
+# raising the setting would have left the health check still reporting rates
+# as stale that the bot had stopped flagging — two answers to one question,
+# which is how a check stops being believed.
+STALE_H="$(grep -E '^RATE_STALENESS_HOURS=' /opt/settlement-bot/.env 2>/dev/null \
+           | tail -1 | cut -d= -f2 | tr -d '[:space:]')"
+STALE_H="${STALE_H:-24}"
+
 STALE="$(q "SELECT count(*) FROM (
              SELECT DISTINCT ON (supplier_id, client_id) created_at
              FROM rates ORDER BY supplier_id, client_id, created_at DESC) t
-           WHERE created_at < now() - interval '24 hours'")"
+           WHERE created_at < now() - interval '$STALE_H hours'")"
 if [ "${STALE:-0}" -eq 0 ]; then
-    ok "no rate is over 24h old"
+    ok "no rate is older than ${STALE_H}h"
 else
-    warn "$STALE rate(s) over 24h old — the bot will flag these on the next deposit"
+    warn "$STALE rate(s) over ${STALE_H}h old — the bot will flag these on the next deposit"
 fi
 
 NOACC="$(q "SELECT count(*) FROM parties p WHERE p.role='supplier' AND p.is_active

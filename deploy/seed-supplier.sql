@@ -5,12 +5,18 @@
 --
 --   docker compose exec -T db psql -U settlement -d settlement \
 --     -v ON_ERROR_STOP=1 \
---     -v label="'Supplier C'" \
+--     -v label="Supplier C" \
 --     -v chat_id=-1003992458205 \
---     -v prefix="'SUPC'" \
---     -v wallet="'T...'" \
---     -v client="'Client A'" \
+--     -v prefix="SUPC" \
+--     -v wallet="T..." \
+--     -v client="Client A" \
 --     -f - < deploy/seed-supplier.sql
+--
+-- Pass the values WITHOUT inner quotes. The script writes :'label' and
+-- friends, and that form adds the quoting itself — a value of 'Client A'
+-- becomes the string "'Client A'", quote marks and all, and the client lookup
+-- then fails on a name nobody has. chat_id is numeric and is the one
+-- exception: it is written bare as :chat_id.
 --
 -- NO RATE IS SET HERE. The Bridge sets it with /setrate, which lists every
 -- registered supplier, shows the rate currently in force, and warns when the
