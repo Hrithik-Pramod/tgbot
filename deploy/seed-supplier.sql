@@ -10,9 +10,16 @@
 --     -v prefix="'SUPC'" \
 --     -v wallet="'T...'" \
 --     -v client="'Client A'" \
---     -v supply=106 \
---     -v sell=107.2 \
 --     -f - < deploy/seed-supplier.sql
+--
+-- NO RATE IS SET HERE. The Bridge sets it with /setrate, which lists every
+-- registered supplier, shows the rate currently in force, and warns when the
+-- sell rate is not above the supply rate. Seeding a rate from the command
+-- line would bypass all three, and the rate is the one number where a typo
+-- turns a margin into a loss on every trade that follows.
+--
+-- Until a rate exists a deposit on this wallet opens no trade and the Bridge
+-- is told why, so the gap is visible rather than silent.
 --
 -- WHAT EACH PIECE IS FOR
 --
@@ -28,9 +35,6 @@
 --                    wallet received it, so two suppliers sharing an address
 --                    would be indistinguishable. The schema enforces it.
 --
---   rate             a deposit with no rate for its pairing opens no trade;
---                    the Bridge is told and the money waits. So this is not
---                    optional either.
 --
 -- The wallet is NOT adopted here. The monitor adopts it on its first poll and
 -- records adopted_at_ms, so everything already on that address is treated as
@@ -67,11 +71,6 @@ FROM parties s, parties c
 WHERE s.label = :'label' AND c.label = :'client'
 ON CONFLICT (address) DO NOTHING;
 
-INSERT INTO rates (supplier_id, client_id, supply_rate, sell_rate, set_by)
-SELECT s.id, c.id, :supply, :sell, b.id
-FROM parties s, parties c, parties b
-WHERE s.label = :'label' AND c.label = :'client' AND b.role = 'bridge';
-
 INSERT INTO audit_log (actor_party_id, action, entity_type, entity_id, detail)
 SELECT NULL, 'supplier.onboarded', 'party', id,
        jsonb_build_object('label', :'label', 'client', :'client',
@@ -80,9 +79,8 @@ FROM parties WHERE label = :'label';
 
 COMMIT;
 
--- Verify. The supplier should appear with a counter, a monitored wallet and a
--- rate — all four, or the first deposit will fail in a different way for each
--- thing that is missing.
+-- Verify. Counter and monitored wallet must both be present; the rate comes
+-- later from /setrate and shows as null until the Bridge sets it.
 --
 --   SELECT p.label, p.telegram_chat_id, sc.prefix, w.address, w.is_monitored,
 --          r.supply_rate, r.sell_rate
