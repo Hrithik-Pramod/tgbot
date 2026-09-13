@@ -60,6 +60,36 @@ class PastedPayment(StatesGroup):
 
 # --------------------------------------------------------------- /accounts
 
+def _account_button(account, among) -> str:
+    """
+    A button label the client can actually tell apart.
+
+    Two suppliers can register an account in the same holder's name. On
+    13 September 2026 a new vendor registered "Girish Kumar Ahirwar" — a name
+    another vendor had already registered months of trades against, at a
+    different bank and a different number.
+
+    match_account handles that correctly: two candidates means it refuses to
+    guess and asks. But asking with two buttons both reading "Girish Kumar
+    Ahirwar" is not asking anything. The client picks blind, and a wrong pick
+    puts the money against the wrong vendor's trade — the misattribution the
+    matching was careful to avoid, arriving through the question instead.
+
+    So a name that is unique among the candidates is shown alone, and one
+    that is not carries the last four digits of its account number. The
+    client already holds the full number from the payment instruction, so
+    this tells them nothing they were not given, and nothing about which
+    supplier is behind it.
+    """
+    name = account["account_name"]
+    clashes = sum(
+        1 for a in among if a["account_name"].strip().lower() == name.strip().lower()
+    )
+    if clashes < 2:
+        return name
+    return f"{name} ••{str(account['account_number'])[-4:]}"
+
+
 def _render_accounts(accounts) -> list[str]:
     """
     The accounts, and nothing about who is behind them.
@@ -177,7 +207,7 @@ async def add_utr(message: Message, state: FSMContext, party, repo) -> None:
 
     # Account names only — see the note on the pasted-payment keyboard.
     kb = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text=a["account_name"],
+        [InlineKeyboardButton(text=_account_button(a, accounts),
                               callback_data=f"acct:{a['id']}")]
         for a in accounts
     ])
@@ -356,7 +386,7 @@ async def on_pasted_payment(message: Message, state: FSMContext, party, repo,
         # Bridge's book. The names alone are enough to choose between, and
         # they are accounts the client has been instructed to pay anyway.
         kb = InlineKeyboardMarkup(inline_keyboard=[
-            [InlineKeyboardButton(text=a["account_name"],
+            [InlineKeyboardButton(text=_account_button(a, accounts),
                                   callback_data=f"pacct:{a['id']}")]
             for a in accounts
         ])
