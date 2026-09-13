@@ -49,10 +49,21 @@ BEGIN;
 
 -- The client must already exist; a typo here would otherwise create a pairing
 -- against nothing and fail confusingly later, at the first deposit.
+--
+-- The label is handed to the block through a session setting rather than
+-- written into it. psql substitutes :'client' in ordinary SQL but NOT inside
+-- dollar-quoted text, so the variable reached the server verbatim and the
+-- whole script died on a syntax error at the colon.
+SELECT set_config('seed.client', :'client', TRUE);
+
 DO $$
 BEGIN
-    IF NOT EXISTS (SELECT 1 FROM parties WHERE label = :'client' AND role = 'client') THEN
-        RAISE EXCEPTION 'no client called % — check the label', :'client';
+    IF NOT EXISTS (
+        SELECT 1 FROM parties
+        WHERE label = current_setting('seed.client') AND role = 'client'
+    ) THEN
+        RAISE EXCEPTION 'no client called "%" — check the label',
+            current_setting('seed.client');
     END IF;
 END $$;
 
