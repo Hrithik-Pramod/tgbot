@@ -29,12 +29,14 @@ how /done sat dead for a day on 10 September.
 
 import inspect
 import sys
+from datetime import datetime, timezone
 from pathlib import Path
-from types import SimpleNamespace
 
 import pytest
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+
+from aiogram.types import Chat, Message  # noqa: E402
 
 import main  # noqa: E402
 from bot.escape import CommandEscapeMiddleware  # noqa: E402
@@ -54,11 +56,22 @@ class FakeState:
 
 
 def _message(text=None, caption=None):
-    from aiogram.types import Message
-    msg = SimpleNamespace(text=text, caption=caption,
-                          chat=SimpleNamespace(id=-100123))
-    msg.__class__ = type("FakeMessage", (Message,), {})
-    return msg
+    """
+    A real Message, built without validation.
+
+    The middleware tests isinstance(event, Message), so a stand-in object
+    will not do — and Message is a pydantic model, so its __class__ cannot
+    be reassigned onto a SimpleNamespace either. model_construct skips
+    validation and still returns a genuine instance, which is exactly what
+    is wanted: the middleware only ever reads .text, .caption and .chat.id.
+    """
+    return Message.model_construct(
+        message_id=1,
+        date=datetime(2026, 9, 15, tzinfo=timezone.utc),
+        chat=Chat.model_construct(id=-100123, type="supergroup"),
+        text=text,
+        caption=caption,
+    )
 
 
 async def _run(event, state):
