@@ -583,6 +583,12 @@ class DepositMonitor:
         self._failures.pop(wallet_id, None)
         self._skips.pop(wallet_id, None)
 
+        # We reached the chain for this wallet. Say so now, before anything
+        # that depends on what came back — a wallet with nothing new is still
+        # a wallet being watched, and the health check has no other way to
+        # know the difference between quiet and dead.
+        await self.repo.mark_polled(wallet_id)
+
         # ADOPTION. A wallet with no cursor is one we have only just been told
         # to watch — newly added, or an address just changed. It is NOT a wallet
         # whose history we are behind on.
@@ -599,7 +605,23 @@ class DepositMonitor:
         # nothing. The cursor is set from the newest transaction the chain
         # already shows rather than from this server's clock, so it does not
         # depend on the clock being right.
-        if wallet["last_timestamp_ms"] is None:
+        # Gated on the adoption baseline, not on the cursor.
+        #
+        # These are written together by adopt_wallet precisely so they cannot
+        # disagree — but /walletchange deletes the whole row, and the poll
+        # cycle works from a snapshot taken before that delete. A cycle in
+        # flight therefore still held the OLD cursor, skipped adoption, and
+        # set_monitor_cursor recreated the row with a cursor and no baseline.
+        #
+        # That left wallet 5 permanently unadopted on 15 September 2026: a
+        # cursor exists, so this branch never ran again, and adopted_at_ms
+        # stayed null — which switches OFF the history guard below. That guard
+        # is what stops a rewound cursor walking back into old transfers and
+        # reporting them as deposits, as it did on 9 September with 38 of them
+        # and a trade for ₹19,851,619.
+        #
+        # "Have we adopted this wallet" is the question. Ask it directly.
+        if wallet["adopted_at_ms"] is None:
             newest = max((t["timestamp_ms"] for t in transfers), default=0)
 
             # The + OVERLAP_MS + 1 is not padding, it is the whole point.

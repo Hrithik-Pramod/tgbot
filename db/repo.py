@@ -382,6 +382,35 @@ class Repo:
                 wallet_id, last_timestamp_ms,
             )
 
+    async def mark_polled(self, wallet_id: int) -> None:
+        """
+        Record that a wallet was reached, whether or not it had anything new.
+
+        last_polled_at used to be written only by set_monitor_cursor and
+        adopt_wallet, and set_monitor_cursor only runs when transfers come
+        back. So a wallet polling perfectly well but sitting quiet never
+        updated it, and the health check reported "deposits are being missed"
+        about wallets that were fine.
+
+        On 15 September 2026 that fired alongside a genuine fault on another
+        wallet, which is the real cost: a check that cries wolf is one nobody
+        reads on the day it matters.
+
+        Deliberately does NOT touch last_timestamp_ms or adopted_at_ms. A row
+        created here has neither, which leaves the wallet correctly looking
+        un-adopted rather than half-adopted.
+        """
+        async with self.pool.acquire() as conn:
+            await conn.execute(
+                """
+                INSERT INTO monitor_state (wallet_id, last_polled_at, consecutive_errors)
+                VALUES ($1, now(), 0)
+                ON CONFLICT (wallet_id) DO UPDATE
+                SET last_polled_at = now(), consecutive_errors = 0
+                """,
+                wallet_id,
+            )
+
     async def adopt_wallet(
         self, wallet_id: int, *, cursor_ms: int, adopted_at_ms: int
     ) -> None:
