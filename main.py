@@ -17,6 +17,7 @@ from aiogram.fsm.storage.memory import MemoryStorage
 
 from bot import bridge_bot, bridge_trade, client_bot, membership, supplier_bot
 from bot.auth import ChatRoleMiddleware
+from bot.escape import CommandEscapeMiddleware
 from bot.notifier import Notifier
 from config import Config
 from db.repo import Repo
@@ -39,6 +40,12 @@ def build_dispatcher(routers, repo, notifier, role: str, config) -> Dispatcher:
         bridge_user_id=config.bridge_user_id,
         strict_bridge_user=config.strict_bridge_user,
     )
+    # Outer, and therefore before any filter is evaluated: a command typed
+    # during a multi-step flow clears the flow so the command reaches its own
+    # handler instead of being read as an answer to the question on screen.
+    # See bot/escape.py.
+    dp.message.outer_middleware(CommandEscapeMiddleware())
+
     dp.message.middleware(middleware)
     dp.callback_query.middleware(middleware)
     # Edits arrive on their own observer. Without this the handler runs with no
