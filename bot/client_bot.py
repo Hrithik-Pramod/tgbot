@@ -301,8 +301,43 @@ async def on_pasted_payment(message: Message, state: FSMContext, party, repo,
     # recency charged payments to whichever trade happened to start last
     # (live, 11 September 2026). The account identifies the trade.
     accounts = await repo.open_trade_accounts_for_client(party["id"])
+
     if not accounts:
-        return  # nothing open — stay quiet rather than nagging on small talk
+        # Nothing open. Silence is right for conversation and catastrophic
+        # for a payment, so read it before deciding which this is.
+        #
+        # 15 September 2026: a trade was cancelled at 15:23 and its
+        # replacement did not exist until 15:50. The client kept paying
+        # throughout. Five payments totalling ₹1,419,016 arrived, were never
+        # parsed, never recorded, never acknowledged and never reported — the
+        # handler returned here, one line before the parser ran. Nobody knew
+        # until the Bridge added up his own list and found it short.
+        #
+        # This is the ₹902,460 failure of 11 September wearing different
+        # clothes: money arriving while the bot has nothing to attach it to.
+        # The rule that came out of that one holds here too — the bot may
+        # decline to record something, but it may never do so quietly.
+        stray = parse_payments(body)
+        if stray.payments or stray.saw_utr:
+            await message.reply(
+                "This has NOT been recorded — there is no open trade to "
+                "record it against right now.\n\n"
+                "The Bridge has been notified. Send it again once they tell "
+                "you the trade is open."
+            )
+            if notifier is not None:
+                lines = [
+                    f"  {p.utr}  ₹{fmt_inr(p.amount_inr)}"
+                    for p in stray.payments
+                ] or ["  (a payment reference, amount unreadable)"]
+                await notifier.to_bridge(
+                    "A payment arrived with NO OPEN TRADE to record it "
+                    "against.\n\n"
+                    + "\n".join(lines)
+                    + "\n\nNothing has been logged. Open or re-issue the "
+                      "trade, then ask the client to send these again."
+                )
+        return
 
     result = parse_payments(body)
 
