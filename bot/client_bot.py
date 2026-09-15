@@ -628,9 +628,24 @@ async def _record(message, staged, party, repo, *, acknowledge: bool,
         totals = []
         for tid in touched or [s["trade_id"] for s in staged]:
             totals.append(f"Running total: ₹{fmt_inr(await repo.trade_paid_total(tid))}")
-        await message.reply(
-            "\n".join([*rejected, f"Recorded {len(added)} of {len(staged)}.", *totals])
-        )
+        # "Recorded 0 of 1" reads as a failure. It means the opposite.
+        #
+        # 15 September 2026, 21:06. A payment already safely in the ledger was
+        # pasted again; the bot refused the duplicate — correctly, that is
+        # what stops money being counted twice — and reported "Recorded 0 of
+        # 1". The Bridge read that as the payment having been lost, checked,
+        # and could not reconcile the two: "has happened twice, but this is
+        # not in system... its like its double checking".
+        #
+        # Nothing was wrong. The sentence was.
+        if added:
+            summary = f"Recorded {len(added)} of {len(staged)}."
+        else:
+            summary = (
+                "Nothing new to add — everything in that message is already "
+                "counted in the total below. No action needed."
+            )
+        await message.reply("\n".join([*rejected, summary, *totals]))
     elif acknowledge:
         # Acknowledge first, so the client sees the thumbs up on their own
         # message before any summary arrives underneath it.
