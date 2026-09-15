@@ -60,9 +60,13 @@ class TestADepositCannotJoinAnInstructedTrade:
         )
 
     def test_it_still_looks_up_by_wallet(self):
-        """The pairing is the wallet. Narrowing must not lose that."""
+        """
+        The pairing is the wallet. Narrowing must not lose that — and it has
+        been narrowed twice since, first to uninstructed trades and then to
+        recent ones, so the table carries an alias now.
+        """
         sql = _sql(Notifier.on_supplier_deposit)
-        assert "WHERE wallet_id = $1" in sql
+        assert "t.wallet_id = $1" in sql
 
     def test_a_missing_trade_opens_a_new_one(self):
         """
