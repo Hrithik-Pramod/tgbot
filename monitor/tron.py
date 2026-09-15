@@ -605,23 +605,20 @@ class DepositMonitor:
         # nothing. The cursor is set from the newest transaction the chain
         # already shows rather than from this server's clock, so it does not
         # depend on the clock being right.
-        # Gated on the adoption baseline, not on the cursor.
+        # The cursor, deliberately, and NOT adopted_at_ms.
         #
-        # These are written together by adopt_wallet precisely so they cannot
-        # disagree — but /walletchange deletes the whole row, and the poll
-        # cycle works from a snapshot taken before that delete. A cycle in
-        # flight therefore still held the OLD cursor, skipped adoption, and
-        # set_monitor_cursor recreated the row with a cursor and no baseline.
+        # Gating on the baseline looks more direct and is wrong: wallets
+        # adopted before that column existed carry a cursor and a null
+        # baseline quite legitimately, and re-adopting one drags its cursor
+        # forward past deposits it has not seen yet. tests/test_poll_wallet
+        # has said so since the column was added, and said so again when this
+        # was tried on 15 September 2026.
         #
-        # That left wallet 5 permanently unadopted on 15 September 2026: a
-        # cursor exists, so this branch never ran again, and adopted_at_ms
-        # stayed null — which switches OFF the history guard below. That guard
-        # is what stops a rewound cursor walking back into old transfers and
-        # reporting them as deposits, as it did on 9 September with 38 of them
-        # and a trade for ₹19,851,619.
-        #
-        # "Have we adopted this wallet" is the question. Ask it directly.
-        if wallet["adopted_at_ms"] is None:
+        # A cursor with no baseline is therefore indistinguishable from a
+        # legacy wallet, so it cannot be repaired from here. It is prevented
+        # instead: only adopt_wallet may CREATE a monitor_state row, and it
+        # writes both fields at once. See Repo.set_monitor_cursor.
+        if wallet["last_timestamp_ms"] is None:
             newest = max((t["timestamp_ms"] for t in transfers), default=0)
 
             # The + OVERLAP_MS + 1 is not padding, it is the whole point.

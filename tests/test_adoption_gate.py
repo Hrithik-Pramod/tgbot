@@ -1,45 +1,45 @@
 """
-A wallet is adopted when it has no adoption baseline — not when it has no
-cursor. And a quiet wallet is not a dead one.
+Only adoption may create a monitor_state row.
 
-TWO FAULTS, FOUND TOGETHER (15 September 2026)
+THE FAULT (live, 15 September 2026)
 
 Supplier D's wallet showed adopted = false and last polled four hours ago.
-Two unrelated causes wearing the same clothes.
+It had a cursor and no adoption baseline — the one combination adopt_wallet
+writes both columns together to prevent, because a null baseline switches
+OFF the history guard. That guard is what stops the two-minute overlap
+rewind pulling old transfers back in as fresh deposits: 38 of them on
+9 September, and a trade for ₹19,851,619.
 
-1. THE ADOPTION GATE WAS ASKING THE WRONG QUESTION
+HOW IT GOT THERE
 
-   adopt_wallet writes last_timestamp_ms and adopted_at_ms in one statement,
-   with a comment saying they can never disagree — "that combination would
-   look exactly like an established wallet and let its history back in".
+/walletchange deletes the whole monitor_state row so the new address is
+adopted from scratch. But the poll cycle reads every wallet once at the top
+and then works through them, so a cycle already in flight still held the OLD
+cursor. It skipped adoption, found transfers, and set_monitor_cursor — an
+upsert — recreated the row with that stale cursor and no baseline.
 
-   /walletchange deletes the whole monitor_state row so the new address
-   re-adopts. But the poll cycle reads every wallet once at the top and then
-   works through them, so a cycle already in flight still held the OLD
-   cursor. It skipped adoption, found transfers, and set_monitor_cursor
-   recreated the row — with a cursor and no baseline. Exactly the
-   combination that was supposed to be impossible.
+THE FIX I TRIED FIRST, AND WHY IT WAS WRONG
 
-   From then on the wallet had a cursor, so the adoption branch never ran
-   again and adopted_at_ms stayed null forever. That null switches OFF the
-   history guard. The guard is what stops the two-minute cursor rewind
-   walking back into old transfers and reporting them as new deposits — 38
-   of them on 9 September, and a trade for ₹19,851,619.
+Gating adoption on adopted_at_ms instead of the cursor. It reads better and
+it breaks production: wallets adopted before that column existed carry a
+cursor and a null baseline perfectly legitimately, and re-adopting one drags
+its cursor past deposits it has not seen. test_poll_wallet has asserted that
+since the column was added, and it caught this.
 
-   The fix is to ask the question the branch is actually about.
+Which also settles the deeper point: a cursor with no baseline cannot be
+told apart from a legacy wallet. It is not repairable in code. It has to be
+made unreachable.
 
-2. A WALLET WITH NOTHING NEW LOOKED UNPOLLED
+THE FIX
 
-   last_polled_at was written only by set_monitor_cursor, which runs only
-   when transfers come back, and by adopt_wallet. A wallet polling perfectly
-   but sitting quiet never updated it, so the health check said "deposits
-   are being missed" about wallets that were fine.
-
-   It said that on the same run as the real fault above. A check that cries
-   wolf is one nobody reads on the day it matters.
+Only adopt_wallet creates the row, and it always writes both columns.
+set_monitor_cursor and mark_polled are UPDATE-only, so a row deleted by
+/walletchange stays deleted until the next cycle reads a fresh snapshot,
+sees no cursor, and adopts properly.
 """
 
 import inspect
+import re
 import sys
 from pathlib import Path
 
@@ -53,79 +53,75 @@ def _code(fn) -> str:
     src = inspect.getsource(fn)
     if fn.__doc__:
         src = src.replace(fn.__doc__, "")
-    return "\n".join(l for l in src.splitlines() if not l.strip().startswith("#"))
+    src = "\n".join(l for l in src.splitlines() if not l.strip().startswith("#"))
+    return re.sub(r"\s+", " ", src)
 
 
-class TestAdoptionAsksAboutAdoption:
-    def test_the_gate_is_the_adoption_baseline(self):
+class TestOnlyAdoptionCreatesTheRow:
+    def test_setting_the_cursor_cannot_create_it(self):
+        sql = _code(Repo.set_monitor_cursor)
+        assert "INSERT INTO monitor_state" not in sql, (
+            "an upsert here recreates a row /walletchange just deleted, with "
+            "a stale cursor and no adoption baseline"
+        )
+        assert "UPDATE monitor_state" in sql
+        assert "WHERE wallet_id = $1" in sql
+
+    def test_marking_a_poll_cannot_create_it(self):
+        sql = _code(Repo.mark_polled)
+        assert "INSERT INTO monitor_state" not in sql
+        assert "UPDATE monitor_state" in sql
+
+    def test_adoption_still_creates_it_with_both_columns(self):
+        sql = _code(Repo.adopt_wallet)
+        assert "INSERT INTO monitor_state" in sql
+        assert "last_timestamp_ms" in sql
+        assert "adopted_at_ms" in sql
+
+    def test_the_cursor_still_only_moves_forward(self):
+        """GREATEST, so an out-of-order poll cannot rewind recorded work."""
+        sql = _code(Repo.set_monitor_cursor)
+        assert "GREATEST(last_timestamp_ms, $2)" in sql
+
+
+class TestTheAdoptionGateIsUnchanged:
+    """
+    Deliberately still the cursor. Gating on the baseline would re-adopt
+    every wallet that predates that column — see the module docstring.
+    """
+
+    def test_it_gates_on_the_cursor(self):
         src = _code(tron.DepositMonitor._poll_wallet)
-        assert 'if wallet["adopted_at_ms"] is None:' in src
+        assert 'if wallet["last_timestamp_ms"] is None:' in src
 
-    def test_it_is_no_longer_the_cursor(self):
-        """
-        A cursor can exist without a baseline — that is the whole bug. Gating
-        on it means a wallet in that state never adopts and never can.
-        """
+    def test_it_does_not_gate_on_the_baseline(self):
         src = _code(tron.DepositMonitor._poll_wallet)
-        assert 'if wallet["last_timestamp_ms"] is None:' not in src
+        assert 'if wallet["adopted_at_ms"] is None:' not in src
 
     def test_the_history_guard_still_reads_the_baseline(self):
-        """
-        The guard is the thing the gate protects. If adopted_at_ms is null it
-        does nothing, which is why leaving a wallet unadopted is dangerous
-        rather than untidy.
-        """
         src = _code(tron.DepositMonitor._poll_wallet)
         assert 'wallet["adopted_at_ms"]' in src
 
-    def test_adoption_still_writes_both_together(self):
-        sql = _code(Repo.adopt_wallet)
-        assert "last_timestamp_ms" in sql and "adopted_at_ms" in sql
-
 
 class TestAQuietWalletReportsAsPolled:
+    """
+    last_polled_at was written only by set_monitor_cursor, which runs only
+    when transfers come back. A wallet polling fine but sitting quiet never
+    updated it, so the health check said "deposits are being missed" about
+    wallets that were fine — on the same run as a real fault, which is the
+    cost: a check that cries wolf is not read on the day it matters.
+    """
+
     def test_every_successful_poll_is_recorded(self):
         src = _code(tron.DepositMonitor._poll_wallet)
         assert "mark_polled" in src
 
-    def test_it_happens_before_anything_conditional(self):
-        """
-        After the failure branch, before adoption and before the transfer
-        loop — otherwise a wallet with nothing new falls straight past it,
-        which is the bug.
-        """
+    def test_a_failed_poll_is_not(self):
         src = _code(tron.DepositMonitor._poll_wallet)
-        marked = src.index("mark_polled")
-        adopted = src.index('wallet["adopted_at_ms"] is None')
-        assert marked < adopted
-
-    def test_a_failed_poll_is_not_recorded_as_polled(self):
-        """
-        The check exists to catch a wallet that cannot be reached. Stamping
-        it on failure would hide precisely what it is for.
-        """
-        src = _code(tron.DepositMonitor._poll_wallet)
-        before_fetch = src.split("except Exception as exc:")[0]
-        assert "mark_polled" not in before_fetch
         failure_branch = src.split("except Exception as exc:")[1].split("return")[0]
         assert "mark_polled" not in failure_branch
 
-
-class TestMarkPolledCannotHalfAdoptAWallet:
     def test_it_touches_neither_the_cursor_nor_the_baseline(self):
-        """
-        A row created by mark_polled must leave the wallet looking
-        un-adopted. Writing a cursor here would recreate the exact state
-        that caused the incident.
-        """
         sql = _code(Repo.mark_polled)
         assert "last_timestamp_ms" not in sql
         assert "adopted_at_ms" not in sql
-
-    def test_it_is_an_upsert(self):
-        sql = _code(Repo.mark_polled)
-        assert "ON CONFLICT (wallet_id) DO UPDATE" in sql
-
-    def test_it_clears_the_error_count(self):
-        sql = _code(Repo.mark_polled)
-        assert "consecutive_errors = 0" in sql

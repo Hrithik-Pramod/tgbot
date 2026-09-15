@@ -367,17 +367,38 @@ class Repo:
     async def set_monitor_cursor(
         self, wallet_id: int, last_timestamp_ms: int
     ) -> None:
+        """
+        Advance the cursor. UPDATE only — this must never create the row.
+
+        /walletchange deletes monitor_state so the new address is adopted
+        fresh. But the poll cycle reads every wallet once at the top and then
+        works through them, so a cycle already in flight still holds the OLD
+        cursor. When it used to upsert, that in-flight cycle recreated the
+        row with the stale cursor and no adoption baseline.
+
+        A cursor without a baseline is exactly the state adopt_wallet writes
+        both columns together to prevent, and it is not recoverable
+        afterwards: it is indistinguishable from a wallet adopted before the
+        baseline column existed. Worse, a null baseline disables the history
+        guard, which is what stops the two-minute overlap rewind pulling old
+        transfers in as new deposits — 38 of them on 9 September 2026, and a
+        trade for ₹19,851,619.
+
+        Live on 15 September 2026: Supplier D's wallet spent four hours in
+        exactly that state after an address change.
+
+        So the rule is that ONLY adoption creates the row. If it is missing,
+        this writes nothing and the next cycle — reading a fresh snapshot
+        with no cursor — adopts the wallet properly.
+        """
         async with self.pool.acquire() as conn:
             await conn.execute(
                 """
-                INSERT INTO monitor_state (wallet_id, last_timestamp_ms, last_polled_at,
-                                           consecutive_errors)
-                VALUES ($1, $2, now(), 0)
-                ON CONFLICT (wallet_id) DO UPDATE
-                SET last_timestamp_ms = GREATEST(
-                        monitor_state.last_timestamp_ms, EXCLUDED.last_timestamp_ms),
+                UPDATE monitor_state
+                SET last_timestamp_ms = GREATEST(last_timestamp_ms, $2),
                     last_polled_at = now(),
                     consecutive_errors = 0
+                WHERE wallet_id = $1
                 """,
                 wallet_id, last_timestamp_ms,
             )
@@ -396,17 +417,18 @@ class Repo:
         wallet, which is the real cost: a check that cries wolf is one nobody
         reads on the day it matters.
 
-        Deliberately does NOT touch last_timestamp_ms or adopted_at_ms. A row
-        created here has neither, which leaves the wallet correctly looking
-        un-adopted rather than half-adopted.
+        UPDATE only, for the same reason as set_monitor_cursor: a row that
+        /walletchange has just deleted must stay deleted until adoption
+        recreates it with both the cursor and the baseline. An unadopted
+        wallet therefore reports as unpolled, which is true — it is not being
+        watched yet.
         """
         async with self.pool.acquire() as conn:
             await conn.execute(
                 """
-                INSERT INTO monitor_state (wallet_id, last_polled_at, consecutive_errors)
-                VALUES ($1, now(), 0)
-                ON CONFLICT (wallet_id) DO UPDATE
+                UPDATE monitor_state
                 SET last_polled_at = now(), consecutive_errors = 0
+                WHERE wallet_id = $1
                 """,
                 wallet_id,
             )
