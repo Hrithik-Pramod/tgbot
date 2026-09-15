@@ -105,8 +105,17 @@ CREATE TABLE wallets (
     )
 );
 
--- One internal wallet per supplier-client pairing (C3).
-CREATE UNIQUE INDEX wallets_pairing_unique
+-- C3, as amended 15 September 2026.
+--
+-- The pairing was unique until a supplier began running a second address to
+-- the same client. Routing never needed that uniqueness: a deposit reads its
+-- supplier and client off the wallet row for the address it landed on, and
+-- two rows naming the same pair answer identically. What routing does need
+-- is wallets_address_unique, which is untouched.
+--
+-- Each wallet accumulates its own trade, so two addresses for one supplier
+-- run two independent streams.
+CREATE INDEX wallets_pairing_idx
     ON wallets (supplier_id, client_id) WHERE is_internal;
 
 CREATE INDEX wallets_monitored_idx ON wallets (address) WHERE is_monitored;
