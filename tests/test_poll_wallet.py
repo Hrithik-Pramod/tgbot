@@ -35,6 +35,16 @@ class _Repo:
     def __init__(self):
         self.cursors = {}
         self.adopted = {}
+        self.polled = []
+
+    async def mark_polled(self, wallet_id):
+        """
+        Every successful poll records that the wallet was reached, whether or
+        not anything came back — otherwise a quiet wallet reads as a dead one
+        and the health check reports missed deposits on wallets that are fine
+        (15 September 2026).
+        """
+        self.polled.append(wallet_id)
 
     async def set_monitor_cursor(self, wallet_id, ts):
         self.cursors[wallet_id] = ts
