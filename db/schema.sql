@@ -105,17 +105,15 @@ CREATE TABLE wallets (
     )
 );
 
--- C3, as amended 15 September 2026.
+-- One internal wallet per supplier-client pairing (C3).
 --
--- The pairing was unique until a supplier began running a second address to
--- the same client. Routing never needed that uniqueness: a deposit reads its
--- supplier and client off the wallet row for the address it landed on, and
--- two rows naming the same pair answer identically. What routing does need
--- is wallets_address_unique, which is untouched.
---
--- Each wallet accumulates its own trade, so two addresses for one supplier
--- run two independent streams.
-CREATE INDEX wallets_pairing_idx
+-- Briefly dropped on 15 September 2026 on my misreading of a request for "a
+-- second wallet" — which turned out to be a second CLIENT payout address,
+-- the far end of the transfer, not another place deposits arrive. Restored
+-- the same day. A client may have any number of wallets to be paid at; a
+-- pairing still has exactly one address that deposits land on, because that
+-- address is what identifies the pairing.
+CREATE UNIQUE INDEX wallets_pairing_unique
     ON wallets (supplier_id, client_id) WHERE is_internal;
 
 CREATE INDEX wallets_monitored_idx ON wallets (address) WHERE is_monitored;
@@ -213,9 +211,20 @@ CREATE TABLE trades (
 -- What must never happen is two trades both collecting deposits, because then
 -- there is no answer to which one a deposit belongs in.
 --
--- So the uniqueness is on the UNINSTRUCTED open trade: exactly one per wallet.
-CREATE UNIQUE INDEX trades_one_uninstructed_per_wallet
-    ON trades (wallet_id)
+-- Amended again 15 September 2026.
+--
+-- "Exactly one uninstructed open trade per wallet" held while trades were
+-- issued the same day. SUPA5 sat open and unissued for three days, and a
+-- new deposit merged into it rather than starting fresh — so the rule that
+-- was meant to keep deposits attributable is what made a stale trade
+-- swallow a live one.
+--
+-- Deposits now join an open trade only within MERGE_WINDOW_MINUTES of its
+-- last deposit, which means a stale trade and a new one must be able to
+-- coexist. The guarantee lives in the query instead; this index is here for
+-- the lookup, not to constrain.
+CREATE INDEX trades_uninstructed_idx
+    ON trades (wallet_id, opened_at)
     WHERE status IN ('open', 'awaiting_payment') AND instructed_at IS NULL;
 
 -- The monitor asks for these on every cycle, so it stays cheap.

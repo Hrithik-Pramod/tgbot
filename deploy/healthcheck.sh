@@ -348,13 +348,22 @@ fi
 # awaiting payment against an issued instruction, and a newer one collecting
 # deposits. What must never happen is two trades both open to deposits, because
 # then nothing decides which one an arriving deposit belongs to.
-MULTI="$(q "SELECT count(*) FROM (SELECT wallet_id FROM trades
-            WHERE status IN ('open','awaiting_payment') AND instructed_at IS NULL
-            GROUP BY wallet_id HAVING count(*) > 1) t")"
-if [ "${MULTI:-0}" -eq 0 ]; then
-    ok "at most one uninstructed open trade per wallet"
+# An uninstructed trade left open is the shape of the 15 September incident:
+# SUPA5 sat for three days, absorbed a new deposit, and nothing had ever
+# mentioned it. A deposit can no longer join a trade that stale — but the
+# trade itself still needs someone to deal with it, so say so.
+STALE_T="$(q "SELECT count(*) FROM trades
+              WHERE status IN ('open','awaiting_payment') AND instructed_at IS NULL
+                AND opened_at < now() - interval '6 hours'")"
+if [ "${STALE_T:-0}" -eq 0 ]; then
+    ok "no trade left open and uninstructed"
 else
-    bad "$MULTI wallet(s) with more than one trade open to deposits"
+    warn "$STALE_T trade(s) open and never issued for over 6h — /issue or /cancel"
+    q "SELECT '        ' || t.reference || '  ' || t.usdt_received || ' USDT  since '
+              || to_char(t.opened_at,'DD Mon HH24:MI')
+       FROM trades t
+       WHERE t.status IN ('open','awaiting_payment') AND t.instructed_at IS NULL
+         AND t.opened_at < now() - interval '6 hours' ORDER BY t.opened_at"
 fi
 
 # The migration must actually have been applied. Without the column the bot

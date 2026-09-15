@@ -66,6 +66,18 @@ class Config:
     # C5: warn when the rate in force for a pairing is older than this.
     rate_staleness_hours: int
 
+    # How long an uninstructed trade stays open to further deposits.
+    #
+    # Accumulating is right for a supplier splitting one send into two
+    # transfers minutes apart (client question, 10 September 2026). It is
+    # wrong days later: on 15 September a trade opened on the 12th and never
+    # issued absorbed a fresh 37,736 USDT, so the Bridge was shown a total of
+    # 66,038 for a deposit he had just received and had already settled the
+    # earlier half of. "ITS STILL STORED PREVIOUS TRADE."
+    #
+    # Past this window a deposit starts its own trade instead.
+    merge_window_minutes: int
+
     # Tell the supplier to prepare the next batch once the outstanding INR on a
     # trade falls to this (client request, 8 Sep 2026).
     near_completion_inr: Decimal
@@ -100,6 +112,7 @@ class Config:
             poll_interval_seconds=int(_opt("POLL_INTERVAL_SECONDS", "20")),
             monitor_asset=_opt("MONITOR_ASSET", "USDT").strip().upper(),
             rate_staleness_hours=int(_opt("RATE_STALENESS_HOURS", "24")),
+            merge_window_minutes=int(_opt("MERGE_WINDOW_MINUTES", "120")),
             near_completion_inr=Decimal(_opt("NEAR_COMPLETION_INR", "300000")),
             min_deposit_amount=Decimal(_opt("MIN_DEPOSIT_AMOUNT", "1")),
         )

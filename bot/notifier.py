@@ -304,17 +304,35 @@ class Notifier:
                 # ORDER BY opened_at with the uniqueness index behind it means
                 # there is at most one such row, but the ordering makes the
                 # intent explicit rather than relying on the index to hold.
+                # ...and only while it is still the trade in progress.
+                #
+                # Accumulating is right for one send split into two transfers
+                # minutes apart. It is wrong days later. SUPA5 opened on
+                # 12 September, was never issued, and on the 15th absorbed a
+                # fresh 37,736 USDT — so a deposit the Bridge had just taken
+                # was reported as a 66,038 total whose earlier half he had
+                # already settled by hand. He was mid-trade with a client
+                # waiting: "ITS STILL STORED PREVIOUS TRADE".
+                #
+                # The window runs from the LAST deposit, not from opening, so
+                # a supplier sending in three parts over an afternoon still
+                # gets one trade. Past it, the deposit starts its own.
                 trade = await conn.fetchrow(
                     """
-                    SELECT * FROM trades
-                    WHERE wallet_id = $1
-                      AND status IN ('open', 'awaiting_payment')
-                      AND instructed_at IS NULL
-                    ORDER BY opened_at
+                    SELECT * FROM trades t
+                    WHERE t.wallet_id = $1
+                      AND t.status IN ('open', 'awaiting_payment')
+                      AND t.instructed_at IS NULL
+                      AND COALESCE(
+                            (SELECT max(d.detected_at) FROM deposits d
+                             WHERE d.trade_id = t.id),
+                            t.opened_at
+                          ) > now() - ($2 || ' minutes')::interval
+                    ORDER BY t.opened_at
                     LIMIT 1
                     FOR UPDATE
                     """,
-                    wallet["id"],
+                    wallet["id"], str(self.config.merge_window_minutes),
                 )
 
                 if trade is None:

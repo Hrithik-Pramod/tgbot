@@ -90,15 +90,26 @@ class TestInstructedAtIsSetAndNeverMoved:
 
 
 class TestTheDatabaseEnforcesIt:
-    def test_the_old_index_is_gone_from_the_schema(self):
+    def test_the_original_index_is_gone_from_the_schema(self):
         assert "trades_one_open_per_wallet" not in SCHEMA, (
-            "the old unique index would reject the second open trade outright"
+            "the original unique index would reject the second open trade outright"
         )
 
-    def test_the_new_index_allows_one_uninstructed_trade_per_wallet(self):
-        assert "trades_one_uninstructed_per_wallet" in SCHEMA
+    def test_the_index_is_scoped_to_uninstructed_open_trades(self):
+        """
+        Amended 15 September 2026. This required a UNIQUE index — exactly one
+        uninstructed open trade per wallet — until a deposit had to be able
+        to split away from a trade that had been sitting for three days, at
+        which point the stale trade and the new one must coexist. The
+        uniqueness moved into the query; see test_merge_window.py.
+
+        What still matters here, and is what this ever really tested, is the
+        predicate: only OPEN and UNINSTRUCTED trades are the ones a deposit
+        can land on.
+        """
+        assert "trades_uninstructed_idx" in SCHEMA
         flat = re.sub(r"\s+", " ", SCHEMA)
-        assert "ON trades (wallet_id) WHERE status IN ('open', 'awaiting_payment') AND instructed_at IS NULL" in flat
+        assert "WHERE status IN ('open', 'awaiting_payment') AND instructed_at IS NULL" in flat
 
     def test_the_column_exists(self):
         assert "instructed_at" in SCHEMA
