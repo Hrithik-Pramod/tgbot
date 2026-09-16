@@ -228,6 +228,48 @@ class Repo:
                 """
             )
 
+    async def all_active_parties(self) -> list[asyncpg.Record]:
+        """Every party and the chat it lives in. Backs the label sync."""
+        async with self.pool.acquire() as conn:
+            return await conn.fetch(
+                """
+                SELECT id, role, label, telegram_chat_id
+                FROM parties WHERE is_active ORDER BY id
+                """
+            )
+
+    async def rename_party(
+        self, *, party_id: int, new_label: str, old_label: str,
+    ) -> bool:
+        """
+        Take a party's name from its Telegram group title.
+
+        Returns False rather than raising if the name is already in use. The
+        caller checks first, but two groups can be renamed to the same thing
+        between the check and the write, and a label collision must not take
+        down a background task.
+
+        Audited because a name changing underneath a reconciliation has to be
+        traceable: "Supplier C" in a report from last week and "Feb David
+        Group" in one from today are the same party, and only this row says so.
+        """
+        async with self.pool.acquire() as conn:
+            async with conn.transaction():
+                try:
+                    await conn.execute(
+                        "UPDATE parties SET label = $2 WHERE id = $1",
+                        party_id, new_label,
+                    )
+                except asyncpg.UniqueViolationError:
+                    return False
+                await self.audit(
+                    conn, actor_party_id=None, action="party.renamed",
+                    entity_type="party", entity_id=party_id,
+                    detail={"from": old_label, "to": new_label,
+                            "source": "telegram group title"},
+                )
+        return True
+
     async def wallets_owned_by(self, party_id: int) -> list[asyncpg.Record]:
         """
         A party's own addresses — the ones they are paid at, not the internal

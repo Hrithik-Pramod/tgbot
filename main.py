@@ -18,6 +18,7 @@ from aiogram.fsm.storage.memory import MemoryStorage
 from bot import bridge_bot, bridge_trade, client_bot, membership, supplier_bot
 from bot.auth import ChatRoleMiddleware
 from bot.escape import CommandEscapeMiddleware
+from bot.labels import run_label_sync
 from bot.notifier import Notifier
 from config import Config
 from db.repo import Repo
@@ -102,11 +103,17 @@ async def main() -> None:
                           repo, notifier, "client", config), client),
     ]
 
+    # Each party's name is read from its own group, by the bot that sits in
+    # it — the supplier bot cannot see a client group and should not be able
+    # to. See bot/labels.py.
+    bots_by_role = {"bridge": bridge, "supplier": supplier, "client": client}
+
     log.info("starting three bots and the deposit monitor")
     try:
         await asyncio.gather(
             *[dp.start_polling(b, handle_signals=False) for dp, b in dispatchers],
             monitor.run_forever(),
+            run_label_sync(repo, bots_by_role),
         )
     finally:
         await tron.close()
