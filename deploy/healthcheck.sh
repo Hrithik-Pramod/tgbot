@@ -344,6 +344,26 @@ else
     warn "$ORPHAN deposit(s) with no trade attached"
 fi
 
+# A trade's usdt_received must equal the deposits attached to it. They drift
+# when a deposit is moved between trades and the figures are not recomputed:
+# SUPA5 still read 66,038 after its 37,736 went to SUPA6, so ₹4,000,016 was
+# counted on both and every /export since 15 September overstated the period
+# by that much. Nothing complained, because both trades were individually
+# plausible. Repair with deploy/fix-phantom-usdt.sql.
+DRIFT="$(q "SELECT count(*) FROM (
+                SELECT t.id
+                FROM trades t
+                LEFT JOIN deposits d ON d.trade_id = t.id
+                GROUP BY t.id, t.usdt_received
+                HAVING COALESCE(sum(d.amount_usdt), 0) <> t.usdt_received
+                   AND COALESCE(sum(d.amount_usdt), 0) > 0
+            ) x")"
+if [ "${DRIFT:-0}" -eq 0 ]; then
+    ok "every trade's USDT matches its deposits"
+else
+    warn "$DRIFT trade(s) whose USDT total disagrees with their deposits"
+fi
+
 # A wallet may legitimately have two open trades since 11 Sep 2026: one
 # awaiting payment against an issued instruction, and a newer one collecting
 # deposits. What must never happen is two trades both open to deposits, because
