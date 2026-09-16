@@ -203,6 +203,33 @@ class Notifier:
                  trade["reference"], total)
         return True
 
+    async def alert_no_open_trade(self, pairs) -> None:
+        """
+        Tell the Bridge a payment landed on an account with nothing open.
+
+        Lives here rather than in the client handler for a reason that is not
+        cosmetic. The Bridge needs the supplier's NAME — "no open trade for
+        Malegao - Sam" is actionable, "no open trade" is not — but the
+        disclosure tests forbid a supplier label appearing anywhere in a
+        client-facing handler, bluntly and on purpose, because that bluntness
+        is what caught the 11 September leak.
+
+        So the handler passes the rows and this reads the name off them. The
+        rule stays strict, and the Bridge still gets the one fact he needs.
+
+        `pairs` is (staged payment, account row).
+        """
+        lines = [
+            f"  {p['utr']}  ₹{fmt_inr(Decimal(p['amount']))}  → {a['supplier_label']}"
+            for p, a in pairs
+        ]
+        await self.to_bridge(
+            "A payment was made to an account with NO OPEN TRADE.\n\n"
+            + "\n".join(lines)
+            + "\n\nNothing is logged. Open or re-issue that supplier's trade, "
+              "then ask the client to send it again."
+        )
+
     # ------------------------------------------------ held announcements
 
     async def announce_trade(self, trade_id: int, *, waited: bool = False) -> bool:

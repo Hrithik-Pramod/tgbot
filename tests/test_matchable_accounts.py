@@ -132,10 +132,19 @@ class TestTheClientStillSeesOnlyWhatTheyShould:
         assert "match_account(p.beneficiary, matchable)" in src
 
     def test_the_buttons_use_the_narrow_list(self):
+        """
+        The keyboard specifically — matching happens earlier in the same
+        function and legitimately reads the wide list, so this looks at the
+        InlineKeyboardMarkup that is actually sent.
+        """
         src = _code(client_bot.on_pasted_payment)
-        buttons = src.split("Which account did these go to?")[0]
-        assert "for a in accounts" in buttons
-        assert "for a in matchable" not in buttons
+        kb = src.split("InlineKeyboardMarkup(inline_keyboard=[")[1] \
+                .split("])")[0]
+        assert "for a in accounts" in kb
+        assert "matchable" not in kb, (
+            "the client would be shown every vendor's accounts — the "
+            "11 September disclosure, exactly"
+        )
 
     def test_accounts_command_is_unchanged(self):
         src = _code(client_bot.cmd_accounts)
@@ -157,16 +166,27 @@ class TestAPaymentWithNowhereToGoIsReported:
         """
         "no open trade" is not actionable. "no open trade for Malegao - Sam"
         tells him exactly which one to open.
+
+        The name is read in the notifier, not here: a supplier label must not
+        appear in a client-facing handler at all, however it is being used.
+        That rule is blunt on purpose — it is what caught the 11 September
+        leak — so the handler hands over the rows instead.
         """
-        src = _code(client_bot.on_pasted_payment)
-        branch = src.split("if homeless:")[1].split("return")[0]
-        assert "supplier_label" in branch
-        assert "to_bridge" in branch
+        from bot.notifier import Notifier
+
+        handler = _code(client_bot.on_pasted_payment)
+        assert "alert_no_open_trade" in handler
+        assert "supplier_label" not in handler
+
+        alert = _code(Notifier.alert_no_open_trade)
+        assert "supplier_label" in alert
+        assert "to_bridge" in alert
 
     def test_an_edit_is_held_to_the_same_rule(self):
         src = _code(client_bot.on_edited_payment)
         assert 'if row["trade_id"] is None:' in src
-        assert "to_bridge" in src
+        assert "alert_no_open_trade" in src
+        assert "supplier_label" not in src
 
     def test_an_unmatchable_name_with_nothing_instructed_is_not_a_dead_end(self):
         """

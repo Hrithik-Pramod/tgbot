@@ -60,9 +60,15 @@ def _src():
 
 
 def _no_trade_branch():
-    """The body of the 'nothing open' branch, up to its return."""
+    """
+    The body of the 'nothing open' branch, up to its return.
+
+    Keyed on `matchable` since 16 September: the handler now holds two
+    lists — everything the bot can RECOGNISE, and the narrower set the client
+    is SHOWN — and this branch is about having nothing at all.
+    """
     src = _src()
-    branch = src.split("if not accounts:")[1]
+    branch = src.split("if not matchable:")[1]
     return branch.split("\n        return")[0]
 
 
@@ -77,7 +83,7 @@ class TestItReadsBeforeItDecides:
     def test_the_parse_happens_before_the_return(self):
         src = _src()
         parsed_at = src.index("stray = parse_payments(body)")
-        returned_at = src.index("if not accounts:")
+        returned_at = src.index("if not matchable:")
         assert parsed_at > returned_at
 
 

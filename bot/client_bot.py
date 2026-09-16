@@ -429,16 +429,11 @@ async def on_pasted_payment(message: Message, state: FSMContext, party, repo,
             "The Bridge has been notified."
         )
         if notifier is not None:
-            named = [
-                f"  {s['utr']}  ₹{fmt_inr(to_decimal(s['amount']))}  "
-                f"→ {by_id[s['account_id']]['supplier_label']}"
-                for s in homeless
-            ]
-            await notifier.to_bridge(
-                "A payment was made to an account with NO OPEN TRADE.\n\n"
-                + "\n".join(named)
-                + "\n\nNothing is logged. Open or re-issue that supplier's "
-                  "trade, then ask the client to send it again."
+            # The rows go over; the notifier reads the supplier's name off
+            # them. A supplier name must not appear in a client-facing
+            # handler at all — see Notifier.alert_no_open_trade.
+            await notifier.alert_no_open_trade(
+                [(s, by_id[s["account_id"]]) for s in homeless]
             )
         return
 
@@ -651,12 +646,9 @@ async def on_edited_payment(message: Message, party, repo, notifier) -> None:
                 "account right now. The Bridge has been notified."
             )
             if notifier is not None:
-                await notifier.to_bridge(
-                    "An edited message names an account with NO OPEN TRADE.\n\n"
-                    f"  {p.utr}  ₹{fmt_inr(p.amount_inr)}  "
-                    f"→ {row['supplier_label']}\n\n"
-                    "Nothing is logged."
-                )
+                await notifier.alert_no_open_trade([
+                    ({"utr": p.utr, "amount": str(p.amount_inr)}, row)
+                ])
             return
         staged.append({
             "utr": p.utr, "amount": str(p.amount_inr),
