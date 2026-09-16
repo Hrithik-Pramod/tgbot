@@ -214,16 +214,152 @@ class Repo:
             return await conn.fetch(
                 """
                 SELECT w.id, w.address, w.is_internal, w.label, w.is_monitored,
+                       w.supplier_id, w.client_id, w.owner_party_id,
                        s.label AS supplier_label,
                        c.label AS client_label,
-                       o.label AS owner_label
+                       o.label AS owner_label,
+                       p.address AS payout_address
                 FROM wallets w
                 LEFT JOIN parties s ON s.id = w.supplier_id
                 LEFT JOIN parties c ON c.id = w.client_id
                 LEFT JOIN parties o ON o.id = w.owner_party_id
+                LEFT JOIN wallets p ON p.id = w.payout_wallet_id
                 ORDER BY w.is_internal DESC, w.id
                 """
             )
+
+    async def wallets_owned_by(self, party_id: int) -> list[asyncpg.Record]:
+        """
+        A party's own addresses — the ones they are paid at, not the internal
+        ones deposits land on. Backs the payout picker in /walletlink.
+        """
+        async with self.pool.acquire() as conn:
+            return await conn.fetch(
+                """
+                SELECT id, address, label FROM wallets
+                WHERE owner_party_id = $1 AND NOT is_internal
+                ORDER BY id
+                """,
+                party_id,
+            )
+
+    async def set_payout_wallet(
+        self, *, wallet_id: int, payout_wallet_id: int, actor_party_id: int,
+    ) -> tuple[bool, str]:
+        """
+        Record which client address a pairing settles to.
+
+        Refuses anything that would not make sense rather than storing it and
+        printing nonsense on a deposit notification later: the source has to
+        be an internal pairing, and the destination has to be a wallet
+        belonging to that pairing's own client. Paying one client's trade to
+        another client's address is the kind of mistake that is obvious in a
+        sentence and invisible in a foreign key.
+        """
+        async with self.pool.acquire() as conn:
+            async with conn.transaction():
+                src = await conn.fetchrow(
+                    "SELECT id, is_internal, client_id FROM wallets WHERE id = $1",
+                    wallet_id,
+                )
+                dst = await conn.fetchrow(
+                    """
+                    SELECT w.id, w.is_internal, w.owner_party_id, w.address,
+                           p.label AS owner_label
+                    FROM wallets w LEFT JOIN parties p ON p.id = w.owner_party_id
+                    WHERE w.id = $1
+                    """,
+                    payout_wallet_id,
+                )
+                if src is None or dst is None:
+                    return False, "That wallet no longer exists."
+                if not src["is_internal"]:
+                    return False, "Only a supplier pairing can have a payout address."
+                if dst["is_internal"]:
+                    return False, (
+                        "That is an internal wallet — deposits land there. "
+                        "Pick one of the client's own addresses."
+                    )
+                if dst["owner_party_id"] != src["client_id"]:
+                    return False, (
+                        f"That address belongs to {dst['owner_label']}, not to "
+                        "this pairing's client."
+                    )
+
+                await conn.execute(
+                    "UPDATE wallets SET payout_wallet_id = $2 WHERE id = $1",
+                    wallet_id, payout_wallet_id,
+                )
+                await self.audit(
+                    conn, actor_party_id=actor_party_id, action="wallet.payout_set",
+                    entity_type="wallet", entity_id=wallet_id,
+                    detail={"payout_wallet_id": payout_wallet_id,
+                            "payout_address": dst["address"]},
+                )
+        return True, f"Settlements for this pairing go to {dst['address']}."
+
+    async def add_wallet(
+        self, *, address: str, is_internal: bool, actor_party_id: int,
+        supplier_id: Optional[int] = None, client_id: Optional[int] = None,
+        owner_party_id: Optional[int] = None, label: Optional[str] = None,
+    ) -> tuple[bool, str]:
+        """
+        Register a new wallet from the Bridge bot.
+
+        Until 16 September 2026 there was no way to do this — /wallet showed
+        them and /walletchange changed an address, but every wallet had been
+        inserted by hand. The Bridge found the edge of that the only way
+        anyone finds it: by needing one at three in the morning.
+
+        The address is NOT adopted here. The monitor adopts it on its first
+        poll and records the baseline then, so everything already on the
+        address is treated as history. Seeding that by hand is how 38 old
+        transfers were once ingested as live deposits.
+        """
+        async with self.pool.acquire() as conn:
+            async with conn.transaction():
+                clash = await conn.fetchval(
+                    "SELECT id FROM wallets WHERE address = $1", address
+                )
+                if clash is not None:
+                    return False, "That address is already registered."
+
+                if is_internal:
+                    taken = await conn.fetchval(
+                        """
+                        SELECT w.id FROM wallets w
+                        WHERE w.is_internal AND w.supplier_id = $1 AND w.client_id = $2
+                        """,
+                        supplier_id, client_id,
+                    )
+                    if taken is not None:
+                        return False, (
+                            "That pairing already has an internal wallet. Use "
+                            "/walletchange to change its address."
+                        )
+
+                new_id = await conn.fetchval(
+                    """
+                    INSERT INTO wallets (address, is_internal, supplier_id,
+                                         client_id, owner_party_id, label,
+                                         is_monitored)
+                    VALUES ($1, $2, $3, $4, $5, $6, TRUE)
+                    RETURNING id
+                    """,
+                    address, is_internal, supplier_id, client_id,
+                    owner_party_id, label,
+                )
+                await self.audit(
+                    conn, actor_party_id=actor_party_id, action="wallet.added",
+                    entity_type="wallet", entity_id=new_id,
+                    detail={"address": address, "internal": is_internal,
+                            "label": label},
+                )
+        return True, (
+            "Wallet registered and being watched. Anything already on that "
+            "address is treated as history — only transfers from now on count "
+            "as deposits."
+        )
 
     async def claim_trade_announcement(self, trade_id: int) -> Optional[asyncpg.Record]:
         """
@@ -255,6 +391,7 @@ class Repo:
                        cl.label AS client_label,
                        b.account_name AS nominated_name,
                        w.address AS wallet_address,
+                       pw.address AS payout_address,
                        (SELECT d.tx_hash FROM deposits d
                         WHERE d.trade_id = c.id
                         ORDER BY d.detected_at DESC LIMIT 1) AS tx_hash
@@ -262,6 +399,7 @@ class Repo:
                 JOIN parties s  ON s.id  = c.supplier_id
                 JOIN parties cl ON cl.id = c.client_id
                 JOIN wallets w  ON w.id  = c.wallet_id
+                LEFT JOIN wallets pw ON pw.id = w.payout_wallet_id
                 LEFT JOIN bank_accounts b ON b.id = c.nominated_account_id
                 """,
                 trade_id,

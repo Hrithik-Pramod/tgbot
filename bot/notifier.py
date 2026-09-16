@@ -249,6 +249,7 @@ class Notifier:
                 sell_rate=trade["sell_rate"],
                 usdt_out=trade["usdt_owed_client"],
                 nominated_account=trade["nominated_name"],
+                payout_address=trade["payout_address"],
             )
             + note,
             reply_markup=confirm_keyboard(trade_id),
@@ -406,6 +407,16 @@ class Notifier:
                 """,
                 supplier_id, client_id,
             )
+            # Where this pairing settles to, so the Bridge does not have to
+            # look it up while acting on the message.
+            payout_address = await conn.fetchval(
+                """
+                SELECT p.address FROM wallets w
+                JOIN wallets p ON p.id = w.payout_wallet_id
+                WHERE w.id = $1
+                """,
+                wallet["id"],
+            )
             # The supplier's nominated account, named on the notification the
             # Bridge acts on rather than in a message of its own.
             nominated_name = await conn.fetchval(
@@ -468,6 +479,7 @@ class Notifier:
                 # the message distinguishes a second tranche from a new trade.
                 previous_usdt=trade["usdt_received"] if trade else None,
                 nominated_account=nominated_name,
+                payout_address=payout_address,
             )
             + stale_note,
             reply_markup=confirm_keyboard(trade_id),

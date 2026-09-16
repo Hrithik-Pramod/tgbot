@@ -280,6 +280,7 @@ def render_deposit_notification(
     usdt_out: Decimal | None = None,
     previous_usdt: Decimal | None = None,
     nominated_account: str | None = None,
+    payout_address: str | None = None,
     html: bool = False,
 ) -> str:
     """
@@ -337,6 +338,19 @@ def render_deposit_notification(
         if sell_rate is not None:
             line += f" at {fmt_usdt_plain(sell_rate)}"
         body.append(line)
+
+        # And WHERE to send it.
+        #
+        # A client can be paid at more than one address. The Bridge acts on
+        # this message, so the destination belongs on it — otherwise he is
+        # cross-referencing /wallet mid-trade to remember which of two
+        # addresses this pairing uses (his request, 16 September 2026).
+        #
+        # Printed in full for the same reason the internal wallet is: the
+        # first and last characters of two TRON addresses match far too
+        # easily to trust an abbreviation with money.
+        if payout_address:
+            body.append(f"Send to {esc(payout_address)}")
 
     # The supplier's own choice of account, surfaced here rather than in a
     # separate message when they claimed to have sent. One notification, at the

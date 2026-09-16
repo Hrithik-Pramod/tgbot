@@ -92,6 +92,20 @@ CREATE TABLE wallets (
     client_id       BIGINT      REFERENCES parties(id),
     label           TEXT,
     is_monitored    BOOLEAN     NOT NULL DEFAULT TRUE,
+
+    -- Which of the client's addresses this pairing settles to.
+    --
+    -- Set only on internal wallets, pointing at a non-internal one owned by
+    -- this pairing's client. A client can be paid at more than one address,
+    -- and before this nothing recorded which pairing used which — so the
+    -- Bridge held it in his head while acting on a deposit notification
+    -- (his request, 16 September 2026).
+    --
+    -- This is a record, not routing: the bot never moves money. It exists so
+    -- the destination can be printed on the notification he is already
+    -- reading, rather than looked up mid-trade.
+    payout_wallet_id BIGINT     REFERENCES wallets(id),
+
     created_at      TIMESTAMPTZ NOT NULL DEFAULT now(),
 
     CONSTRAINT wallets_address_unique UNIQUE (address),

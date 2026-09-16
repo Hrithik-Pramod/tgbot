@@ -36,6 +36,19 @@ class WalletChange(StatesGroup):
     confirm = State()
 
 
+class WalletAdd(StatesGroup):
+    kind = State()
+    supplier = State()
+    client = State()
+    owner = State()
+    address = State()
+
+
+class WalletLink(StatesGroup):
+    pairing = State()
+    payout = State()
+
+
 class BridgeSend(StatesGroup):
     supplier = State()
     client = State()
@@ -233,22 +246,215 @@ async def cmd_wallet(message: Message, repo) -> None:
 
     lines: list[str] = []
     if internal:
-        lines.append("Internal wallets (supplier → client pairings)")
+        lines.append("Supplier pairings")
         lines.append("")
         for w in internal:
             flag = "" if w["is_monitored"] else "   [not monitored]"
             lines.append(f"{w['supplier_label']} → {w['client_label']}{flag}")
-            lines.append(f"Internal wallet {w['address']}")
+            lines.append(f"  Deposits in   {w['address']}")
+
+            # The destination, on the same block as the source.
+            #
+            # These used to be two separate lists — pairings above,
+            # counterparty wallets below — with nothing joining them, so a
+            # client with two addresses left the Bridge working out which one
+            # a given pairing settles to (16 September 2026: "we need to be
+            # able to associate the wallets to the client pairings, as not
+            # able to see this at moment").
+            if w["payout_address"]:
+                lines.append(f"  Pay out to    {w['payout_address']}")
+            else:
+                lines.append("  Pay out to    not set — use /walletlink")
             lines.append("")
 
     if external:
-        lines.append("Counterparty wallets")
+        lines.append("Client and supplier addresses")
         lines.append("")
         for w in external:
             flag = "" if w["is_monitored"] else "   [not monitored]"
             lines.append(f"{w['owner_label']} = {w['address']}{flag}")
 
     await message.answer("\n".join(lines).rstrip())
+
+
+# --------------------------------------------------------------- /walletadd
+#
+# There was no way to register a wallet from the Bridge bot at all. /wallet
+# listed them and /walletchange changed an address, but every wallet in the
+# system had been inserted by hand. The Bridge hit that edge at 03:13 on
+# 16 September 2026 — "BRIDGE CONTROL is now not letting me set new wallets"
+# — which was true, and had always been true.
+
+
+def _is_tron_address(value: str) -> bool:
+    """TRON base58: starts with T, 34 characters (B1, TRC20 only)."""
+    return value.startswith("T") and len(value) == 34
+
+
+@router.message(Command("walletadd"))
+async def cmd_walletadd(message: Message, state: FSMContext) -> None:
+    await state.set_state(WalletAdd.kind)
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="Supplier pairing (deposits land here)",
+                              callback_data="wa_kind:internal")],
+        [InlineKeyboardButton(text="A party's own address (you pay out to it)",
+                              callback_data="wa_kind:external")],
+    ])
+    await message.answer("What kind of wallet?", reply_markup=kb)
+
+
+@router.callback_query(WalletAdd.kind, F.data.startswith("wa_kind:"))
+async def walletadd_kind(call: CallbackQuery, state: FSMContext, repo) -> None:
+    kind = call.data.split(":", 1)[1]
+    await state.update_data(kind=kind)
+
+    if kind == "internal":
+        suppliers = await repo.list_parties("supplier")
+        if not suppliers:
+            await call.message.edit_text("No suppliers are registered yet.")
+            await state.clear()
+            await call.answer()
+            return
+        await state.set_state(WalletAdd.supplier)
+        await call.message.edit_text(
+            "Which supplier sends to it?",
+            reply_markup=_party_keyboard(suppliers, "wa_sup"),
+        )
+    else:
+        parties = await repo.list_parties("client") + await repo.list_parties("supplier")
+        await state.set_state(WalletAdd.owner)
+        await call.message.edit_text(
+            "Whose address is it?", reply_markup=_party_keyboard(parties, "wa_own")
+        )
+    await call.answer()
+
+
+@router.callback_query(WalletAdd.supplier, F.data.startswith("wa_sup:"))
+async def walletadd_supplier(call: CallbackQuery, state: FSMContext, repo) -> None:
+    await state.update_data(supplier_id=int(call.data.split(":", 1)[1]))
+    clients = await repo.list_parties("client")
+    await state.set_state(WalletAdd.client)
+    await call.message.edit_text(
+        "Which client?", reply_markup=_party_keyboard(clients, "wa_cli")
+    )
+    await call.answer()
+
+
+@router.callback_query(WalletAdd.client, F.data.startswith("wa_cli:"))
+async def walletadd_client(call: CallbackQuery, state: FSMContext) -> None:
+    await state.update_data(client_id=int(call.data.split(":", 1)[1]))
+    await state.set_state(WalletAdd.address)
+    await call.message.edit_text("Enter the address:")
+    await call.answer()
+
+
+@router.callback_query(WalletAdd.owner, F.data.startswith("wa_own:"))
+async def walletadd_owner(call: CallbackQuery, state: FSMContext) -> None:
+    await state.update_data(owner_party_id=int(call.data.split(":", 1)[1]))
+    await state.set_state(WalletAdd.address)
+    await call.message.edit_text("Enter the address:")
+    await call.answer()
+
+
+@router.message(WalletAdd.address)
+async def walletadd_address(message: Message, state: FSMContext, party, repo) -> None:
+    address = (message.text or "").strip()
+    if not _is_tron_address(address):
+        await message.answer(
+            "That does not look like a TRON address. TRC20 addresses start "
+            "with T and are 34 characters long."
+        )
+        return
+
+    data = await state.get_data()
+    await state.clear()
+
+    ok, msg = await repo.add_wallet(
+        address=address,
+        is_internal=data["kind"] == "internal",
+        supplier_id=data.get("supplier_id"),
+        client_id=data.get("client_id"),
+        owner_party_id=data.get("owner_party_id"),
+        actor_party_id=party["id"],
+    )
+    await message.answer(msg + ("\n\nUse /walletlink to say where this pairing "
+                                "settles to." if ok and data["kind"] == "internal"
+                                else ""))
+
+
+# -------------------------------------------------------------- /walletlink
+
+
+@router.message(Command("walletlink"))
+async def cmd_walletlink(message: Message, state: FSMContext, repo) -> None:
+    """Say which of the client's addresses a pairing settles to."""
+    wallets = [w for w in await repo.list_wallets() if w["is_internal"]]
+    if not wallets:
+        await message.answer("No supplier pairings are configured.")
+        return
+
+    rows = [
+        [InlineKeyboardButton(
+            text=f"{w['supplier_label']} → {w['client_label']}",
+            callback_data=f"wl:{w['id']}",
+        )]
+        for w in wallets
+    ]
+    await state.set_state(WalletLink.pairing)
+    await message.answer(
+        "Which pairing?", reply_markup=InlineKeyboardMarkup(inline_keyboard=rows)
+    )
+
+
+@router.callback_query(WalletLink.pairing, F.data.startswith("wl:"))
+async def walletlink_pairing(call: CallbackQuery, state: FSMContext, repo) -> None:
+    wallet_id = int(call.data.split(":", 1)[1])
+    wallet = next(
+        (w for w in await repo.list_wallets() if w["id"] == wallet_id), None
+    )
+    if wallet is None:
+        await call.message.edit_text("That pairing no longer exists.")
+        await state.clear()
+        await call.answer()
+        return
+
+    candidates = await repo.wallets_owned_by(wallet["client_id"])
+    if not candidates:
+        # Only the client's own addresses are offered, so a pairing can never
+        # be pointed at another client's wallet by a mis-tap.
+        await call.message.edit_text(
+            f"{wallet['client_label']} has no addresses registered yet. "
+            "Add one with /walletadd first."
+        )
+        await state.clear()
+        await call.answer()
+        return
+
+    await state.update_data(wallet_id=wallet_id)
+    await state.set_state(WalletLink.payout)
+    rows = [
+        [InlineKeyboardButton(text=c["address"], callback_data=f"wlp:{c['id']}")]
+        for c in candidates
+    ]
+    await call.message.edit_text(
+        f"{wallet['supplier_label']} → {wallet['client_label']}\n\n"
+        "Which address do you settle to?",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=rows),
+    )
+    await call.answer()
+
+
+@router.callback_query(WalletLink.payout, F.data.startswith("wlp:"))
+async def walletlink_payout(call: CallbackQuery, state: FSMContext, party, repo) -> None:
+    data = await state.get_data()
+    await state.clear()
+    ok, msg = await repo.set_payout_wallet(
+        wallet_id=data["wallet_id"],
+        payout_wallet_id=int(call.data.split(":", 1)[1]),
+        actor_party_id=party["id"],
+    )
+    await call.message.edit_text(msg)
+    await call.answer()
 
 
 # ------------------------------------------------------------ /walletchange
