@@ -158,5 +158,5 @@ class TestTheNormalPathIsUntouched:
     def test_an_open_trade_still_goes_through_the_usual_flow(self):
         src = _src()
         after = src.split("result = parse_payments(body)")[-1]
-        assert "match_account" in after
+        assert "match_beneficiary" in after
         assert "_record(" in after

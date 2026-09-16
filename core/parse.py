@@ -418,3 +418,58 @@ def match_account(name: Optional[str], accounts) -> Optional[int]:
             return by_prefix[0]["id"]
 
     return None
+
+
+def _has_live_trade(account) -> bool:
+    try:
+        return account["trade_id"] is not None
+    except (KeyError, IndexError, TypeError):
+        return False
+
+
+def match_beneficiary(name: Optional[str], accounts) -> Optional[int]:
+    """
+    Match a beneficiary, breaking a tie on which supplier actually sent.
+
+    THE REQUEST (Bridge, 16 September 2026)
+
+        We may need to use these accounts on seperated vendors, is there a
+        way to tag to the Supplier who sent, as opposed to specific supplier
+        group?
+
+    SUPER TRADING COMPANY (STC) is registered under two vendors, because two
+    vendors genuinely settle through it. That is not a mistake to be tidied
+    away — it is how the business works, and asking him to retire one of them
+    would have lost a real vendor relationship to a limitation of ours.
+
+    match_account refuses to choose between two identically-named accounts,
+    and must go on refusing: guessing puts money against the wrong vendor.
+    But the tie is not actually a tie. The client is paying an instruction
+    they were given, and an instruction only exists where a trade is open.
+    A vendor with nothing open cannot be the one who sent.
+
+    So an ambiguous name is re-run against only those candidates carrying a
+    live trade. If exactly one of the two STC registrations has a trade open,
+    that is who sent, and the payment lands there.
+
+    WHY THE NARROW LIST IS A FALLBACK AND NOT THE FIRST ATTEMPT
+
+    Trying the live list first would let a partial match on a live account
+    beat an exact match on an idle one — "Ekta traders" landing on "Ekta
+    traders Pvt Ltd" because only the second had a trade open. Running the
+    full list first keeps the exact match winning, and the narrowing can then
+    only ever resolve an ambiguity, never invent a match that was not
+    already available.
+
+    If both vendors have a trade open, it is a genuine tie and this refuses,
+    exactly as before. The client is asked, with the last four digits shown
+    beside each name so the question can be answered.
+    """
+    matched = match_account(name, accounts)
+    if matched is not None:
+        return matched
+
+    live = [a for a in accounts if _has_live_trade(a)]
+    if live and len(live) < len(accounts):
+        return match_account(name, live)
+    return None

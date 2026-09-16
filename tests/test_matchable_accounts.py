@@ -128,8 +128,13 @@ class TestTheClientStillSeesOnlyWhatTheyShould:
         assert "accounts = await repo.open_trade_accounts_for_client" in src
 
     def test_matching_uses_the_wide_list(self):
+        """
+        match_beneficiary since 16 September — the same matcher with a
+        tiebreak for one account registered under two vendors. The list it
+        is handed is what this test is about, and that is still the wide one.
+        """
         src = _code(client_bot.on_pasted_payment)
-        assert "match_account(p.beneficiary, matchable)" in src
+        assert "match_beneficiary(p.beneficiary, matchable)" in src
 
     def test_the_buttons_use_the_narrow_list(self):
         """

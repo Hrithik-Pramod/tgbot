@@ -28,7 +28,7 @@ from aiogram.types import (
 from core.money import (
     MoneyError, fmt_inr, fmt_inr_plain, normalise_utr, round_inr, to_decimal,
 )
-from core.parse import match_account, parse_payments
+from core.parse import match_beneficiary, parse_payments
 from core.summary import (
     CLIENT_CLOSING_SUMMARY, Payment, render_completion_notice,
     render_supplier_summary, render_trade_summary,
@@ -387,7 +387,7 @@ async def on_pasted_payment(message: Message, state: FSMContext, party, repo,
 
     staged, lines = [], ["Read this as:", ""]
     for p in result.payments:
-        account_id = match_account(p.beneficiary, matchable)
+        account_id = match_beneficiary(p.beneficiary, matchable)
         row = by_id.get(account_id)
         staged.append({
             "utr": p.utr, "amount": str(p.amount_inr), "account_id": account_id,
@@ -625,7 +625,7 @@ async def on_edited_payment(message: Message, party, repo, notifier) -> None:
     by_id = {a["id"]: a for a in accounts}
     staged = []
     for p in fresh:
-        account_id = match_account(p.beneficiary, accounts)
+        account_id = match_beneficiary(p.beneficiary, accounts)
         row = by_id.get(account_id)
         if row is None:
             # An edit cannot open a conversation — the buttons would attach to
