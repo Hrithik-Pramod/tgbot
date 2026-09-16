@@ -847,6 +847,63 @@ class Repo:
                 client_id,
             )
 
+    async def matchable_accounts_for_client(self, client_id: int) -> list[asyncpg.Record]:
+        """
+        Every account this client could plausibly be paying, for MATCHING —
+        which is a different question from what they are shown.
+
+        WHY THESE ARE DIFFERENT
+
+        open_trade_accounts_for_client narrows to suppliers the client has
+        actually been instructed to pay. That exists because showing the full
+        list leaked the Bridge's book into a counterparty's group on
+        11 September 2026, and it is still right for anything the client SEES.
+
+        It is wrong for recognising a name the client has typed. They already
+        know who they paid — reading it back to attribute a payment reveals
+        nothing. On 16 September that narrowing rejected two live payments:
+
+            unmatched beneficiary 'Barkaati Textile'
+            unmatched beneficiary 'PRIME PATH ENTERPRISES GGN'
+
+        Both are real, active, registered accounts — Malegao - Sam's and GS
+        Group's. Their trades had been cancelled, so their accounts dropped
+        out of the candidates and the payments could not be read at all. The
+        Bridge: "bot is not reading the slips", "lots of slips keep missing".
+
+        WHICH TRADE EACH ACCOUNT RESOLVES TO
+
+        The supplier's best open trade: instructed before uninstructed,
+        unpaid before paid, oldest first. trade_id comes back NULL when that
+        supplier has nothing open — which is a real answer, not a failure.
+        The caller reports it rather than recording against a guess.
+        """
+        async with self.pool.acquire() as conn:
+            return await conn.fetch(
+                """
+                SELECT DISTINCT ON (b.id)
+                       b.id, b.account_name, b.account_number, b.ifsc,
+                       s.label AS supplier_label,
+                       t.id AS trade_id, t.reference
+                FROM wallets w
+                JOIN parties s ON s.id = w.supplier_id
+                JOIN bank_accounts b ON b.party_id = s.id AND b.is_active
+                LEFT JOIN trades t
+                       ON t.supplier_id = s.id
+                      AND t.client_id = w.client_id
+                      AND t.status IN ('open', 'awaiting_payment')
+                WHERE w.is_internal AND w.client_id = $1
+                ORDER BY
+                    b.id,
+                    (t.id IS NULL),
+                    (t.instructed_at IS NULL),
+                    (COALESCE((SELECT sum(p.amount_inr) FROM payments p
+                               WHERE p.trade_id = t.id), 0) >= t.inr_expected),
+                    t.opened_at
+                """,
+                client_id,
+            )
+
     async def open_trade_for_supplier(self, supplier_id: int) -> Optional[asyncpg.Record]:
         """
         Backs the supplier's own progress view (client request, 10 Sep 2026:

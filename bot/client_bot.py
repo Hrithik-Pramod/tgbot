@@ -300,9 +300,27 @@ async def on_pasted_payment(message: Message, state: FSMContext, party, repo,
     # time, so "the" open trade is not a thing that exists — resolving it by
     # recency charged payments to whichever trade happened to start last
     # (live, 11 September 2026). The account identifies the trade.
+    # Two different lists, deliberately.
+    #
+    #   matchable   every active account of every supplier this client is
+    #               paired with. Used to RECOGNISE a name the client typed.
+    #               They already know who they paid, so reading it back
+    #               discloses nothing.
+    #
+    #   accounts    only suppliers the client has been instructed to pay.
+    #               Used for anything the client is SHOWN — the buttons
+    #               below, and /accounts. Widening this is what put the
+    #               Bridge's whole book in a counterparty's group on
+    #               11 September 2026.
+    #
+    # Collapsing the two cost a day: on 16 September, payments to Barkaati
+    # Textile and PRIME PATH ENTERPRISES GGN — both real, active, registered
+    # accounts — could not be read, because those suppliers' trades had been
+    # cancelled and their accounts fell out of the only list there was.
+    matchable = await repo.matchable_accounts_for_client(party["id"])
     accounts = await repo.open_trade_accounts_for_client(party["id"])
 
-    if not accounts:
+    if not matchable:
         # Nothing open. Silence is right for conversation and catastrophic
         # for a payment, so read it before deciding which this is.
         #
@@ -362,13 +380,14 @@ async def on_pasted_payment(message: Message, state: FSMContext, party, repo,
             )
         return
 
-    # account id -> (name, trade id). The account carries its trade, so
-    # matching the name resolves both at once.
-    by_id = {a["id"]: a for a in accounts}
+    # account id -> row. The account carries its trade, so matching the name
+    # resolves both at once — and carries its supplier, so a payment to a
+    # vendor with nothing open can be reported by name.
+    by_id = {a["id"]: a for a in matchable}
 
     staged, lines = [], ["Read this as:", ""]
     for p in result.payments:
-        account_id = match_account(p.beneficiary, accounts)
+        account_id = match_account(p.beneficiary, matchable)
         row = by_id.get(account_id)
         staged.append({
             "utr": p.utr, "amount": str(p.amount_inr), "account_id": account_id,
@@ -394,9 +413,34 @@ async def on_pasted_payment(message: Message, state: FSMContext, party, repo,
             log.warning(
                 "unmatched beneficiary %r in chat %s (candidates: %s)",
                 p.beneficiary, message.chat.id,
-                [a["account_name"] for a in accounts],
+                [a["account_name"] for a in matchable],
             )
         lines.append("")
+
+    # Matched an account, but that supplier has nothing open to record it
+    # against. The account is real and the client paid it — this is the
+    # Bridge's to resolve, and it must never be silent.
+    homeless = [s for s in staged if s["account_id"] and not s["trade_id"]]
+    if homeless:
+        await state.clear()
+        await message.reply(
+            "This has NOT been recorded — there is no open trade for that "
+            "account right now.\n\n"
+            "The Bridge has been notified."
+        )
+        if notifier is not None:
+            named = [
+                f"  {s['utr']}  ₹{fmt_inr(to_decimal(s['amount']))}  "
+                f"→ {by_id[s['account_id']]['supplier_label']}"
+                for s in homeless
+            ]
+            await notifier.to_bridge(
+                "A payment was made to an account with NO OPEN TRADE.\n\n"
+                + "\n".join(named)
+                + "\n\nNothing is logged. Open or re-issue that supplier's "
+                  "trade, then ask the client to send it again."
+            )
+        return
 
     if len(staged) > 1:
         total = sum(to_decimal(s["amount"]) for s in staged)
@@ -409,6 +453,31 @@ async def on_pasted_payment(message: Message, state: FSMContext, party, repo,
     await state.update_data(staged=staged)
 
     unmatched = [s for s in staged if s["account_id"] is None]
+
+    if unmatched and not accounts:
+        # Nothing to offer. The buttons come from instructed trades only, so
+        # asking "which account?" with an empty keyboard is a dead end — and
+        # it is the exact state the client was left in on 16 September, when
+        # both new vendors' trades had been cancelled.
+        await state.clear()
+        await message.reply(
+            "This has NOT been recorded — I could not match that account and "
+            "there is no open instruction to check it against.\n\n"
+            "The Bridge has been notified."
+        )
+        if notifier is not None:
+            await notifier.to_bridge(
+                "A payment could not be matched, and there is no instructed "
+                "trade to offer the client.\n\n"
+                + "\n".join(
+                    f"  {s['utr']}  ₹{fmt_inr(to_decimal(s['amount']))}"
+                    for s in unmatched
+                )
+                + "\n\nNothing is logged. Check the account name is "
+                  "registered and that the trade is open."
+            )
+        return
+
     if unmatched:
         # Never guess an account. A wrong one attributes money to the wrong
         # place — and now to the wrong trade as well — and the client is right
@@ -499,7 +568,8 @@ async def on_pasted_payment(message: Message, state: FSMContext, party, repo,
 async def on_edited_payment(message: Message, party, repo, notifier) -> None:
     body = message.text or message.caption or ""
 
-    accounts = await repo.open_trade_accounts_for_client(party["id"])
+    # Matching, not display — the same distinction as the paste handler.
+    accounts = await repo.matchable_accounts_for_client(party["id"])
     if not accounts:
         return
 
@@ -570,6 +640,23 @@ async def on_edited_payment(message: Message, party, repo, notifier) -> None:
                 "I still cannot tell which account this went to.\n\n"
                 "Please send it as a NEW message rather than editing this one."
             )
+            return
+
+        if row["trade_id"] is None:
+            # The account is real; its supplier has nothing open. Recording
+            # is impossible and silence is not acceptable — the paste handler
+            # reports this to the Bridge, and so must this one.
+            await message.reply(
+                "This has NOT been recorded — there is no open trade for that "
+                "account right now. The Bridge has been notified."
+            )
+            if notifier is not None:
+                await notifier.to_bridge(
+                    "An edited message names an account with NO OPEN TRADE.\n\n"
+                    f"  {p.utr}  ₹{fmt_inr(p.amount_inr)}  "
+                    f"→ {row['supplier_label']}\n\n"
+                    "Nothing is logged."
+                )
             return
         staged.append({
             "utr": p.utr, "amount": str(p.amount_inr),
