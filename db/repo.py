@@ -1138,6 +1138,198 @@ class Repo:
                 """
             )
 
+    async def repriceable_trades(self) -> list[asyncpg.Record]:
+        """
+        Every live trade, priced as it stands beside the rate now in force.
+
+        The three facts that decide whether it may be moved travel with it —
+        instructed_at, paid_inr, and whether it is already on the newest
+        rate — so the Bridge is told WHY a trade cannot be repriced instead
+        of simply not being offered it. Not knowing his options is what made
+        him cancel on 16 September.
+        """
+        async with self.pool.acquire() as conn:
+            return await conn.fetch(
+                """
+                SELECT t.id, t.reference, t.usdt_received, t.rate_id,
+                       t.supply_rate, t.sell_rate,
+                       t.inr_expected, t.usdt_owed_client,
+                       t.instructed_at,
+                       s.label AS supplier_label, c.label AS client_label,
+                       COALESCE((SELECT sum(p.amount_inr) FROM payments p
+                                 WHERE p.trade_id = t.id), 0) AS paid_inr,
+                       r.id          AS current_rate_id,
+                       r.supply_rate AS current_supply_rate,
+                       r.sell_rate   AS current_sell_rate
+                FROM trades t
+                JOIN parties s ON s.id = t.supplier_id
+                JOIN parties c ON c.id = t.client_id
+                LEFT JOIN LATERAL (
+                    SELECT id, supply_rate, sell_rate
+                    FROM rates
+                    WHERE supplier_id = t.supplier_id AND client_id = t.client_id
+                    ORDER BY created_at DESC
+                    LIMIT 1
+                ) r ON TRUE
+                WHERE t.status IN ('open', 'awaiting_payment')
+                ORDER BY t.opened_at
+                """
+            )
+
+    async def reprice_trade(
+        self, *, trade_id: int, actor_party_id: int,
+    ) -> tuple[bool, str, Optional[dict]]:
+        """
+        Move an open, uninstructed, unpaid trade onto the rate now in force.
+
+        Bridge, 14 September 2026:
+
+            the rate has changed but the funds have come
+            Can i have the option to change the rate and it reflect
+
+        A trade snapshots its rate on purpose, so that a later /setrate cannot
+        silently rewrite arithmetic already agreed. The cost of that is a rate
+        moving between the deposit landing and the instruction going out,
+        leaving the trade on the old one with no way to correct it. Without
+        this command his only lever is /cancel — and cancelling is what took
+        Malegao - Sam and GS Group out of the client's matcher on 16 September
+        and lost the slips.
+
+        The guards are the same as deploy/reprice-open-trade.sql and are not
+        negotiable:
+
+          instructed   REFUSED. The client is holding a message naming a
+                       figure. Moving the total underneath it is exactly the
+                       11 September fault, where a trade instructed at
+                       ₹197,054 quietly became ₹515,054.
+
+          any payment  REFUSED. Money already in was priced at the old rate.
+                       Repricing the whole trade would restate settled money.
+
+        Everything is re-checked here under FOR UPDATE rather than trusted
+        from the picker. An instruction can go out, or a payment land, in the
+        seconds between the Bridge seeing the list and tapping confirm, and
+        that gap is precisely where this would do harm.
+
+        The new rate is read from the rates table, never passed in, so the
+        figure applied is the one /setrate recorded — with its current-rate
+        display, its loss warning and its attribution.
+        """
+        from core.money import inr_to_usdt, round_usdt, usdt_to_inr
+
+        async with self.pool.acquire() as conn:
+            async with conn.transaction():
+                t = await conn.fetchrow(
+                    """
+                    SELECT t.*, s.label AS supplier_label, c.label AS client_label
+                    FROM trades t
+                    JOIN parties s ON s.id = t.supplier_id
+                    JOIN parties c ON c.id = t.client_id
+                    WHERE t.id = $1
+                    FOR UPDATE OF t
+                    """,
+                    trade_id,
+                )
+                if t is None:
+                    return False, "That trade no longer exists.", None
+
+                if t["status"] not in ("open", "awaiting_payment"):
+                    return False, (
+                        f"{t['reference']} is {t['status']}, not open. "
+                        "Nothing was changed."
+                    ), None
+
+                if t["instructed_at"] is not None:
+                    return False, (
+                        f"{t['reference']} has already been issued to the "
+                        "client — they are holding that figure.\n\n"
+                        "Repricing it underneath them is the one thing this "
+                        "will not do. Cancel and re-issue instead."
+                    ), None
+
+                paid = await conn.fetchval(
+                    "SELECT COALESCE(sum(amount_inr), 0) FROM payments WHERE trade_id = $1",
+                    trade_id,
+                )
+                if paid:
+                    return False, (
+                        f"{t['reference']} already has ₹{paid:,.0f} paid "
+                        "against it at the old rate.\n\n"
+                        "Repricing now would restate money that is already "
+                        "settled. Nothing was changed."
+                    ), None
+
+                r = await conn.fetchrow(
+                    """
+                    SELECT id, supply_rate, sell_rate
+                    FROM rates
+                    WHERE supplier_id = $1 AND client_id = $2
+                    ORDER BY created_at DESC
+                    LIMIT 1
+                    """,
+                    t["supplier_id"], t["client_id"],
+                )
+                if r is None:
+                    return False, (
+                        "There is no rate set for that pairing at all. "
+                        "Set one with /setrate first."
+                    ), None
+
+                if r["id"] == t["rate_id"]:
+                    return False, (
+                        f"{t['reference']} is already on the rate in force "
+                        f"({r['supply_rate']} / {r['sell_rate']}).\n\n"
+                        "Set the new rate with /setrate first, then reprice."
+                    ), None
+
+                usdt = t["usdt_received"]
+                new_inr = usdt_to_inr(usdt, r["supply_rate"])
+                new_owed = inr_to_usdt(new_inr, r["sell_rate"])
+                new_margin = round_usdt(Decimal(usdt) - new_owed)
+
+                await conn.execute(
+                    """
+                    UPDATE trades
+                    SET rate_id          = $2,
+                        supply_rate      = $3,
+                        sell_rate        = $4,
+                        inr_expected     = $5,
+                        usdt_owed_client = $6,
+                        margin_usdt      = $7
+                    WHERE id = $1
+                    """,
+                    trade_id, r["id"], r["supply_rate"], r["sell_rate"],
+                    new_inr, new_owed, new_margin,
+                )
+                await self.audit(
+                    conn, actor_party_id=actor_party_id, action="trade.reprice",
+                    entity_type="trade", entity_id=trade_id,
+                    detail={
+                        "reference":   t["reference"],
+                        "usdt":        usdt,
+                        "from_rates":  f"{t['supply_rate']} / {t['sell_rate']}",
+                        "to_rates":    f"{r['supply_rate']} / {r['sell_rate']}",
+                        "from_inr":    t["inr_expected"],
+                        "to_inr":      new_inr,
+                        "from_owed":   t["usdt_owed_client"],
+                        "to_owed":     new_owed,
+                    },
+                )
+                return True, f"{t['reference']} repriced.", {
+                    "reference":       t["reference"],
+                    "supplier_label":  t["supplier_label"],
+                    "client_label":    t["client_label"],
+                    "usdt":            usdt,
+                    "old_supply":      t["supply_rate"],
+                    "old_sell":        t["sell_rate"],
+                    "new_supply":      r["supply_rate"],
+                    "new_sell":        r["sell_rate"],
+                    "old_inr":         t["inr_expected"],
+                    "new_inr":         new_inr,
+                    "old_owed":        t["usdt_owed_client"],
+                    "new_owed":        new_owed,
+                }
+
     async def recent_completed_trades(self, limit: int = 10) -> list[asyncpg.Record]:
         async with self.pool.acquire() as conn:
             return await conn.fetch(

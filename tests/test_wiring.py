@@ -101,7 +101,7 @@ class TestCommandCoverage:
     def test_bridge(self):
         got = self._commands(bridge_bot, bridge_trade)
         assert {"setrate", "viewrate", "wallet", "walletchange", "send",
-                "summary", "cancel", "correct", "export"} <= got
+                "summary", "cancel", "correct", "export", "reprice"} <= got
 
     def test_supplier(self):
         got = self._commands(supplier_bot)

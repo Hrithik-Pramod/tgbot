@@ -55,6 +55,11 @@ class Cancel(StatesGroup):
     reason = State()
 
 
+class Reprice(StatesGroup):
+    pick = State()
+    confirm = State()
+
+
 class Correct(StatesGroup):
     pick_trade = State()
     action = State()
@@ -422,6 +427,166 @@ async def confirm_restart(call: CallbackQuery, state: FSMContext) -> None:
     await call.message.edit_text(
         "Discarded. Nothing was sent. Tap Confirm on the deposit notice to start again."
     )
+    await call.answer()
+
+
+# ======================================================================
+# /reprice
+# ======================================================================
+#
+# The rate moves between the deposit landing and the instruction going out.
+# Until this existed the Bridge had exactly one lever for that — /cancel —
+# and on 16 September he used it:
+#
+#     Peter bot is not reading the slips
+#     Just fyi, lots of slips keep missing Pter
+#
+# Cancelling the trades took their suppliers' accounts out of the client's
+# matcher, and the client went on paying them into a bot that could no longer
+# recognise the names. The slips were a symptom. This is the cause.
+#
+# The guards live in repo.reprice_trade and are re-checked there under a row
+# lock. What happens here is only the asking.
+
+def _reprice_blocker(t) -> str | None:
+    """
+    Why this trade may not be moved, in the Bridge's words rather than a
+    status code. None means it can be.
+    """
+    if t["instructed_at"] is not None:
+        return "already issued to the client"
+    if t["paid_inr"]:
+        return f"₹{fmt_inr(t['paid_inr'])} already paid at the old rate"
+    if t["current_rate_id"] is None:
+        return "no rate set for this pairing"
+    if t["current_rate_id"] == t["rate_id"]:
+        return "already on the rate in force"
+    return None
+
+
+@router.message(Command("reprice"))
+async def cmd_reprice(message: Message, state: FSMContext, repo) -> None:
+    trades = await repo.repriceable_trades()
+    if not trades:
+        await message.answer("There are no open trades.")
+        return
+
+    movable = [t for t in trades if _reprice_blocker(t) is None]
+
+    if not movable:
+        # Never a bare "no". Every one of these has a different answer, and
+        # not knowing which is what sent him to /cancel.
+        lines = ["No open trade can be repriced right now.", ""]
+        for t in trades:
+            lines.append(f"{t['reference']} — {_reprice_blocker(t)}")
+        lines += [
+            "",
+            "If the rate has moved, set it with /setrate first — a trade can "
+            "only be moved onto a rate that exists.",
+            "",
+            "A trade the client is already holding cannot be repriced at all. "
+            "Cancel and re-issue that one.",
+        ]
+        await message.answer("\n".join(lines))
+        return
+
+    await state.set_state(Reprice.pick)
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(
+            text=f"{t['reference']} — {t['supplier_label']} → {t['client_label']}",
+            callback_data=f"rp:{t['id']}",
+        )]
+        for t in movable
+    ])
+
+    note = ""
+    held = [t for t in trades if _reprice_blocker(t) is not None]
+    if held:
+        note = "\n\nNot offered:\n" + "\n".join(
+            f"{t['reference']} — {_reprice_blocker(t)}" for t in held
+        )
+    await message.answer(
+        f"Which trade do you want to move onto the current rate?{note}",
+        reply_markup=kb,
+    )
+
+
+@router.callback_query(Reprice.pick, F.data.startswith("rp:"))
+async def reprice_pick(call: CallbackQuery, state: FSMContext, repo) -> None:
+    """
+    Both figures, before and after, spelled out. He is about to change what a
+    client will be asked to pay, and it should not take arithmetic to see by
+    how much.
+    """
+    trade_id = int(call.data.split(":", 1)[1])
+    trades = {t["id"]: t for t in await repo.repriceable_trades()}
+    t = trades.get(trade_id)
+
+    if t is None or _reprice_blocker(t) is not None:
+        await state.clear()
+        await call.message.edit_text(
+            "That trade moved while you were choosing — "
+            f"{_reprice_blocker(t) if t else 'it is no longer open'}. "
+            "Nothing was changed. Run /reprice again."
+        )
+        await call.answer()
+        return
+
+    new_inr = round_inr(Decimal(t["usdt_received"]) * Decimal(t["current_supply_rate"]))
+    difference = new_inr - Decimal(t["inr_expected"])
+    direction = "more" if difference > 0 else "less"
+
+    await state.update_data(trade_id=trade_id)
+    await state.set_state(Reprice.confirm)
+
+    kb = InlineKeyboardMarkup(inline_keyboard=[[
+        InlineKeyboardButton(text="Reprice", callback_data="rp_yes"),
+        InlineKeyboardButton(text="Cancel", callback_data="rp_no"),
+    ]])
+    await call.message.edit_text(
+        f"{t['reference']} — {fmt_usdt_plain(t['usdt_received'])} USDT\n\n"
+        f"Now:  buy {t['supply_rate']} / sell {t['sell_rate']}\n"
+        f"      client pays ₹{fmt_inr(t['inr_expected'])}\n\n"
+        f"New:  buy {t['current_supply_rate']} / sell {t['current_sell_rate']}\n"
+        f"      client pays ₹{fmt_inr(new_inr)}\n\n"
+        f"That is ₹{fmt_inr(abs(difference))} {direction}.\n\n"
+        "Nothing has gone to the client for this trade yet, so this changes "
+        "only a figure you are holding.",
+        reply_markup=kb,
+    )
+    await call.answer()
+
+
+@router.callback_query(Reprice.confirm, F.data == "rp_yes")
+async def reprice_confirm(call: CallbackQuery, state: FSMContext, party, repo) -> None:
+    data = await state.get_data()
+    await state.clear()
+
+    ok, msg, detail = await repo.reprice_trade(
+        trade_id=data["trade_id"], actor_party_id=party["id"]
+    )
+    if not ok:
+        await call.message.edit_text(msg)
+        await call.answer()
+        return
+
+    await call.message.edit_text(
+        f"{detail['reference']} repriced.\n\n"
+        f"Buy  {detail['old_supply']} → {detail['new_supply']}\n"
+        f"Sell {detail['old_sell']} → {detail['new_sell']}\n\n"
+        f"Client pays ₹{fmt_inr(detail['old_inr'])} → "
+        f"₹{fmt_inr(detail['new_inr'])}\n"
+        f"Owed out {fmt_usdt_plain(detail['old_owed'])} → "
+        f"{fmt_usdt_plain(detail['new_owed'])} USDT\n\n"
+        "The client has not been told anything yet. Send it with /issue."
+    )
+    await call.answer()
+
+
+@router.callback_query(Reprice.confirm, F.data == "rp_no")
+async def reprice_cancel(call: CallbackQuery, state: FSMContext) -> None:
+    await state.clear()
+    await call.message.edit_text("Cancelled. The trade is unchanged.")
     await call.answer()
 
 

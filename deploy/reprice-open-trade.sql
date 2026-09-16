@@ -1,6 +1,11 @@
 -- ===========================================================================
 -- Re-price an open trade at the rate currently in force.
 --
+-- SUPERSEDED, 16 September 2026. Use /reprice in the Bridge chat instead: it
+-- applies the same guards, shows both figures before anything moves, and
+-- re-checks under a row lock. This file stays for the record and for a trade
+-- that somehow cannot be reached from the bot.
+--
 --   docker compose exec -T db psql -U settlement -d settlement \
 --     -v ON_ERROR_STOP=1 -v ref="SUPA5" \
 --     -f - < deploy/reprice-open-trade.sql
