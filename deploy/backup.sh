@@ -38,23 +38,30 @@ STAMP="$(date +%Y-%m-%d)"
 FILE="$BACKUP_DIR/settlement-$STAMP.sql.gz"
 
 echo "[$(date -Is)] dumping $DB_NAME -> $FILE"
-pg_dump "$DB_NAME" | gzip > "$FILE"
+
+# Staged the same way as docker-backup.sh: a failure must not destroy the
+# backup already sitting at this path. See the note there.
+TMP="$FILE.partial"
+trap 'rm -f "$TMP"' EXIT
+pg_dump "$DB_NAME" | gzip > "$TMP"
 
 # Verify the dump is readable before trusting it. A silently truncated backup is
 # worse than no backup, because it stops you looking for another copy.
-if ! gzip -t "$FILE"; then
+if ! gzip -t "$TMP"; then
     echo "[$(date -Is)] ERROR: dump failed integrity check" >&2
-    rm -f "$FILE"
     exit 1
 fi
 
 # An empty dump still gzips cleanly and still passes the check above, so it
 # would be reported as a good backup. docker-backup.sh has always had this
 # guard; this one did not.
-if [[ $(stat -c%s "$FILE") -lt 1024 ]]; then
+if [[ $(stat -c%s "$TMP") -lt 1024 ]]; then
     echo "[$(date -Is)] ERROR: dump is suspiciously small — check the database" >&2
     exit 1
 fi
+
+mv -f "$TMP" "$FILE"
+trap - EXIT
 
 SIZE=$(du -h "$FILE" | cut -f1)
 echo "[$(date -Is)] wrote $FILE ($SIZE)"

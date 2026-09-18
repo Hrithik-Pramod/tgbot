@@ -27,22 +27,37 @@ FILE="$BACKUP_DIR/settlement-$STAMP.sql.gz"
 
 echo "[$(date -Is)] dumping $DB_NAME -> $FILE"
 
+# Write to a temporary file and move it into place only once every check has
+# passed, so a failed run leaves the previous good backup alone.
+#
+# `cmd | gzip > "$FILE"` truncates $FILE before cmd even starts. The backup is
+# named for the date, so a second attempt on the same day writes to the same
+# path — and a failure destroys that morning's good backup before producing
+# anything to replace it. 18 September 2026: a run of the wrong script turned
+# the 02:00 backup into 20 bytes, and the file was gone before the error was
+# printed. A backup script whose failure mode is deleting a backup is worse
+# than no script.
+TMP="$FILE.partial"
+trap 'rm -f "$TMP"' EXIT
+
 # -T because cron has no TTY. Without it docker refuses to run.
-docker compose exec -T db pg_dump -U "$DB_USER" "$DB_NAME" | gzip > "$FILE"
+docker compose exec -T db pg_dump -U "$DB_USER" "$DB_NAME" | gzip > "$TMP"
 
 # Verify before trusting it. A silently truncated backup is worse than none,
 # because it stops you looking for another copy.
-if ! gzip -t "$FILE"; then
+if ! gzip -t "$TMP"; then
     echo "[$(date -Is)] ERROR: dump failed integrity check" >&2
-    rm -f "$FILE"
     exit 1
 fi
 
 # A dump of an empty database still gzips cleanly, so check it has real content.
-if [[ $(stat -c%s "$FILE") -lt 1024 ]]; then
+if [[ $(stat -c%s "$TMP") -lt 1024 ]]; then
     echo "[$(date -Is)] ERROR: dump is suspiciously small — check the database" >&2
     exit 1
 fi
+
+mv -f "$TMP" "$FILE"
+trap - EXIT
 
 echo "[$(date -Is)] wrote $FILE ($(du -h "$FILE" | cut -f1))"
 

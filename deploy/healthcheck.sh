@@ -457,10 +457,24 @@ if [ -d "$BDIR" ]; then
         else
             bad "latest backup is ${AGE_H}h old — nightly backups are not running"
         fi
-        if gzip -t "$LATEST" 2>/dev/null; then
-            ok "latest backup passes an integrity check"
-        else
-            bad "latest backup is CORRUPT"
+        # Only worth saying when there is something to be intact. An empty
+        # gzip is a VALID gzip, so this line printed a reassuring PASS
+        # directly under the FAIL above it on 18 September and read as a
+        # contradiction rather than a detail.
+        if [ "$SIZE" -ge 1024 ]; then
+            if gzip -t "$LATEST" 2>/dev/null; then
+                ok "latest backup passes an integrity check"
+            else
+                bad "latest backup is CORRUPT"
+            fi
+        fi
+
+        # A backup left mid-write. The dump is staged as .partial and moved
+        # into place only once it is verified, so one of these lying around
+        # means a run died — and the file next to it may be yesterday's.
+        PARTIAL="$(ls -1 "$BDIR"/settlement-*.sql.gz.partial 2>/dev/null | head -1)"
+        if [ -n "$PARTIAL" ]; then
+            warn "an unfinished backup is present: $(basename "$PARTIAL")"
         fi
     else
         bad "no backup files in $BDIR"
