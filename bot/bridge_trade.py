@@ -415,10 +415,68 @@ async def confirm_final(call: CallbackQuery, state: FSMContext, party, repo, not
     #
     # Sent after the instruction so it is the last thing on screen, which is
     # also where a thumb lands.
-    await call.message.answer(fmt_usdt_plain(trade["usdt_owed_client"]))
+    #
+    # Unless it looks like it has already been sent. On 18 September 2026 two
+    # trades were reopened for deposits the Bridge had already paid the client
+    # for, and this line would have handed him 2,321.22 and 6,922.01 to send a
+    # second time. The last thing on screen, one tap from the clipboard, with
+    # nothing between it and 9,243 USDT but a WhatsApp message he would have
+    # had to remember at three in the morning.
+    #
+    # So when there is a matching payout already out the door, the bare number
+    # is withheld and he has to ask for it. Withheld rather than merely warned
+    # above, because the number is what gets acted on: a caption over a
+    # copy-ready figure is read after the copy, if at all.
+    prior = await repo.prior_payouts_for_trade(trade["id"])
+    if prior:
+        already = "\n".join(
+            f"  {fmt_usdt_plain(p['amount_usdt'])} USDT   "
+            f"{p['detected_at']:%d %b %H:%M}   {p['tx_hash'][:12]}…"
+            for p in prior
+        )
+        await call.message.answer(
+            "HOLD — this may already be paid.\n\n"
+            f"{already}\n\n"
+            "left for this client after the supplier's deposit landed and "
+            "before you issued, which is not the usual order.\n\n"
+            f"{trade['reference']} says "
+            f"{fmt_usdt_plain(trade['usdt_owed_client'])} USDT is owed out. "
+            "If that is the same money, send nothing.",
+            reply_markup=InlineKeyboardMarkup(inline_keyboard=[[
+                InlineKeyboardButton(text="Show the amount anyway",
+                                     callback_data=f"pay:{trade['id']}")
+            ]]),
+        )
+        log.warning(
+            "trade %s issued with %d prior payout(s) matching the amount owed",
+            trade["reference"], len(prior),
+        )
+    else:
+        await call.message.answer(fmt_usdt_plain(trade["usdt_owed_client"]))
 
     await call.answer()
     log.info("trade %s slots issued and sent to client", trade["reference"])
+
+
+@router.callback_query(F.data.startswith("pay:"))
+async def show_payout_amount(call: CallbackQuery, repo) -> None:
+    """
+    The figure, once he has said he wants it anyway.
+
+    No second confirmation and no lecture. He has been told what the bot can
+    see; deciding against it is his call to make, and making him fight for it
+    is how a warning turns into something people route around.
+    """
+    trade_id = int(call.data.split(":", 1)[1])
+    trade = await repo.trade_detail(trade_id)
+    if trade is None:
+        await call.answer("That trade no longer exists.", show_alert=True)
+        return
+
+    await call.message.answer(fmt_usdt_plain(trade["usdt_owed_client"]))
+    await call.answer()
+    log.info("trade %s payout amount revealed after a prior-payout warning",
+             trade["reference"])
 
 
 @router.callback_query(Confirm.final, F.data == "cfno")

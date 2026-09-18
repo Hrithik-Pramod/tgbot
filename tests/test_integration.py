@@ -645,6 +645,109 @@ class TestReprice:
         assert rows["SUPB1"]["current_rate_id"] is None
 
 
+class TestPriorPayoutGuard:
+    """
+    The two-hop join from a trade to its pairing's payout wallet, run for
+    real. 18 September 2026: 9,243 USDT had already gone out on two reopened
+    trades, and the issue flow was about to hand over the figures again.
+    """
+
+    @pytest_asyncio.fixture
+    async def paired(self, world, repo):
+        """A client payout wallet, linked to the internal one."""
+        async with repo.pool.acquire() as conn:
+            payout = await conn.fetchval(
+                """
+                INSERT INTO wallets (address, is_internal, owner_party_id, label)
+                VALUES ('THazeProperPay11111111111111111111', FALSE, $1, 'client')
+                RETURNING id
+                """, world["client"])
+            await conn.execute(
+                "UPDATE wallets SET payout_wallet_id = $2 WHERE id = $1",
+                world["wallet"], payout)
+            trade = await conn.fetchval(
+                """
+                INSERT INTO trades (reference, supplier_id, client_id, wallet_id,
+                    rate_id, supply_rate, sell_rate, usdt_received, inr_expected,
+                    usdt_owed_client, margin_usdt, status)
+                VALUES ('SUPB5',$1,$2,$3,$4,106.20,107.70,2354,249995,2321.22,32.78,
+                        'awaiting_payment')
+                RETURNING id
+                """, world["supplier"], world["client"], world["wallet"],
+                world["rate"])
+        await repo.record_deposit(
+            tx_hash="supplier_in", wallet_id=world["wallet"],
+            amount_usdt=D("2354"), from_address="TMalegao", block_number=1)
+        async with repo.pool.acquire() as conn:
+            await conn.execute(
+                "UPDATE deposits SET trade_id = $1 WHERE tx_hash = 'supplier_in'",
+                trade)
+        return {"trade": trade, "payout": payout}
+
+    async def _payout(self, repo, paired, amount, tx="paid_out"):
+        await repo.record_deposit(
+            tx_hash=tx, wallet_id=paired["payout"],
+            amount_usdt=amount, from_address=None, block_number=2)
+
+    @pytest.mark.asyncio
+    async def test_nothing_out_yet_means_nothing_to_say(self, repo, paired):
+        assert await repo.prior_payouts_for_trade(paired["trade"]) == []
+
+    @pytest.mark.asyncio
+    async def test_the_payment_already_made_is_found(self, repo, paired):
+        """2,321.21 paid by hand against 2,321.22 owed — one paisa apart."""
+        await self._payout(repo, paired, D("2321.21"))
+        found = await repo.prior_payouts_for_trade(paired["trade"])
+        assert len(found) == 1
+        assert found[0]["amount_usdt"] == D("2321.21")
+        assert found[0]["tx_hash"] == "paid_out"
+
+    @pytest.mark.asyncio
+    async def test_another_vendors_payout_is_not_swept_in(self, repo, paired):
+        """
+        One client, one payout wallet, every supplier. Five unrelated
+        transfers sat in that window on the day; none may be reported.
+        """
+        for i, amt in enumerate(["18569.71", "6922.00", "32497",
+                                 "32497.99", "46425.27"]):
+            await self._payout(repo, paired, D(amt), tx=f"other{i}")
+        assert await repo.prior_payouts_for_trade(paired["trade"]) == []
+
+    @pytest.mark.asyncio
+    async def test_a_payout_before_the_deposit_is_not_this_trades(
+        self, repo, paired
+    ):
+        await self._payout(repo, paired, D("2321.21"), tx="earlier")
+        async with repo.pool.acquire() as conn:
+            await conn.execute(
+                "UPDATE deposits SET detected_at = now() - interval '2 days' "
+                "WHERE tx_hash = 'earlier'")
+        assert await repo.prior_payouts_for_trade(paired["trade"]) == []
+
+    @pytest.mark.asyncio
+    async def test_a_transfer_that_has_a_trade_is_not_a_payout(
+        self, repo, paired
+    ):
+        await self._payout(repo, paired, D("2321.21"), tx="claimed")
+        async with repo.pool.acquire() as conn:
+            await conn.execute(
+                "UPDATE deposits SET trade_id = $1 WHERE tx_hash = 'claimed'",
+                paired["trade"])
+        assert await repo.prior_payouts_for_trade(paired["trade"]) == []
+
+    @pytest.mark.asyncio
+    async def test_a_pairing_with_no_payout_wallet_says_nothing(
+        self, world, repo, paired
+    ):
+        """An inner join on a null link must not error — it must be silent."""
+        async with repo.pool.acquire() as conn:
+            await conn.execute(
+                "UPDATE wallets SET payout_wallet_id = NULL WHERE id = $1",
+                world["wallet"])
+        await self._payout(repo, paired, D("2321.21"))
+        assert await repo.prior_payouts_for_trade(paired["trade"]) == []
+
+
 class TestAccountsAndExport:
     @pytest.mark.asyncio
     async def test_removed_account_is_soft_deleted(self, world, repo):

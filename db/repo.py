@@ -1330,6 +1330,67 @@ class Repo:
                     "new_owed":        new_owed,
                 }
 
+    async def prior_payouts_for_trade(self, trade_id: int) -> list[asyncpg.Record]:
+        """
+        USDT that already left for this client, for about this amount, since
+        this trade's first deposit landed.
+
+        WHAT THIS IS FOR (live, 18 September 2026)
+
+        Malegao's 2,354 and GS Group's 7,000 arrived on the 16th, the Bridge
+        paid the client 2,321.21 and 6,922.00 within minutes, and both trades
+        were then cancelled before the client was ever invoiced. Reopening
+        them as SUPB5 and SUPD2 put ₹995,495 back on the client — correctly —
+        but it also put two copy-ready USDT figures in front of the Bridge for
+        money he had already sent. 9,243 USDT, one tap from going twice.
+
+        The bot could see it the whole time. A payout is recorded as a deposit
+        on the client's wallet and never carries a trade_id, so the evidence
+        was sitting in the table with nothing reading it.
+
+        WHY THE WINDOW STARTS AT THE DEPOSIT
+
+        In normal operation the Bridge pays the client just AFTER issuing —
+        SUPB4 was instructed at 13:10:31 and paid at 13:11:23. So at the
+        moment of issue there is usually nothing here, and a hit means the
+        order of events was unusual, which is exactly when he needs telling.
+
+        WHY IT MATCHES ON AMOUNT
+
+        One client has one payout wallet, shared by every supplier, so the
+        window alone catches every other vendor's payouts too. The amount is
+        what identifies it. The tolerance is 2% because the sell rate moves
+        between a hand payment and a reopened trade — 107.5 became 107.7 here,
+        which is the difference between 2,321.21 and 2,321.22.
+
+        A warning, never a block. The Bridge may have good reason.
+        """
+        async with self.pool.acquire() as conn:
+            return await conn.fetch(
+                """
+                WITH t AS (
+                    SELECT tr.id, tr.wallet_id, tr.usdt_owed_client AS owed,
+                           (SELECT min(d.detected_at) FROM deposits d
+                            WHERE d.trade_id = tr.id) AS since
+                    FROM trades tr
+                    WHERE tr.id = $1
+                )
+                SELECT d.amount_usdt, d.tx_hash, d.detected_at
+                FROM t
+                JOIN wallets iw ON iw.id = t.wallet_id
+                JOIN wallets pw ON pw.id = iw.payout_wallet_id
+                JOIN deposits d ON d.wallet_id = pw.id
+                WHERE d.trade_id IS NULL
+                  AND t.since IS NOT NULL
+                  AND t.owed > 0
+                  AND d.detected_at >= t.since
+                  AND abs(d.amount_usdt - t.owed)
+                        <= greatest(t.owed * 0.02, 0.01)
+                ORDER BY d.detected_at
+                """,
+                trade_id,
+            )
+
     async def recent_completed_trades(self, limit: int = 10) -> list[asyncpg.Record]:
         async with self.pool.acquire() as conn:
             return await conn.fetch(
