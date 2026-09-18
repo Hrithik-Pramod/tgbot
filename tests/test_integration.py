@@ -735,6 +735,92 @@ class TestPriorPayoutGuard:
                 paired["trade"])
         assert await repo.prior_payouts_for_trade(paired["trade"]) == []
 
+    async def _settled_trade(self, world, repo, ref):
+        """Another trade on this pairing, instructed and paid."""
+        async with repo.pool.acquire() as conn:
+            await conn.execute(
+                """
+                INSERT INTO trades (reference, supplier_id, client_id, wallet_id,
+                    rate_id, supply_rate, sell_rate, usdt_received, inr_expected,
+                    usdt_owed_client, margin_usdt, status, instructed_at,
+                    completed_at)
+                VALUES ($5,$1,$2,$3,$4,106.20,107.70,2354,249995,2321.22,
+                        32.78,'completed', now(), now())
+                """, world["supplier"], world["client"], world["wallet"],
+                world["rate"], ref)
+
+    @pytest.mark.asyncio
+    async def test_a_surplus_payout_is_reported_with_its_neighbours(
+        self, world, repo, paired
+    ):
+        """
+        The live shape on 18 September. Two matching transfers, one other
+        instructed trade to account for them — so one is unaccounted and
+        both are shown, because nothing in the data says which is which.
+        """
+        await self._settled_trade(world, repo, "SUPB4")
+        await self._payout(repo, paired, D("2321.21"), tx="unbilled")
+        await self._payout(repo, paired, D("2321.22"), tx="supb4s")
+
+        found = await repo.prior_payouts_for_trade(paired["trade"])
+        assert {f["tx_hash"] for f in found} == {"unbilled", "supb4s"}
+
+    @pytest.mark.asyncio
+    async def test_a_payout_every_other_trade_accounts_for_is_silent(
+        self, world, repo, paired
+    ):
+        """
+        Two settled trades, two transfers, nothing owing an explanation. A
+        vendor settling the same figure repeatedly must not be warned about
+        every payout they have ever had.
+        """
+        await self._settled_trade(world, repo, "SUPB4")
+        await self._settled_trade(world, repo, "SUPB6")
+        await self._payout(repo, paired, D("2321.22"), tx="first")
+        await self._payout(repo, paired, D("2321.21"), tx="second")
+
+        assert await repo.prior_payouts_for_trade(paired["trade"]) == []
+
+    @pytest.mark.asyncio
+    async def test_one_claimant_cannot_silence_two_unpaid_transfers(
+        self, world, repo, paired
+    ):
+        """
+        The reason this counts instead of excluding. Dropping anything an
+        instructed trade could explain would let a single trade hide any
+        number of genuinely unbilled payouts — and missing a real one is the
+        failure this exists to prevent.
+        """
+        await self._settled_trade(world, repo, "SUPB4")
+        for i in range(3):
+            await self._payout(repo, paired, D("2321.21"), tx=f"unbilled{i}")
+
+        found = await repo.prior_payouts_for_trade(paired["trade"])
+        assert len(found) == 3
+
+    @pytest.mark.asyncio
+    async def test_an_uninstructed_trade_accounts_for_nothing(
+        self, world, repo, paired
+    ):
+        """
+        SUPB3 was never instructed — that is precisely why its money went
+        unbilled — so it cannot be the explanation for a transfer.
+        """
+        async with repo.pool.acquire() as conn:
+            await conn.execute(
+                """
+                INSERT INTO trades (reference, supplier_id, client_id, wallet_id,
+                    rate_id, supply_rate, sell_rate, usdt_received, inr_expected,
+                    usdt_owed_client, margin_usdt, status)
+                VALUES ('SUPB3',$1,$2,$3,$4,106.00,107.50,2354,249524,2321.15,
+                        32.85,'cancelled')
+                """, world["supplier"], world["client"], world["wallet"],
+                world["rate"])
+        await self._payout(repo, paired, D("2321.21"), tx="unbilled")
+
+        found = await repo.prior_payouts_for_trade(paired["trade"])
+        assert [f["tx_hash"] for f in found] == ["unbilled"]
+
     @pytest.mark.asyncio
     async def test_a_pairing_with_no_payout_wallet_says_nothing(
         self, world, repo, paired

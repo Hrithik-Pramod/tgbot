@@ -153,6 +153,30 @@ class TestTheQueryIsNarrowEnoughToBeBelieved:
     def test_a_trade_with_no_deposits_matches_nothing(self):
         assert "t.since IS NOT NULL" in _sql(Repo.prior_payouts_for_trade)
 
+    def test_it_counts_claimants_rather_than_excluding_them(self):
+        """
+        The subtle one, and the easiest to "simplify" back into a bug.
+
+        Dropping every payout some other instructed trade could account for
+        reads cleaner and is wrong: one trade would then silence any number
+        of genuinely unbilled transfers. Missing a real one costs 9,243 USDT;
+        a spurious one costs a tap.
+        """
+        sql = _sql(Repo.prior_payouts_for_trade)
+        assert "claimants AS" in sql
+        assert "(SELECT count(*) FROM pay) > c.n" in sql
+        assert "NOT EXISTS" not in sql, (
+            "excluding instead of counting lets one trade hide the rest"
+        )
+
+    def test_only_an_instructed_trade_can_account_for_a_payout(self):
+        """
+        SUPB3 was never instructed — that is why its money went unbilled —
+        so it must not be treated as the explanation for the transfer.
+        """
+        sql = _sql(Repo.prior_payouts_for_trade)
+        assert "o.instructed_at IS NOT NULL" in sql
+
 
 class TestTheRealFigures:
     """The two that prompted it, and the five that must not be swept in."""

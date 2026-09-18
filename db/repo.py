@@ -1363,6 +1363,31 @@ class Repo:
         between a hand payment and a reopened trade — 107.5 became 107.7 here,
         which is the difference between 2,321.21 and 2,321.22.
 
+        WHY IT COUNTS RATHER THAN EXCLUDES
+
+        Run against the live rows before anyone relied on it, this reported
+        two transfers for SUPB5 — the 2,321.21 it should have, and SUPB4's
+        2,321.22 from the following day. SUPB4 is a separate settled trade
+        whose payout is spoken for, but nothing in the row says so: a payout
+        never carries a trade_id, which is the whole reason this function has
+        to exist.
+
+        The obvious fix was to drop any payout some other instructed trade
+        could account for. That is worse. One instructed trade would then
+        silence ANY number of matching payouts, so a genuinely unpaid one
+        would go unmentioned — and missing a real one is the failure this
+        guard exists to prevent, where a spurious one only costs a tap.
+
+        So it compares counts. If the matching payouts outnumber the other
+        instructed trades that could account for them, at least one is
+        unaccounted for and all of them are shown, because the bot honestly
+        cannot say which. A vendor who settles the same figure five times
+        over, all issued and all paid, has five of each and hears nothing.
+
+        Live: SUPB5 sees two payouts against one claimant (SUPB4), so it
+        speaks — correctly, since SUPB3's 2,321.21 went out on the 16th and
+        was never billed to anyone.
+
         A warning, never a block. The Bridge may have good reason.
         """
         async with self.pool.acquire() as conn:
@@ -1374,19 +1399,36 @@ class Repo:
                             WHERE d.trade_id = tr.id) AS since
                     FROM trades tr
                     WHERE tr.id = $1
+                ),
+                pay AS (
+                    SELECT d.amount_usdt, d.tx_hash, d.detected_at
+                    FROM t
+                    JOIN wallets iw ON iw.id = t.wallet_id
+                    JOIN wallets pw ON pw.id = iw.payout_wallet_id
+                    JOIN deposits d ON d.wallet_id = pw.id
+                    WHERE d.trade_id IS NULL
+                      AND t.since IS NOT NULL
+                      AND t.owed > 0
+                      AND d.detected_at >= t.since
+                      AND abs(d.amount_usdt - t.owed)
+                            <= greatest(t.owed * 0.02, 0.01)
+                ),
+                claimants AS (
+                    SELECT count(*) AS n
+                    FROM t
+                    JOIN wallets iw ON iw.id = t.wallet_id
+                    JOIN wallets ow
+                      ON ow.payout_wallet_id = iw.payout_wallet_id
+                    JOIN trades o
+                      ON o.wallet_id = ow.id AND o.id <> t.id
+                    WHERE o.instructed_at IS NOT NULL
+                      AND abs(o.usdt_owed_client - t.owed)
+                            <= greatest(t.owed * 0.02, 0.01)
                 )
-                SELECT d.amount_usdt, d.tx_hash, d.detected_at
-                FROM t
-                JOIN wallets iw ON iw.id = t.wallet_id
-                JOIN wallets pw ON pw.id = iw.payout_wallet_id
-                JOIN deposits d ON d.wallet_id = pw.id
-                WHERE d.trade_id IS NULL
-                  AND t.since IS NOT NULL
-                  AND t.owed > 0
-                  AND d.detected_at >= t.since
-                  AND abs(d.amount_usdt - t.owed)
-                        <= greatest(t.owed * 0.02, 0.01)
-                ORDER BY d.detected_at
+                SELECT p.amount_usdt, p.tx_hash, p.detected_at
+                FROM pay p, claimants c
+                WHERE (SELECT count(*) FROM pay) > c.n
+                ORDER BY p.detected_at
                 """,
                 trade_id,
             )
