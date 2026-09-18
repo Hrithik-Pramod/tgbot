@@ -350,13 +350,19 @@ fi
 # counted on both and every /export since 15 September overstated the period
 # by that much. Nothing complained, because both trades were individually
 # plausible. Repair with deploy/fix-phantom-usdt.sql.
+#
+# The first version of this skipped trades with NO deposits attached, on the
+# grounds that a trade briefly has none. That is the loudest case, not the
+# quietest: giving a deposit its own trade leaves the trade it came from
+# claiming USDT it no longer holds. SUPB3 was sitting in that gap on
+# 18 September while this line read green.
 DRIFT="$(q "SELECT count(*) FROM (
                 SELECT t.id
                 FROM trades t
                 LEFT JOIN deposits d ON d.trade_id = t.id
                 GROUP BY t.id, t.usdt_received
                 HAVING COALESCE(sum(d.amount_usdt), 0) <> t.usdt_received
-                   AND COALESCE(sum(d.amount_usdt), 0) > 0
+                   AND t.usdt_received > 0
             ) x")"
 if [ "${DRIFT:-0}" -eq 0 ]; then
     ok "every trade's USDT matches its deposits"
