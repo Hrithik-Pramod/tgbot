@@ -19,6 +19,7 @@ from bot import bridge_bot, bridge_trade, client_bot, membership, supplier_bot
 from bot.auth import ChatRoleMiddleware
 from bot.escape import CommandEscapeMiddleware
 from bot.labels import run_label_sync
+from bot.menu import publish_menus
 from bot.notifier import Notifier
 from config import Config
 from db.repo import Repo
@@ -107,6 +108,12 @@ async def main() -> None:
     # it — the supplier bot cannot see a client group and should not be able
     # to. See bot/labels.py.
     bots_by_role = {"bridge": bridge, "supplier": supplier, "client": client}
+
+    # Before polling starts, so the menu is right the moment anyone types a
+    # slash. /issue was live for eight days and invisible the whole time
+    # because this call did not exist (Bridge, 19 September 2026: "dont see -
+    # /issue?").
+    await publish_menus(bots_by_role)
 
     log.info("starting three bots and the deposit monitor")
     try:
