@@ -834,6 +834,160 @@ class TestPriorPayoutGuard:
         assert await repo.prior_payouts_for_trade(paired["trade"]) == []
 
 
+class TestTheBookAtAGlance:
+    """
+    /progress on the Bridge. Six correlated subselects per pairing, so it
+    runs against a real schema rather than being read.
+    """
+
+    async def _trade(self, world, repo, ref, status, expected, **over):
+        async with repo.pool.acquire() as conn:
+            return await conn.fetchval(
+                """
+                INSERT INTO trades (reference, supplier_id, client_id, wallet_id,
+                    rate_id, supply_rate, sell_rate, usdt_received, inr_expected,
+                    usdt_owed_client, margin_usdt, status, instructed_at)
+                VALUES ($1,$2,$3,$4,$5,105.50,106.50,$6,$7,0,0,$8::trade_status,$9)
+                RETURNING id
+                """,
+                ref, world["supplier"], world["client"], world["wallet"],
+                world["rate"], over.get("usdt", D("1000")), expected, status,
+                over.get("instructed"))
+
+    @pytest.mark.asyncio
+    async def test_an_idle_pairing_still_appears(self, world, repo):
+        """
+        The whole reason he asked. /summary can only show a pairing that has
+        a trade, so a quiet group is invisible — and a quiet group is often
+        the one worth looking at.
+        """
+        rows = await repo.book_progress()
+        assert len(rows) == 1
+        assert rows[0]["supplier_label"] == "Supplier A"
+        assert rows[0]["open_trades"] == 0
+        assert rows[0]["expected_inr"] == 0
+        assert rows[0]["stranded_usdt"] == 0
+
+    @pytest.mark.asyncio
+    async def test_collection_is_summed_across_open_trades(self, world, repo):
+        acct = await repo.add_bank_account(
+            party_id=world["supplier"], account_name="Alpha",
+            account_number="1", ifsc="X")
+        a = await self._trade(world, repo, "SUPA1", "awaiting_payment", D("100000"))
+        await self._trade(world, repo, "SUPA2", "open", D("50000"))
+        await repo.add_payment(
+            trade_id=a, utr="U1", amount_inr=D("30000"),
+            beneficiary_account_id=acct, added_by=world["client"])
+
+        row = (await repo.book_progress())[0]
+        assert row["open_trades"] == 2
+        assert row["expected_inr"] == D("150000")
+        assert row["collected_inr"] == D("30000")
+
+    @pytest.mark.asyncio
+    async def test_an_uninstructed_trade_is_counted(self, world, repo):
+        """It collects nothing and looks identical to one that is just slow."""
+        await self._trade(world, repo, "SUPA1", "open", D("100000"))
+        await self._trade(world, repo, "SUPA2", "awaiting_payment", D("50000"),
+                          instructed=__import__("datetime").datetime.now(
+                              __import__("datetime").timezone.utc))
+        row = (await repo.book_progress())[0]
+        assert row["open_trades"] == 2
+        assert row["uninstructed"] == 1
+
+    @pytest.mark.asyncio
+    async def test_a_completed_trade_is_not_counted_as_open(self, world, repo):
+        await self._trade(world, repo, "SUPA1", "completed", D("100000"))
+        row = (await repo.book_progress())[0]
+        assert row["open_trades"] == 0
+        assert row["expected_inr"] == 0
+
+    @pytest.mark.asyncio
+    async def test_money_on_a_cancelled_trade_is_reported(self, world, repo):
+        """
+        The line that would have caught ₹995,495 twice. A vendor with a
+        deposit on a cancelled trade and nothing invoiced reads as idle
+        everywhere else in the product.
+        """
+        t = await self._trade(world, repo, "SUPA1", "cancelled", D("249995"),
+                              usdt=D("2354"))
+        await repo.record_deposit(
+            tx_hash="stranded", wallet_id=world["wallet"],
+            amount_usdt=D("2354"), from_address="T", block_number=1)
+        async with repo.pool.acquire() as conn:
+            await conn.execute(
+                "UPDATE deposits SET trade_id = $1 WHERE tx_hash = 'stranded'", t)
+
+        row = (await repo.book_progress())[0]
+        assert row["open_trades"] == 0
+        assert row["stranded_usdt"] == D("2354")
+        assert row["stranded_inr"] == D("249995")
+
+    @pytest.mark.asyncio
+    async def test_a_cancelled_trade_that_was_part_paid_is_not_stranded(
+        self, world, repo
+    ):
+        """
+        Money came in against it, so it is a settled matter rather than an
+        unbilled one. Reporting it would train the eye to ignore the line.
+        """
+        acct = await repo.add_bank_account(
+            party_id=world["supplier"], account_name="Alpha",
+            account_number="1", ifsc="X")
+        t = await self._trade(world, repo, "SUPA1", "cancelled", D("249995"),
+                              usdt=D("2354"))
+        await repo.record_deposit(
+            tx_hash="paid", wallet_id=world["wallet"], amount_usdt=D("2354"),
+            from_address="T", block_number=1)
+        async with repo.pool.acquire() as conn:
+            await conn.execute(
+                "UPDATE deposits SET trade_id = $1 WHERE tx_hash = 'paid'", t)
+        await repo.add_payment(
+            trade_id=t, utr="U1", amount_inr=D("100"),
+            beneficiary_account_id=acct, added_by=world["client"])
+
+        assert (await repo.book_progress())[0]["stranded_usdt"] == 0
+
+    @pytest.mark.asyncio
+    async def test_a_cancelled_trade_with_no_deposit_is_not_stranded(
+        self, world, repo
+    ):
+        """SUPB3 after its restatement — nothing arrived, nothing owed."""
+        await self._trade(world, repo, "SUPA1", "cancelled", D("0"), usdt=D("0"))
+        assert (await repo.book_progress())[0]["stranded_usdt"] == 0
+
+    @pytest.mark.asyncio
+    async def test_one_pairing_does_not_borrow_anothers_figures(
+        self, world, repo
+    ):
+        """Six correlated subselects, one chance to get a join condition wrong."""
+        other = await repo.add_party(
+            role="supplier", label="Supplier B", display_name="B",
+            telegram_chat_id=-1098, telegram_user_id=None,
+            actor_party_id=world["bridge"])
+        async with repo.pool.acquire() as conn:
+            w2 = await conn.fetchval(
+                """
+                INSERT INTO wallets (address, is_internal, supplier_id, client_id, label)
+                VALUES ('TB2oAaVN9LX3mEJmNTRxKbHSFhPRvFuqmM', TRUE, $1, $2, 'B/A')
+                RETURNING id
+                """, other, world["client"])
+            await conn.execute(
+                """
+                INSERT INTO trades (reference, supplier_id, client_id, wallet_id,
+                    rate_id, supply_rate, sell_rate, usdt_received, inr_expected,
+                    usdt_owed_client, margin_usdt, status)
+                VALUES ('SUPB1',$1,$2,$3,$4,105.50,106.50,900,90000,0,0,'open')
+                """, other, world["client"], w2, world["rate"])
+        await self._trade(world, repo, "SUPA1", "open", D("100000"))
+
+        rows = {r["supplier_label"]: r for r in await repo.book_progress()}
+        assert rows["Supplier A"]["expected_inr"] == D("100000")
+        assert rows["Supplier B"]["expected_inr"] == D("90000")
+        assert rows["Supplier A"]["open_trades"] == 1
+        assert rows["Supplier B"]["open_trades"] == 1
+
+
 class TestOnboardingAVendor:
     """
     seed-supplier.sql, as a command, against a real schema. Every guard here

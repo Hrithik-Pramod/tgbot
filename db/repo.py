@@ -1142,6 +1142,86 @@ class Repo:
                 )
                 return trade
 
+    async def book_progress(self) -> list[asyncpg.Record]:
+        """
+        Every pairing and where it stands, in one row each.
+
+        Client request, 19 September 2026:
+
+            can you add /progress to UI control, so it shows a summary of all
+            trading progress for all groups?
+
+        /summary already existed but answers a narrower question: pick a
+        supplier, see their open trades. That is no use as a morning glance,
+        and it is silent about the thing worth knowing — a pairing where
+        NOTHING is open.
+
+        WHY IT WALKS THE WALLETS
+
+        One internal wallet is one supplier↔client pairing, so the wallet
+        table is the list of relationships whether or not they are busy. A
+        query over trades would only ever show groups that happen to have
+        one, which is precisely the blind spot being asked about.
+
+        WHY STRANDED USDT IS IN HERE
+
+        A vendor with nothing open looks idle. Twice in three days that has
+        meant the opposite: SUPB3 and SUPD1 on the 16th, SUPB5 and SUPD2 on
+        the 19th — deposits sitting on cancelled trades, USDT already paid
+        onward to the client, nothing invoiced to anybody. ₹995,495, lost
+        the same way twice, and on both occasions the screen said nothing.
+
+        A progress view that reports those as "nothing open" would be the
+        third time. So the money that arrived and was never billed is on the
+        same line as the money that is being collected.
+        """
+        async with self.pool.acquire() as conn:
+            return await conn.fetch(
+                """
+                SELECT
+                  s.label AS supplier_label,
+                  c.label AS client_label,
+                  (SELECT count(*) FROM trades t
+                    WHERE t.supplier_id = w.supplier_id
+                      AND t.client_id = w.client_id
+                      AND t.status IN ('open','awaiting_payment')) AS open_trades,
+                  (SELECT count(*) FROM trades t
+                    WHERE t.supplier_id = w.supplier_id
+                      AND t.client_id = w.client_id
+                      AND t.status IN ('open','awaiting_payment')
+                      AND t.instructed_at IS NULL) AS uninstructed,
+                  COALESCE((SELECT sum(t.inr_expected) FROM trades t
+                    WHERE t.supplier_id = w.supplier_id
+                      AND t.client_id = w.client_id
+                      AND t.status IN ('open','awaiting_payment')), 0) AS expected_inr,
+                  COALESCE((SELECT sum(p.amount_inr)
+                    FROM payments p JOIN trades t ON t.id = p.trade_id
+                    WHERE t.supplier_id = w.supplier_id
+                      AND t.client_id = w.client_id
+                      AND t.status IN ('open','awaiting_payment')), 0) AS collected_inr,
+                  COALESCE((SELECT sum(d.amount_usdt)
+                    FROM deposits d JOIN trades t ON t.id = d.trade_id
+                    WHERE t.supplier_id = w.supplier_id
+                      AND t.client_id = w.client_id
+                      AND t.status = 'cancelled'
+                      AND NOT EXISTS (SELECT 1 FROM payments p
+                                      WHERE p.trade_id = t.id)), 0) AS stranded_usdt,
+                  COALESCE((SELECT sum(t.inr_expected) FROM trades t
+                    WHERE t.supplier_id = w.supplier_id
+                      AND t.client_id = w.client_id
+                      AND t.status = 'cancelled'
+                      AND NOT EXISTS (SELECT 1 FROM payments p
+                                      WHERE p.trade_id = t.id)
+                      AND EXISTS (SELECT 1 FROM deposits d
+                                  WHERE d.trade_id = t.id)), 0) AS stranded_inr
+                FROM wallets w
+                JOIN parties s ON s.id = w.supplier_id
+                JOIN parties c ON c.id = w.client_id
+                WHERE w.is_internal AND s.is_active AND c.is_active
+                ORDER BY s.label, c.label
+                """
+            )
+
     async def current_rates(self) -> list[asyncpg.Record]:
         """
         The rate in force for every pairing, newest per pairing.

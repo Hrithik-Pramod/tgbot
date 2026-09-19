@@ -79,6 +79,17 @@ class TestTheMenuMatchesTheCode:
 
 
 class TestTheMenusStayApart:
+    # A name both sides genuinely own, each doing their own version of it.
+    # Not a list to grow casually: every entry is a command word a
+    # counterparty can see the Bridge also uses.
+    #
+    #   send      the supplier says they have sent; the Bridge notes a
+    #             transfer he has made
+    #   progress  the supplier sees their own collection and nothing else
+    #             (decision D4); the Bridge sees every group's position
+    #             (his request, 19 September 2026)
+    SHARED = {"send", "progress"}
+
     def test_no_bridge_command_leaks_to_a_counterparty(self):
         """
         Telegram scopes the menu to the bot, which is the same boundary as
@@ -88,10 +99,43 @@ class TestTheMenusStayApart:
         bridge = {c for c, _ in MENUS["bridge"]}
         for role in ("supplier", "client"):
             theirs = {c for c, _ in MENUS[role]}
-            # /send is genuinely both parties' word for their own action.
-            assert (bridge & theirs) <= {"send"}, (
-                f"{role} advertises Bridge commands: {bridge & theirs}"
+            assert (bridge & theirs) <= self.SHARED, (
+                f"{role} advertises Bridge commands: "
+                f"{(bridge & theirs) - self.SHARED}"
             )
+
+    def test_a_shared_name_is_a_different_handler_on_each_bot(self):
+        """
+        Sharing a word is fine. Sharing an implementation is not — the
+        supplier's /progress must not be able to return the Bridge's view of
+        everyone's book.
+        """
+        from bot import bridge_bot, supplier_bot
+
+        for name in self.SHARED:
+            handlers = {
+                role: getattr(module, f"cmd_{name}", None)
+                for role, module in (("bridge", bridge_bot),
+                                     ("supplier", supplier_bot))
+            }
+            present = [h for h in handlers.values() if h is not None]
+            if len(present) == 2:
+                assert present[0] is not present[1], (
+                    f"/{name} is the same function on both bots"
+                )
+
+    def test_the_suppliers_progress_stays_theirs_alone(self):
+        """
+        D4, pinned. The Bridge's /progress walks every pairing; the
+        supplier's must only ever reach their own trade.
+        """
+        import inspect
+
+        from bot import supplier_bot
+
+        src = inspect.getsource(supplier_bot.cmd_progress)
+        assert "open_trade_for_supplier" in src
+        assert "book_progress" not in src
 
     def test_the_client_is_not_shown_supplier_commands(self):
         client = {c for c, _ in MENUS["client"]}

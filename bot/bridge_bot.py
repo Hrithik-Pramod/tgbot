@@ -16,7 +16,9 @@ from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.types import CallbackQuery, InlineKeyboardButton, InlineKeyboardMarkup, Message
 
-from core.money import MoneyError, fmt_inr, fmt_usdt, to_decimal
+from decimal import Decimal
+
+from core.money import MoneyError, fmt_inr, fmt_usdt, fmt_usdt_plain, to_decimal
 
 log = logging.getLogger(__name__)
 router = Router()
@@ -194,6 +196,75 @@ async def setrate_cancel(call: CallbackQuery, state: FSMContext) -> None:
     await state.clear()
     await call.message.edit_text("Cancelled. No rate was changed.")
     await call.answer()
+
+
+# --------------------------------------------------------------- /progress
+
+@router.message(Command("progress"))
+async def cmd_progress(message: Message, repo) -> None:
+    """
+    The whole book on one screen.
+
+    Client request, 19 September 2026: "can you add /progress to UI control,
+    so it shows a summary of all trading progress for all groups?"
+
+    /summary answers a narrower question — pick a supplier, see their open
+    trades — which is two taps and tells him nothing about the groups he did
+    not pick. This is the glance: every pairing, busy or not, no taps.
+
+    The suppliers' own /progress shows them their collection and nothing
+    else (decision D4). This is the Bridge's, and the Bridge sees all, so it
+    carries the reference, the rate position and the money nobody has been
+    billed for.
+    """
+    rows = await repo.book_progress()
+    if not rows:
+        await message.answer("No pairings are set up yet.")
+        return
+
+    lines, total_out, total_stranded = [], Decimal(0), Decimal(0)
+
+    for r in rows:
+        lines.append(f"{r['supplier_label']} → {r['client_label']}")
+
+        if r["open_trades"]:
+            outstanding = r["expected_inr"] - r["collected_inr"]
+            total_out += outstanding
+            deals = "1 trade" if r["open_trades"] == 1 else f"{r['open_trades']} trades"
+            lines.append(
+                f"  {deals}   ₹{fmt_inr(r['collected_inr'])}"
+                f" of ₹{fmt_inr(r['expected_inr'])}"
+            )
+            if outstanding > 0:
+                lines.append(f"  Outstanding  ₹{fmt_inr(outstanding)}")
+            elif outstanding < 0:
+                lines.append(f"  OVERPAID     ₹{fmt_inr(-outstanding)}")
+            else:
+                lines.append("  Paid in full — close it with /done or /issue")
+            if r["uninstructed"]:
+                # A trade the client has not been told about collects nothing
+                # and looks identical to one that is merely slow.
+                lines.append(
+                    f"  {r['uninstructed']} not yet issued — use /issue"
+                )
+        else:
+            lines.append("  Nothing open")
+
+        # The line that would have caught ₹995,495, twice.
+        if r["stranded_usdt"]:
+            total_stranded += r["stranded_inr"]
+            lines.append(
+                f"  ⚠ {fmt_usdt_plain(r['stranded_usdt'])} USDT on a cancelled "
+                f"trade, never invoiced (₹{fmt_inr(r['stranded_inr'])})"
+            )
+
+        lines.append("")
+
+    lines.append(f"Outstanding across the book  ₹{fmt_inr(total_out)}")
+    if total_stranded:
+        lines.append(f"Never invoiced               ₹{fmt_inr(total_stranded)}")
+
+    await message.answer("\n".join(lines))
 
 
 # --------------------------------------------------------------- /viewrate
