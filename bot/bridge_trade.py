@@ -52,6 +52,7 @@ class Confirm(StatesGroup):
 
 class Cancel(StatesGroup):
     pick = State()
+    why = State()
     reason = State()
 
 
@@ -829,43 +830,62 @@ async def cancel_pick(call: CallbackQuery, state: FSMContext, repo) -> None:
             trade["reference"], len(paid_out),
         )
 
+    # Ask WHICH of the two reasons, because he told us there are only two.
+    #
+    # Bridge, 19 September 2026:
+    #
+    #     I'm cancelling what I want to happen is The Usdt goes out to the
+    #     client which is fine, but under these circumstances there are only
+    #     two reasons to cancel a trade one is that they are sending more
+    #     Usdt or they have picked the incorrect account to use
+    #
+    # That reframes the command. He has never meant "write this trade off" —
+    # he means "start this part again", and the USDT going out is expected
+    # rather than a problem. Treating every cancel as a write-off is why the
+    # money kept ending up unbilled: the tool was doing something other than
+    # what he was asking it for.
+    #
+    # And one of his two reasons does not need a cancel at all. Re-issuing
+    # already moves a trade to a different account and now tells the client
+    # to stop paying the old one, keeping the deposit, the reference and
+    # every payment already logged. Cancelling to change an account throws
+    # all of that away to achieve something /issue does in place — and it is
+    # what stranded 9,354 USDT twice this week.
+    await state.set_state(Cancel.why)
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="They are sending more USDT",
+                              callback_data="cwmore")],
+        [InlineKeyboardButton(text="Wrong account was picked",
+                              callback_data="cwacct")],
+        [InlineKeyboardButton(text="Something else", callback_data="cwother")],
+    ])
     await call.message.edit_text(
-        f"Cancelling {trade['reference']}.{note}\n\nWhy? (this goes in the audit log)"
+        f"Cancelling {trade['reference']}.{note}\n\nWhy?", reply_markup=kb
     )
     await call.answer()
 
 
-@router.message(Cancel.reason)
-async def cancel_reason(message: Message, state: FSMContext, party, repo) -> None:
-    reason = (message.text or "").strip()
-    if not reason:
-        await message.answer("Give a short reason so the record makes sense later.")
-        return
+async def _finish_cancel(target, state: FSMContext, party, repo, reason: str) -> None:
+    """
+    Cancel, then deal with what the cancel leaves behind.
 
+    Shared by every route in so the cleanup cannot be reached by one path and
+    missed by another — which is how the 16 September deposits were stranded
+    in the first place.
+    """
     data = await state.get_data()
+    await state.clear()
+
     ok, msg = await repo.cancel_trade(
         trade_id=data["trade_id"], actor_party_id=party["id"], reason=reason
     )
-    await state.clear()
-
     if not ok:
-        await message.answer(msg)
+        await target.answer(msg)
         return
 
-    # A cancelled trade can leave its supplier's USDT with nothing to pay it.
-    #
-    # Client request, 18 September 2026: "a way to cancel or correct a
-    # transaction cleanly ... while keeping the related records linked".
-    #
-    # On 16 September this step existed only in my head. SUPB3 and SUPD1 were
-    # cancelled over a rate change and their 2,354 and 7,000 USDT sat on dead
-    # trades for two days — already paid onward to the client, billed to
-    # nobody, ₹992,924 absent from the ledger with nothing saying so. Offering
-    # it here is the difference between a mechanism and a thing somebody has
-    # to remember at the moment they are busy cancelling something.
     stranded = await repo.stranded_deposits(data["trade_id"])
     if not stranded:
-        await message.answer(msg)
+        await target.answer(msg)
         return
 
     lines = [
@@ -893,7 +913,111 @@ async def cancel_reason(message: Message, state: FSMContext, party, repo) -> Non
         for d in stranded
     ] + [[InlineKeyboardButton(text="Leave it — settling by hand",
                                callback_data="rd_no")]])
-    await message.answer("\n".join(lines), reply_markup=kb)
+    await target.answer("\n".join(lines), reply_markup=kb)
+
+
+@router.callback_query(Cancel.why, F.data == "cwacct")
+async def cancel_wrong_account(call: CallbackQuery, state: FSMContext, repo) -> None:
+    """
+    The one that should not be a cancel.
+
+    /issue re-issues the same trade to different accounts, allocates only
+    what is still outstanding, keeps every payment already logged, and since
+    18 September tells the client in as many words to stop paying the old
+    account. Cancelling throws the reference and the deposit away to reach
+    the same place by a worse road.
+    """
+    data = await state.get_data()
+    trade = await repo.trade_detail(data["trade_id"])
+    await state.clear()
+
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text=f"Re-issue {trade['reference']} now",
+                              callback_data=f"cf:{trade['id']}")],
+        [InlineKeyboardButton(text="No, cancel it anyway",
+                              callback_data=f"cwforce:{trade['id']}")],
+    ])
+    await call.message.edit_text(
+        f"You do not need to cancel {trade['reference']} for that.\n\n"
+        "Re-issuing it sends the client new details for the right account "
+        "and tells them to stop paying the old one. The deposit, the "
+        "reference and anything already paid all stay where they are — only "
+        "the unpaid balance is re-allocated.",
+        reply_markup=kb,
+    )
+    await call.answer()
+
+
+@router.callback_query(Cancel.why, F.data == "cwmore")
+async def cancel_more_usdt(
+    call: CallbackQuery, state: FSMContext, party, repo
+) -> None:
+    """
+    A second deposit does not always need a cancel either.
+
+    An UNINSTRUCTED trade absorbs a further deposit on its own within the
+    merge window and the total goes up. Only once the client is holding a
+    figure does a new deposit have to become its own trade — the client's own
+    rule from 11 September, after 1,859 USDT quietly became 4,859.
+    """
+    data = await state.get_data()
+    trade = await repo.trade_detail(data["trade_id"])
+
+    if trade["instructed_at"] is None:
+        await state.clear()
+        kb = InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="No, cancel it anyway",
+                                  callback_data=f"cwforce:{trade['id']}")],
+        ])
+        await call.message.edit_text(
+            f"You do not need to cancel {trade['reference']} for that — it "
+            "has not gone to the client yet.\n\n"
+            "A further deposit from this supplier joins this same trade and "
+            "the total goes up by itself. Issue it once everything has "
+            "landed.",
+            reply_markup=kb,
+        )
+        await call.answer()
+        return
+
+    # Instructed. The client is holding a figure, so the extra genuinely has
+    # to be its own trade and cancelling is the right call.
+    await _finish_cancel(
+        call.message, state, party, repo, "supplier is sending more USDT",
+    )
+    await call.answer()
+
+
+@router.callback_query(Cancel.why, F.data == "cwother")
+async def cancel_other_reason(call: CallbackQuery, state: FSMContext) -> None:
+    await state.set_state(Cancel.reason)
+    await call.message.edit_text(
+        "Why? (this goes in the audit log)"
+    )
+    await call.answer()
+
+
+@router.callback_query(F.data.startswith("cwforce:"))
+async def cancel_anyway(call: CallbackQuery, state: FSMContext, party, repo) -> None:
+    """He has been told there is a better route and wants this one regardless."""
+    await state.update_data(trade_id=int(call.data.split(":", 1)[1]))
+    await state.set_state(Cancel.reason)
+    await call.message.edit_text("Why? (this goes in the audit log)")
+    await call.answer()
+
+
+@router.message(Cancel.reason)
+async def cancel_reason(message: Message, state: FSMContext, party, repo) -> None:
+    reason = (message.text or "").strip()
+    if not reason:
+        await message.answer("Give a short reason so the record makes sense later.")
+        return
+
+    # The cleanup lives in _finish_cancel so every route into a cancel gets
+    # it. When it lived here, only the typed-reason path had it — and a
+    # second route added later would silently have gone without, which is
+    # precisely how the 16 September deposits were stranded.
+    await _finish_cancel(message, state, party, repo, reason)
 
 
 @router.callback_query(F.data.startswith("rd:"))

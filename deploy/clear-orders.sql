@@ -11,9 +11,12 @@
 --   docker compose exec -T db psql -U settlement -d settlement < deploy/clear-orders.sql
 --   docker compose start bot
 --
--- KEEPS   parties, groups, bank accounts, rates, wallets — the whole setup.
--- CLEARS  trades, payments, payment slots, deposits, deal counters, and the
---         monitor's position on each wallet.
+-- KEEPS   parties, groups, bank accounts, rates, wallets — the whole setup —
+--         and the deal numbering, so the next trade is SUPA16 rather than a
+--         second SUPA1. See the note further down; it matters more than it
+--         looks.
+-- CLEARS  trades, payments, payment slots, deposits, and the monitor's
+--         position on each wallet.
 --
 -- HOW THIS DIFFERS FROM reset-uat.sql
 --
@@ -42,8 +45,20 @@ DELETE FROM payment_slots;
 DELETE FROM deposits;
 DELETE FROM trades;
 
--- References start again at SUPA1, SUPB1.
-UPDATE supplier_counters SET last_number = 0;
+-- Deal numbers CONTINUE. They are deliberately not reset.
+--
+-- 19 September 2026: "All trading is cleared, so let's wipe out everything."
+-- Fair enough for the ledger — but SUPA1 through SUPA15, SUPB1 through
+-- SUPB6 and the rest are quoted in three WhatsApp groups, in the suppliers'
+-- records and in the client's. Restarting at SUPA1 makes every one of those
+-- references mean two different trades, and the second meaning has no
+-- payments behind it to tell them apart.
+--
+-- Clearing the ledger is housekeeping. Making the last month's paperwork
+-- ambiguous is not, and it cannot be undone afterwards.
+--
+-- deploy/reset-uat.sql is the one that starts the numbering over. That is
+-- for a test database, where nobody outside has seen the references.
 
 -- Re-adopt every wallet, so existing chain history is ignored rather than
 -- read as a fresh pile of deposits.
@@ -69,3 +84,11 @@ UNION ALL SELECT 'bank_accounts (kept)', count(*) FROM bank_accounts
 UNION ALL SELECT 'rates (kept)', count(*) FROM rates
 UNION ALL SELECT 'wallets (kept)', count(*) FROM wallets
 UNION ALL SELECT 'audit_log (kept)', count(*) FROM audit_log;
+
+-- The next deal number for each supplier, which should carry on from where
+-- the cleared trades left off rather than start again at 1.
+--
+--   SELECT p.label, sc.prefix, sc.last_number,
+--          sc.prefix || (sc.last_number + 1) AS next_reference
+--   FROM supplier_counters sc JOIN parties p ON p.id = sc.supplier_id
+--   ORDER BY p.label;

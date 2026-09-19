@@ -229,15 +229,15 @@ class TestASupersededInstructionIsRetracted:
 
 class TestCancellingOffersToKeepTheRecordsLinked:
     def test_a_cancel_looks_for_stranded_money(self):
-        src = _code(bridge_trade.cancel_reason)
+        src = _code(bridge_trade._finish_cancel)
         assert "await repo.stranded_deposits" in src
 
     def test_a_cancel_with_nothing_stranded_is_unchanged(self):
-        src = _code(bridge_trade.cancel_reason)
+        src = _code(bridge_trade._finish_cancel)
         assert "if not stranded:" in src
 
     def test_the_offer_names_the_amount(self):
-        src = _code(bridge_trade.cancel_reason)
+        src = _code(bridge_trade._finish_cancel)
         assert "fmt_usdt_plain(d['amount_usdt'])" in src
 
     def test_settling_by_hand_is_an_option(self):
@@ -245,9 +245,27 @@ class TestCancellingOffersToKeepTheRecordsLinked:
         He often does. A flow with no way out gets abandoned halfway, which
         is its own mess.
         """
-        src = _code(bridge_trade.cancel_reason)
+        src = _code(bridge_trade._finish_cancel)
         assert "rd_no" in src
         assert "by hand" in src
+
+    def test_every_route_into_a_cancel_gets_the_cleanup(self):
+        """
+        The invariant, now that there is more than one way in. When this
+        lived inside the typed-reason handler, a second route added later
+        would have gone without it silently — which is exactly how the
+        16 September deposits were stranded.
+        """
+        import inspect
+
+        callers = [
+            name for name, fn in vars(bridge_trade).items()
+            if callable(fn) and getattr(fn, "__module__", None) == bridge_trade.__name__
+            and "cancel_trade" in inspect.getsource(fn)
+        ]
+        assert callers == ["_finish_cancel"], (
+            f"{callers} call cancel_trade directly and skip the cleanup"
+        )
 
     def test_declining_says_what_that_means(self):
         src = _code(bridge_trade.leave_stranded_deposit)
@@ -313,10 +331,10 @@ class TestCancellingSaysWhatItWritesOff:
         assert "settled it outside the bot, carry on" in src
         assert "return" not in src.split("if paid_out")[1]
 
-    def test_it_arrives_before_the_reason_is_asked(self):
+    def test_it_arrives_before_he_is_asked_why(self):
         """After the fact is a receipt, not a warning."""
         src = _code(bridge_trade.cancel_pick)
-        assert src.index("prior_payouts_for_trade") < src.index("Why? (this goes")
+        assert src.index("prior_payouts_for_trade") < src.index("Why?")
 
 
 class TestTheSourceTradeIsCorrectedToo:
