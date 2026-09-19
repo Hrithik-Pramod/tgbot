@@ -15,8 +15,8 @@
 --         and the deal numbering, so the next trade is SUPA16 rather than a
 --         second SUPA1. See the note further down; it matters more than it
 --         looks.
--- CLEARS  trades, payments, payment slots, deposits, and the monitor's
---         position on each wallet.
+-- CLEARS  trades, payments, payment slots, deposits, outstanding supplier
+--         claims, and the monitor's position on each wallet.
 --
 -- HOW THIS DIFFERS FROM reset-uat.sql
 --
@@ -43,6 +43,23 @@ BEGIN;
 DELETE FROM payments;
 DELETE FROM payment_slots;
 DELETE FROM deposits;
+
+-- Claims go before trades, for two reasons.
+--
+-- The FIRST is that they must. pending_sends.matched_trade_id references
+-- trades(id), so DELETE FROM trades hits a foreign key violation and rolls
+-- the whole transaction back. That has been true since pending_sends was
+-- added on 11 September and this script has not been run since, so it would
+-- have failed the first time it was needed.
+--
+-- The SECOND is that an unmatched claim must not survive a clear-out.
+-- latest_nomination reads exactly those rows, so a claim left behind would
+-- pre-select its account on the first trade after the reset — a default
+-- that reads as a decision, on a fresh ledger, with nothing to check it
+-- against. That is the 11 September fault and it recurred on the 19th from
+-- a single test /send.
+DELETE FROM pending_sends;
+
 DELETE FROM trades;
 
 -- Deal numbers CONTINUE. They are deliberately not reset.
@@ -78,6 +95,7 @@ SELECT 'trades' AS table_name, count(*) FROM trades
 UNION ALL SELECT 'payments', count(*) FROM payments
 UNION ALL SELECT 'payment_slots', count(*) FROM payment_slots
 UNION ALL SELECT 'deposits', count(*) FROM deposits
+UNION ALL SELECT 'pending_sends', count(*) FROM pending_sends
 UNION ALL SELECT 'monitor_state', count(*) FROM monitor_state
 UNION ALL SELECT 'parties (kept)', count(*) FROM parties
 UNION ALL SELECT 'bank_accounts (kept)', count(*) FROM bank_accounts
