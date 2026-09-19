@@ -75,6 +75,28 @@ class CommandEscapeMiddleware(BaseMiddleware):
                 current = await state.get_state()
                 if current is not None:
                     await state.clear()
+
+                    # And the copy the router is about to read.
+                    #
+                    # aiogram's FSMContextMiddleware runs on the UPDATE
+                    # observer, before this one, and puts the state into the
+                    # data dict twice: `state` (the live context) and
+                    # `raw_state` (a snapshot of the string). StateFilter
+                    # matches on the SNAPSHOT. So clearing the context alone
+                    # empties the storage and changes nothing about routing —
+                    # the message still reaches the step handler, which reads
+                    # it as an answer to whatever it asked.
+                    #
+                    # Live, 19 September 2026. Mid-way through /addvendor the
+                    # Bridge typed /issue, and the bot replied "Deal numbers
+                    # for /issue@pt_bridge_ctrl_bot will read ISSU1, ISSU2" —
+                    # it had taken the command as the vendor's name. Exactly
+                    # the complaint this middleware was written for on
+                    # 15 September, four days after it shipped.
+                    #
+                    # The tests passed throughout, because they asserted that
+                    # clear() was called rather than that the command ran.
+                    data["raw_state"] = None
                     log.info(
                         "command %r abandoned open state %s in chat %s",
                         text.split()[0], current, event.chat.id,
