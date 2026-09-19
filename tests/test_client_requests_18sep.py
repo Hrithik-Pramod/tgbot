@@ -263,6 +263,62 @@ class TestCancellingOffersToKeepTheRecordsLinked:
         assert "issue_slots" not in src
 
 
+class TestCancellingSaysWhatItWritesOff:
+    """
+    THE SECOND TIME (live, 19 September 2026)
+
+    SUPB5 and SUPD2 were cancelled with the reasons "cleaing" and
+    "clearing". Neither had been issued and neither had a rupee logged, so on
+    screen they were empty rows worth tidying. The USDT for both had already
+    reached the client on the 16th, so tidying them wrote off ₹995,495 of
+    delivered settlement — the same money, lost the same way, three days
+    apart.
+
+    The only thing that had ever stood in the way was me saying so in
+    WhatsApp. Twice. A message is not a mechanism.
+    """
+
+    def test_the_cancel_screen_checks_for_a_payout(self):
+        src = _code(bridge_trade.cancel_pick)
+        assert "await repo.prior_payouts_for_trade" in src
+
+    def test_it_only_warns_when_nothing_has_been_invoiced(self):
+        """
+        A trade the client has already started paying is a normal cancel and
+        does not need this. The dangerous one looks empty.
+        """
+        src = _code(bridge_trade.cancel_pick)
+        assert 'if paid_out and trade["paid_inr"] == 0:' in src
+
+    def test_it_names_the_sum_being_written_off(self):
+        """
+        "Money may have gone out" is not actionable. "You are writing off
+        ₹249,995" is.
+        """
+        src = _code(bridge_trade.cancel_pick)
+        assert 'fmt_inr(trade[\'inr_expected\'])' in src
+        assert "writes off" in src
+
+    def test_it_shows_when_the_usdt_left(self):
+        src = _code(bridge_trade.cancel_pick)
+        assert "detected_at" in src
+        assert "amount_usdt" in src
+
+    def test_it_does_not_block_the_cancel(self):
+        """
+        He settles by hand often, and that is a legitimate reason to cancel.
+        A guard that refuses gets worked around; one that informs gets read.
+        """
+        src = _code(bridge_trade.cancel_pick)
+        assert "settled it outside the bot, carry on" in src
+        assert "return" not in src.split("if paid_out")[1]
+
+    def test_it_arrives_before_the_reason_is_asked(self):
+        """After the fact is a receipt, not a warning."""
+        src = _code(bridge_trade.cancel_pick)
+        assert src.index("prior_payouts_for_trade") < src.index("Why? (this goes")
+
+
 class TestTheSourceTradeIsCorrectedToo:
     def test_moving_a_deposit_restates_where_it_came_from(self):
         """

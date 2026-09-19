@@ -7,10 +7,13 @@ from the database to the calculation engine. Nothing here ever casts to float.
 
 from __future__ import annotations
 
+import logging
 from decimal import Decimal
 from typing import Any, Optional, Sequence  # noqa: F401
 
 import asyncpg
+
+log = logging.getLogger(__name__)
 
 
 def derive_prefix(label: str) -> str:
@@ -77,6 +80,36 @@ class Repo:
             actor_party_id, action, entity_type, entity_id,
             json.dumps(detail or {}, default=str),
         )
+
+    async def audit_standalone(
+        self,
+        *,
+        actor_party_id: Optional[int],
+        action: str,
+        entity_type: str | None = None,
+        entity_id: int | None = None,
+        detail: dict | None = None,
+    ) -> None:
+        """
+        The same record, for a caller with no transaction of its own.
+
+        audit() takes a connection because almost every entry belongs inside
+        the change it describes — the audit and the UPDATE stand or fall
+        together. This is for the other kind: an observation that is worth
+        keeping whether or not anything else happened, such as a beneficiary
+        the matcher could not place.
+
+        It must never be able to break the flow it is observing. A diagnostic
+        that can fail a payment is worse than no diagnostic.
+        """
+        try:
+            async with self.pool.acquire() as conn:
+                await self.audit(
+                    conn, actor_party_id=actor_party_id, action=action,
+                    entity_type=entity_type, entity_id=entity_id, detail=detail,
+                )
+        except Exception:
+            log.exception("could not write audit entry %r", action)
 
     # ----------------------------------------------------------------- parties
 

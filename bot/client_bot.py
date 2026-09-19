@@ -415,6 +415,34 @@ async def on_pasted_payment(message: Message, state: FSMContext, party, repo,
                 p.beneficiary, message.chat.id,
                 [a["account_name"] for a in matchable],
             )
+            # And to the audit log, because the container log does not last.
+            #
+            # 19 September 2026: the client pasted "to SUPER TRA" against two
+            # identically-named registrations and it went unmatched. By the
+            # time anyone looked, four redeploys had recreated the container
+            # and every line of that log was gone — so the one question worth
+            # answering, whether the tiebreak ran and what it saw, could not
+            # be answered at all.
+            #
+            # A diagnostic that only exists until the next deploy is not a
+            # diagnostic on a system that gets deployed several times a day.
+            # This is the same rule the ledger already follows: if it matters
+            # after the fact, it goes in the database.
+            await repo.audit_standalone(
+                actor_party_id=party["id"],
+                action="payment.unmatched_beneficiary",
+                entity_type="party", entity_id=party["id"],
+                detail={
+                    "typed": p.beneficiary,
+                    "utr": p.utr,
+                    "amount_inr": str(p.amount_inr),
+                    "candidates": [
+                        {"id": a["id"], "name": a["account_name"],
+                         "has_open_trade": a["trade_id"] is not None}
+                        for a in matchable
+                    ],
+                },
+            )
         lines.append("")
 
     # Matched an account, but that supplier has nothing open to record it

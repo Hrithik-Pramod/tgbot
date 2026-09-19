@@ -794,6 +794,41 @@ async def cancel_pick(call: CallbackQuery, state: FSMContext, repo) -> None:
             f"\n\nNOTE: ₹{fmt_inr(trade['paid_inr'])} has already been logged "
             "against this trade. Those payment records are kept."
         )
+
+    # The costly case, and the one that keeps happening.
+    #
+    # 19 September 2026: SUPB5 and SUPD2 were cancelled with the reasons
+    # "cleaing" and "clearing" — housekeeping. Neither had been issued and
+    # neither had a rupee against it, so on screen they looked like empty
+    # rows worth tidying away. They were not. The USDT for both had already
+    # gone to the client on the 16th, so cancelling left ₹995,495 of
+    # delivered settlement billed to nobody, for the second time in three
+    # days.
+    #
+    # Nothing about the screen said so. The only thing standing between him
+    # and that was me putting it in a WhatsApp message, twice, and a message
+    # is not a mechanism. The bot can see the payout — it is the same query
+    # the double-send guard uses — so it says it here, at the moment it
+    # matters, before the reason box.
+    paid_out = await repo.prior_payouts_for_trade(trade_id)
+    if paid_out and trade["paid_inr"] == 0:
+        already = "\n".join(
+            f"  {fmt_usdt_plain(p['amount_usdt'])} USDT   "
+            f"{p['detected_at']:%d %b %H:%M}"
+            for p in paid_out
+        )
+        note += (
+            "\n\nCAREFUL — the client may already have been paid for this:\n\n"
+            f"{already}\n\n"
+            f"left for them after the deposit landed. Nothing has been "
+            f"invoiced, so cancelling writes off ₹{fmt_inr(trade['inr_expected'])} "
+            "you are owed. If you have settled it outside the bot, carry on."
+        )
+        log.warning(
+            "cancelling %s, which has %d prior payout(s) and nothing invoiced",
+            trade["reference"], len(paid_out),
+        )
+
     await call.message.edit_text(
         f"Cancelling {trade['reference']}.{note}\n\nWhy? (this goes in the audit log)"
     )
