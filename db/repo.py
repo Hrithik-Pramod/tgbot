@@ -247,19 +247,46 @@ class Repo:
                 ):
                     return False, f"There is already a party called {label}.", None
 
-                taken = await conn.fetchval(
+                # Not just an exact clash — an OVERLAPPING one.
+                #
+                # A reference is the prefix with a number stuck on the end,
+                # so two prefixes collide whenever one is the start of the
+                # other. V1 and V13 look distinct and are not: V1's
+                # thirty-first trade is V131, and so is V13's first. The
+                # unique index then rejects whichever comes second, and it
+                # does so inside the deposit handler — the worst moment for
+                # a setup mistake to surface, and one nobody would connect
+                # to a vendor registered weeks earlier.
+                #
+                # Caught 19 September 2026 from the live table, with V13
+                # registered and V5–V12 about to be. Vendors are numbered
+                # sequentially here, so V1 was a matter of time.
+                taken = await conn.fetchrow(
                     """
-                    SELECT p.label FROM supplier_counters sc
+                    SELECT p.label, sc.prefix FROM supplier_counters sc
                     JOIN parties p ON p.id = sc.supplier_id
                     WHERE upper(sc.prefix) = $1
+                       OR upper(sc.prefix) LIKE $1 || '%'
+                       OR $1 LIKE upper(sc.prefix) || '%'
                     """,
                     prefix,
                 )
                 if taken is not None:
+                    if taken["prefix"].upper() == prefix:
+                        return False, (
+                            f"{taken['label']} already uses the prefix "
+                            f"{prefix}. Two vendors sharing one makes their "
+                            "deal numbers impossible to tell apart."
+                        ), None
                     return False, (
-                        f"{taken} already uses the prefix {prefix}. Two "
-                        "vendors sharing one makes their deal numbers "
-                        "impossible to tell apart."
+                        f"{prefix} overlaps with {taken['prefix']}, used by "
+                        f"{taken['label']}.\n\n"
+                        "A deal number is the prefix with a number after it, "
+                        f"so {prefix} and {taken['prefix']} would eventually "
+                        "produce the same reference for two different trades "
+                        "— and that only fails when a deposit lands.\n\n"
+                        "Pick something that is not the start of another "
+                        "prefix, or a continuation of one."
                     ), None
 
                 if await conn.fetchval(

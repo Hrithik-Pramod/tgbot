@@ -1137,6 +1137,56 @@ class TestOnboardingAVendor:
         assert "prefix" in msg
 
     @pytest.mark.asyncio
+    async def test_a_prefix_that_extends_another_is_refused(self, world, repo):
+        """
+        V1 and V13 look distinct and are not. A reference is the prefix with
+        a number after it, so V1's thirty-first trade is V131 and so is
+        V13's first. The unique index then refuses one of them inside the
+        deposit handler, weeks after the mistake was made.
+        """
+        ok, _, _ = await self._onboard(
+            world, repo, label="V1", prefix="V1", telegram_chat_id=-2001,
+            wallet_address="TV1jkLmNoPqRsTuVwXyZaBcDeFgHiJkLmN")
+        assert ok
+
+        ok, msg, _ = await self._onboard(
+            world, repo, label="V13", prefix="V13", telegram_chat_id=-2013,
+            wallet_address="TV13kLmNoPqRsTuVwXyZaBcDeFgHiJkLmN")
+        assert not ok
+        assert "overlaps" in msg
+
+    @pytest.mark.asyncio
+    async def test_a_prefix_that_another_extends_is_refused(self, world, repo):
+        """The same collision, registered in the other order."""
+        ok, _, _ = await self._onboard(
+            world, repo, label="V13", prefix="V13", telegram_chat_id=-2013,
+            wallet_address="TV13kLmNoPqRsTuVwXyZaBcDeFgHiJkLmN")
+        assert ok
+
+        ok, msg, _ = await self._onboard(
+            world, repo, label="V1", prefix="V1", telegram_chat_id=-2001,
+            wallet_address="TV1jkLmNoPqRsTuVwXyZaBcDeFgHiJkLmN")
+        assert not ok
+        assert "overlaps" in msg
+
+    @pytest.mark.asyncio
+    async def test_prefixes_that_merely_share_a_start_are_fine(self, world, repo):
+        """
+        V10 and V11 share two characters and neither starts the other, so
+        their references can never meet. The guard must not refuse the whole
+        numbering scheme he is actually using.
+        """
+        ok, _, _ = await self._onboard(
+            world, repo, label="V10", prefix="V10", telegram_chat_id=-2010,
+            wallet_address="TV10kLmNoPqRsTuVwXyZaBcDeFgHiJkLmN")
+        assert ok
+
+        ok, msg, _ = await self._onboard(
+            world, repo, label="V11", prefix="V11", telegram_chat_id=-2011,
+            wallet_address="TV11kLmNoPqRsTuVwXyZaBcDeFgHiJkLmN")
+        assert ok, msg
+
+    @pytest.mark.asyncio
     async def test_a_taken_chat_is_refused(self, world, repo):
         ok, msg, _ = await self._onboard(world, repo, telegram_chat_id=-1002)
         assert not ok
