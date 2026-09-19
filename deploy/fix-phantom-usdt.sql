@@ -39,8 +39,10 @@
 --                       is the 11 September fault. Only a cancelled or
 --                       completed trade can be touched here.
 --   any payment         REFUSED. Money was logged against these figures.
---   no deposits left    REFUSED. A trade with nothing attached needs a
---                       decision, not an arithmetic correction.
+--   no deposits left    ALLOWED on a cancelled trade — its deposit was
+--                       given its own trade and this is the other half of
+--                       that move; the figures go to zero. Still refused on
+--                       a completed one, which really does need looking at.
 --   figures already right  REFUSED, loudly, so a second run cannot quietly
 --                       look like it did something.
 --
@@ -81,10 +83,24 @@ BEGIN
 
     SELECT COALESCE(SUM(amount_usdt), 0) INTO real_usdt
     FROM deposits WHERE trade_id = t.id;
-    IF real_usdt = 0 THEN
+
+    -- Zero is a legitimate answer for a CANCELLED trade: its deposit was
+    -- given its own trade and the source was never restated. SUPB3 and
+    -- SUPD1 were left exactly like that on 18 September — reopened as SUPB5
+    -- and SUPD2 by deploy/reopen-deposit-as-trade.sql, which moves the
+    -- deposit and stops there. Both went on claiming 2,354 and 7,000 USDT
+    -- they no longer held.
+    --
+    -- The first version of this script refused that case on the grounds
+    -- that it "needs a decision". The decision is not in doubt: a cancelled
+    -- trade with nothing attached is owed nothing and owes nothing.
+    --
+    -- A COMPLETED trade with no deposits is a different animal and still
+    -- refused. That one really does need looking at.
+    IF real_usdt = 0 AND t.status <> 'cancelled' THEN
         RAISE EXCEPTION
-            '% has no deposits attached. That needs a decision, not this',
-            t.reference;
+            '% is % and has no deposits attached. That needs a decision, '
+            'not this', t.reference, t.status;
     END IF;
 
     IF real_usdt = t.usdt_received THEN
@@ -93,9 +109,13 @@ BEGIN
             t.reference, real_usdt;
     END IF;
 
-    new_inr    := round(real_usdt * t.supply_rate, 0);
-    new_owed   := round(new_inr / t.sell_rate, 2);
-    new_margin := round(real_usdt - new_owed, 2);
+    IF real_usdt = 0 THEN
+        new_inr := 0; new_owed := 0; new_margin := 0;
+    ELSE
+        new_inr    := round(real_usdt * t.supply_rate, 0);
+        new_owed   := round(new_inr / t.sell_rate, 2);
+        new_margin := round(real_usdt - new_owed, 2);
+    END IF;
 
     UPDATE trades
     SET usdt_received    = real_usdt,
