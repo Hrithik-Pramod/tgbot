@@ -1205,13 +1205,19 @@ class Repo:
                       AND t.client_id = w.client_id
                       AND t.status = 'cancelled'
                       AND NOT EXISTS (SELECT 1 FROM payments p
-                                      WHERE p.trade_id = t.id)), 0) AS stranded_usdt,
+                                      WHERE p.trade_id = t.id)
+                      AND NOT EXISTS (SELECT 1 FROM audit_log al
+                                      WHERE al.action = 'trade.settled_by_hand'
+                                        AND al.entity_id = t.id)), 0) AS stranded_usdt,
                   COALESCE((SELECT sum(t.inr_expected) FROM trades t
                     WHERE t.supplier_id = w.supplier_id
                       AND t.client_id = w.client_id
                       AND t.status = 'cancelled'
                       AND NOT EXISTS (SELECT 1 FROM payments p
                                       WHERE p.trade_id = t.id)
+                      AND NOT EXISTS (SELECT 1 FROM audit_log al
+                                      WHERE al.action = 'trade.settled_by_hand'
+                                        AND al.entity_id = t.id)
                       AND EXISTS (SELECT 1 FROM deposits d
                                   WHERE d.trade_id = t.id)), 0) AS stranded_inr
                 FROM wallets w
@@ -2272,6 +2278,70 @@ class Repo:
                     "inr_expected": new_inr, "usdt_owed": new_owed,
                     "restated": restated,
                 }
+
+    async def mark_settled_by_hand(
+        self, *, deposit_id: int, actor_party_id: int,
+    ) -> tuple[bool, str]:
+        """
+        Record that a stranded deposit was settled outside the bot.
+
+        WHY THIS HAD TO EXIST (19 September 2026)
+
+        /progress gained a line for USDT that arrived on a trade which was
+        then cancelled without the client ever being invoiced. It found
+        84,799 USDT against IndoLondon — and most of that is not lost, it is
+        trades the Bridge settled by hand, which he does often. SUPA5 was
+        settled that way before any of this week's work.
+
+        A warning that fires on normal business is worse than no warning. He
+        would have read the first one, checked it, found nothing wrong, and
+        stopped reading it — and the next real one would have gone by with
+        the rest.
+
+        The "Leave it — settling by hand" button already existed on the
+        cancel flow. It just said "left as it is" and recorded nothing, so
+        the bot had no way to tell the two cases apart. Now it says so, and
+        /progress stops counting that trade.
+
+        Nothing is deleted and no figure moves. This only records a judgement
+        the Bridge has made, in the one place that survives.
+        """
+        async with self.pool.acquire() as conn:
+            async with conn.transaction():
+                row = await conn.fetchrow(
+                    """
+                    SELECT d.id, d.amount_usdt, d.trade_id, t.reference, t.status
+                    FROM deposits d
+                    LEFT JOIN trades t ON t.id = d.trade_id
+                    WHERE d.id = $1
+                    """,
+                    deposit_id,
+                )
+                if row is None:
+                    return False, "That deposit no longer exists."
+                if row["trade_id"] is None:
+                    return False, "That deposit has no trade to mark."
+                if row["status"] != "cancelled":
+                    return False, (
+                        f"{row['reference']} is {row['status']}, not "
+                        "cancelled. Only an abandoned trade can be marked "
+                        "settled by hand."
+                    )
+
+                await self.audit(
+                    conn, actor_party_id=actor_party_id,
+                    action="trade.settled_by_hand", entity_type="trade",
+                    entity_id=row["trade_id"],
+                    detail={
+                        "reference": row["reference"],
+                        "usdt": row["amount_usdt"],
+                        "deposit_id": deposit_id,
+                    },
+                )
+                return True, (
+                    f"{row['reference']} marked as settled by hand. It will "
+                    "stop showing as uninvoiced in /progress."
+                )
 
     async def reopen_trade(
         self, *, trade_id: int, actor_party_id: int, reason: str,

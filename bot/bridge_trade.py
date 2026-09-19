@@ -911,8 +911,12 @@ async def _finish_cancel(target, state: FSMContext, party, repo, reason: str) ->
             callback_data=f"rd:{d['id']}",
         )]
         for d in stranded
-    ] + [[InlineKeyboardButton(text="Leave it — settling by hand",
-                               callback_data="rd_no")]])
+    ] + [[InlineKeyboardButton(
+        text="Leave it — settling by hand",
+        # Carries the deposit, so the choice can be recorded against the
+        # trade rather than merely acknowledged on screen.
+        callback_data=f"rd_no:{stranded[0]['id']}",
+    )]])
     await target.answer("\n".join(lines), reply_markup=kb)
 
 
@@ -1058,12 +1062,34 @@ async def reopen_stranded_deposit(
     await call.answer()
 
 
-@router.callback_query(F.data == "rd_no")
-async def leave_stranded_deposit(call: CallbackQuery) -> None:
+@router.callback_query(F.data.startswith("rd_no"))
+async def leave_stranded_deposit(call: CallbackQuery, party, repo) -> None:
+    """
+    Settling by hand is a decision, so it gets recorded like one.
+
+    This used to say "left as it is" and write nothing, which meant the bot
+    could not tell a trade he had settled himself from one that had been
+    forgotten. /progress then reported 84,799 USDT against IndoLondon as
+    never invoiced, most of it his own hand-settled business — a warning
+    that fires on normal work, which is a warning nobody reads twice.
+    """
+    deposit_id = call.data.split(":", 1)[1] if ":" in call.data else None
     await call.message.edit_reply_markup(reply_markup=None)
+
+    if deposit_id is None:
+        await call.message.answer(
+            "Left as it is. The deposit stays on the cancelled trade and the "
+            "client is not invoiced for it."
+        )
+        await call.answer()
+        return
+
+    ok, msg = await repo.mark_settled_by_hand(
+        deposit_id=int(deposit_id), actor_party_id=party["id"]
+    )
     await call.message.answer(
-        "Left as it is. The deposit stays on the cancelled trade and the "
-        "client is not invoiced for it."
+        msg if ok else
+        f"{msg}\n\nLeft as it is — the client is not invoiced for it."
     )
     await call.answer()
 

@@ -949,6 +949,83 @@ class TestTheBookAtAGlance:
         assert (await repo.book_progress())[0]["stranded_usdt"] == 0
 
     @pytest.mark.asyncio
+    async def test_a_trade_settled_by_hand_stops_being_reported(
+        self, world, repo
+    ):
+        """
+        He settles by hand often — SUPA5 was, before any of this week's
+        work. Without this the line reported 84,799 USDT against IndoLondon
+        as never invoiced, most of it his own normal business, and a warning
+        that fires on normal business is one nobody reads twice.
+        """
+        t = await self._trade(world, repo, "SUPA1", "cancelled", D("249995"),
+                              usdt=D("2354"))
+        await repo.record_deposit(
+            tx_hash="byhand", wallet_id=world["wallet"], amount_usdt=D("2354"),
+            from_address="T", block_number=1)
+        async with repo.pool.acquire() as conn:
+            deposit = await conn.fetchval(
+                "UPDATE deposits SET trade_id = $1 WHERE tx_hash = 'byhand' "
+                "RETURNING id", t)
+
+        assert (await repo.book_progress())[0]["stranded_usdt"] == D("2354")
+
+        ok, msg = await repo.mark_settled_by_hand(
+            deposit_id=deposit, actor_party_id=world["bridge"])
+        assert ok, msg
+
+        row = (await repo.book_progress())[0]
+        assert row["stranded_usdt"] == 0
+        assert row["stranded_inr"] == 0
+
+    @pytest.mark.asyncio
+    async def test_a_live_trade_cannot_be_marked_settled_by_hand(
+        self, world, repo
+    ):
+        """
+        Only an abandoned trade. Marking a live one would hide real money
+        from the one view built to surface it.
+        """
+        t = await self._trade(world, repo, "SUPA1", "awaiting_payment",
+                              D("249995"), usdt=D("2354"))
+        await repo.record_deposit(
+            tx_hash="live", wallet_id=world["wallet"], amount_usdt=D("2354"),
+            from_address="T", block_number=1)
+        async with repo.pool.acquire() as conn:
+            deposit = await conn.fetchval(
+                "UPDATE deposits SET trade_id = $1 WHERE tx_hash = 'live' "
+                "RETURNING id", t)
+
+        ok, msg = await repo.mark_settled_by_hand(
+            deposit_id=deposit, actor_party_id=world["bridge"])
+        assert not ok
+        assert "not" in msg and "cancelled" in msg
+
+    @pytest.mark.asyncio
+    async def test_marking_changes_no_figures(self, world, repo):
+        """It records a judgement. Nothing about the money moves."""
+        t = await self._trade(world, repo, "SUPA1", "cancelled", D("249995"),
+                              usdt=D("2354"))
+        await repo.record_deposit(
+            tx_hash="nofig", wallet_id=world["wallet"], amount_usdt=D("2354"),
+            from_address="T", block_number=1)
+        async with repo.pool.acquire() as conn:
+            deposit = await conn.fetchval(
+                "UPDATE deposits SET trade_id = $1 WHERE tx_hash = 'nofig' "
+                "RETURNING id", t)
+
+        await repo.mark_settled_by_hand(
+            deposit_id=deposit, actor_party_id=world["bridge"])
+
+        row = await repo.trade_detail(t)
+        assert row["usdt_received"] == D("2354")
+        assert row["inr_expected"] == D("249995")
+        assert row["status"] == "cancelled"
+        async with repo.pool.acquire() as conn:
+            assert await conn.fetchval(
+                "SELECT count(*) FROM deposits WHERE id = $1", deposit) == 1
+
+    @pytest.mark.asyncio
     async def test_a_cancelled_trade_with_no_deposit_is_not_stranded(
         self, world, repo
     ):
