@@ -62,6 +62,42 @@ class ChatRoleMiddleware(BaseMiddleware):
         self.bridge_user_id = bridge_user_id
         self.strict_bridge_user = strict_bridge_user
 
+    async def _report_new_chat(self, event, data, chat) -> None:
+        """
+        Tell the Bridge that this bot was just added somewhere unregistered.
+
+        Only on the event that says so — the bot appearing in new_chat_members.
+        Any other traffic from an unregistered chat stays silent, or an
+        unknown group could make the bot chatter at the Bridge by messaging it.
+
+        Wrapped whole: this is a convenience hanging off the security path, and
+        it must never be able to change what that path decides. If the
+        notification fails, the chat is still refused.
+        """
+        try:
+            members = getattr(event, "new_chat_members", None)
+            if not members:
+                return
+            bot = data.get("bot")
+            if bot is None or not any(u.id == bot.id for u in members):
+                return
+
+            notifier = data.get("notifier")
+            if notifier is None:
+                return
+
+            title = getattr(chat, "title", None) or "no title"
+            await notifier.to_bridge(
+                f"This bot was added to an unregistered group.\n\n"
+                f"  {title}\n"
+                f"  chat id  {chat.id}\n\n"
+                "It will ignore everything sent there until the group is "
+                "registered. Run /addvendor and give it that chat id."
+            )
+            log.info("announced unregistered chat %s (%r)", chat.id, title)
+        except Exception:
+            log.exception("could not announce unregistered chat %s", chat.id)
+
     async def __call__(
         self,
         handler: Callable[[TelegramObject, dict[str, Any]], Awaitable[Any]],
@@ -78,6 +114,19 @@ class ChatRoleMiddleware(BaseMiddleware):
             # An unregistered chat. Silence rather than an error message: a
             # reply would confirm to a stranger that this bot is live and hint
             # at what it does.
+            #
+            # One exception, and it is not a reply to the chat: if this bot has
+            # just been ADDED to the chat, the Bridge is told privately, with
+            # the chat id. He needs that id to register the group and there was
+            # no way to get it from inside the product — every vendor so far
+            # was onboarded by me running SQL with an id he found elsewhere.
+            #
+            # Client request, 18 September 2026: "I'm going to create some more
+            # FX groups now so they are ready for later use, add bots".
+            #
+            # Nothing about who may do what changes here. The chat is still
+            # rejected on the next line.
+            await self._report_new_chat(event, data, chat)
             log.warning("command in unregistered chat %s - ignored", chat.id)
             return None
 

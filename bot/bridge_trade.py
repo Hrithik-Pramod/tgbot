@@ -355,6 +355,25 @@ async def confirm_final(call: CallbackQuery, state: FSMContext, party, repo, not
     data = await state.get_data()
     trade = await repo.trade_detail(data["trade_id"])
 
+    # What the client was told last time, read before it is replaced.
+    #
+    # Client request, 18 September 2026:
+    #
+    #     Vendor payment account change: We need a way to handle situations
+    #     where the vendor changes the payment account after the payment
+    #     details have already been sent.
+    #
+    # Re-issuing already worked — the slots are replaced, only the unpaid
+    # balance is reallocated, and instructed_at holds. What was missing was
+    # anyone telling the client. The superseded instruction simply stayed in
+    # their chat, indistinguishable from the live one, and their side is
+    # automated: it reads payment instructions and acts on them. Sending a
+    # replacement without retracting the original is how a vendor's old
+    # account gets paid after they have moved off it.
+    superseded = []
+    if trade["instructed_at"] is not None:
+        superseded = await repo.trade_slots(data["trade_id"])
+
     slots = [(account_id, to_decimal(amount)) for account_id, amount in data["slots"]]
     await repo.issue_slots(
         trade_id=data["trade_id"], slots=slots, actor_party_id=party["id"]
@@ -379,6 +398,43 @@ async def confirm_final(call: CallbackQuery, state: FSMContext, party, repo, not
     # html=True so the account number is tap-to-copy — it gets typed into a
     # banking app, which is where a wrong digit costs most (client request,
     # 8 Sep 2026).
+    # The retraction goes FIRST, so the client reads "stop" before they read
+    # the replacement. The other order leaves a window where the newest thing
+    # on their screen is an instruction they are being told to ignore.
+    #
+    # It names the accounts rather than just saying "the previous ones",
+    # because the client may be holding several messages and only the account
+    # number tells them which. Those numbers were already sent to them, so
+    # this discloses nothing new — and it says nothing about the vendor.
+    if superseded:
+        dropped = [
+            s for s in superseded
+            if s["account_number"] not in {o.account_number for o in slot_objs}
+        ]
+        lines = [
+            f"CANCELLED — the payment details for {trade['reference']} have "
+            "changed.",
+            "",
+            "Do NOT pay against the previous instruction. New details follow "
+            "in the next message.",
+        ]
+        if dropped:
+            lines += ["", "No longer to be paid:"]
+            lines += [
+                f"  {s['account_name']}  {s['account_number']}"
+                for s in dropped
+            ]
+        lines += [
+            "",
+            "Anything you have already sent is still counted — the new "
+            "amounts are what remains.",
+        ]
+        await notifier.to_party(trade["client_id"], "\n".join(lines))
+        log.info(
+            "trade %s re-issued; %d superseded slot(s) retracted to the client",
+            trade["reference"], len(superseded),
+        )
+
     for slot in slot_objs:
         await notifier.to_party(
             trade["client_id"], render_payment_slot(slot, html=True), html=True
@@ -654,20 +710,73 @@ async def reprice_cancel(call: CallbackQuery, state: FSMContext) -> None:
 
 @router.message(Command("cancel"))
 async def cmd_cancel(message: Message, state: FSMContext, repo) -> None:
+    """
+    Cancel an open trade, or withdraw a supplier's unmatched claim.
+
+    Both live here because this is where the Bridge looked. 19 September
+    2026, after a test /send from Malegao - Sam with the hash "1234test":
+
+        i did a test, but i am unable to cancel it myself?
+
+    He was right — /cancel listed trades, and a claim is not a trade, so
+    there was no way to clear one. Rather than a second command he would have
+    to know about, the thing he reached for now covers both.
+
+    It is not cosmetic. An unmatched claim is what latest_nomination reads,
+    so that test would have pre-selected "Afrin fathima" on Malegao's next
+    real deposit.
+    """
     trades = await repo.list_open_trades()
-    if not trades:
-        await message.answer("There are no open trades to cancel.")
+    claims = await repo.outstanding_claims()
+
+    if not trades and not claims:
+        await message.answer("There are no open trades and no claims waiting.")
         return
 
-    await state.set_state(Cancel.pick)
-    kb = InlineKeyboardMarkup(inline_keyboard=[
+    rows = [
         [InlineKeyboardButton(
             text=f"{t['reference']} — {t['supplier_label']} → {t['client_label']}",
             callback_data=f"cx:{t['id']}",
         )]
         for t in trades
-    ])
-    await message.answer("Which trade do you want to cancel?", reply_markup=kb)
+    ]
+    rows += [
+        [InlineKeyboardButton(
+            text=f"Claim: {c['supplier_label']} — "
+                 f"{c['hash_url'] or 'no hash'}",
+            callback_data=f"cs:{c['id']}",
+        )]
+        for c in claims
+    ]
+
+    note = ""
+    if claims:
+        # Say what a claim is and why leaving it costs something, or the
+        # extra buttons are just clutter he scrolls past.
+        note = (
+            "\n\nA claim is a supplier saying they have sent, with nothing "
+            "arrived yet. Left in place, the account they named will be "
+            "offered as the nomination on their next deposit."
+        )
+    await message.answer(
+        f"What do you want to cancel?{note}",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=rows),
+    )
+
+
+@router.callback_query(F.data.startswith("cs:"))
+async def cancel_claim(call: CallbackQuery, state: FSMContext, party, repo) -> None:
+    """
+    No reason is asked for. A claim carries no money and no instruction — the
+    audit entry records what it was, which is proportionate. Making him
+    justify clearing his own test is how a flow gets abandoned halfway.
+    """
+    await state.clear()
+    ok, msg = await repo.drop_pending_send(
+        pending_id=int(call.data.split(":", 1)[1]), actor_party_id=party["id"]
+    )
+    await call.message.edit_text(msg)
+    await call.answer()
 
 
 @router.callback_query(Cancel.pick, F.data.startswith("cx:"))
@@ -703,7 +812,101 @@ async def cancel_reason(message: Message, state: FSMContext, party, repo) -> Non
         trade_id=data["trade_id"], actor_party_id=party["id"], reason=reason
     )
     await state.clear()
-    await message.answer(msg)
+
+    if not ok:
+        await message.answer(msg)
+        return
+
+    # A cancelled trade can leave its supplier's USDT with nothing to pay it.
+    #
+    # Client request, 18 September 2026: "a way to cancel or correct a
+    # transaction cleanly ... while keeping the related records linked".
+    #
+    # On 16 September this step existed only in my head. SUPB3 and SUPD1 were
+    # cancelled over a rate change and their 2,354 and 7,000 USDT sat on dead
+    # trades for two days — already paid onward to the client, billed to
+    # nobody, ₹992,924 absent from the ledger with nothing saying so. Offering
+    # it here is the difference between a mechanism and a thing somebody has
+    # to remember at the moment they are busy cancelling something.
+    stranded = await repo.stranded_deposits(data["trade_id"])
+    if not stranded:
+        await message.answer(msg)
+        return
+
+    lines = [
+        msg,
+        "",
+        "That leaves the supplier's USDT with no trade to pay it:",
+        "",
+    ]
+    lines += [
+        f"  {fmt_usdt_plain(d['amount_usdt'])} USDT   "
+        f"{d['detected_at']:%d %b %H:%M}"
+        for d in stranded
+    ]
+    lines += [
+        "",
+        "They have sent it either way. Unless you are settling this by hand, "
+        "open a fresh trade for it at the current rate so the client is "
+        "invoiced.",
+    ]
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(
+            text=f"Reopen {fmt_usdt_plain(d['amount_usdt'])} USDT as a new trade",
+            callback_data=f"rd:{d['id']}",
+        )]
+        for d in stranded
+    ] + [[InlineKeyboardButton(text="Leave it — settling by hand",
+                               callback_data="rd_no")]])
+    await message.answer("\n".join(lines), reply_markup=kb)
+
+
+@router.callback_query(F.data.startswith("rd:"))
+async def reopen_stranded_deposit(
+    call: CallbackQuery, party, repo
+) -> None:
+    deposit_id = int(call.data.split(":", 1)[1])
+    ok, msg, detail = await repo.reopen_deposit_as_trade(
+        deposit_id=deposit_id, actor_party_id=party["id"]
+    )
+    if not ok:
+        await call.message.answer(msg)
+        await call.answer()
+        return
+
+    lines = [
+        f"{detail['reference']} opened for "
+        f"{fmt_usdt_plain(detail['usdt'])} USDT.",
+        "",
+        f"Rate        {detail['supply_rate']} / {detail['sell_rate']}",
+        f"Client pays ₹{fmt_inr(detail['inr_expected'])}",
+        f"Owed out    {fmt_usdt_plain(detail['usdt_owed'])} USDT",
+    ]
+    # Saying so out loud. The figure moving on a cancelled trade looks like a
+    # second problem if it arrives unexplained, and it is the fix for the one
+    # that made every export since 15 September overstate the period.
+    if detail["restated"]:
+        r = detail["restated"]
+        lines += [
+            "",
+            f"{r['reference']} restated to the deposits it still holds: "
+            f"{fmt_usdt_plain(r['from_usdt'])} → {fmt_usdt_plain(r['to_usdt'])} "
+            f"USDT, ₹{fmt_inr(r['from_inr'])} → ₹{fmt_inr(r['to_inr'])}.",
+        ]
+    lines += ["", "Send it to the client with /issue."]
+
+    await call.message.answer("\n".join(lines))
+    await call.answer()
+
+
+@router.callback_query(F.data == "rd_no")
+async def leave_stranded_deposit(call: CallbackQuery) -> None:
+    await call.message.edit_reply_markup(reply_markup=None)
+    await call.message.answer(
+        "Left as it is. The deposit stays on the cancelled trade and the "
+        "client is not invoiced for it."
+    )
+    await call.answer()
 
 
 # ======================================================================

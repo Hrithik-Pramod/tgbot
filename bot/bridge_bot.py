@@ -49,6 +49,15 @@ class WalletLink(StatesGroup):
     payout = State()
 
 
+class AddVendor(StatesGroup):
+    label = State()
+    prefix = State()
+    client = State()
+    chat = State()
+    address = State()
+    confirm = State()
+
+
 class BridgeSend(StatesGroup):
     supplier = State()
     client = State()
@@ -526,6 +535,209 @@ async def walletchange_confirm(call: CallbackQuery, state: FSMContext, party, re
 async def walletchange_cancel(call: CallbackQuery, state: FSMContext) -> None:
     await state.clear()
     await call.message.edit_text("Cancelled. No wallet was changed.")
+    await call.answer()
+
+
+# -------------------------------------------------------------- /addvendor
+#
+# Client request, 18 September 2026: "I'm going to create some more FX groups
+# now so they are ready for later use add bots".
+#
+# He can make the groups and add the bots himself. Registering them was the
+# part that still needed me at a terminal running deploy/seed-supplier.sql,
+# which is a poor answer to wanting several ready in advance.
+#
+# The chat id used to be the hard part — there was no way to read it from
+# inside the product. Adding the supplier bot to the new group now posts it
+# to the Bridge channel (see bot/auth.py), so the two steps join up.
+
+@router.message(Command("addvendor"))
+async def cmd_addvendor(message: Message, state: FSMContext, repo) -> None:
+    clients = await repo.list_parties("client")
+    if not clients:
+        await message.answer(
+            "There are no clients registered, so there is nothing to pair a "
+            "vendor with yet."
+        )
+        return
+
+    await state.set_state(AddVendor.label)
+    await message.answer(
+        "Registering a new vendor.\n\n"
+        "What is it called? This is the name that appears on your own "
+        "notifications — the client never sees it.\n\n"
+        "It will follow the group's own title from then on, so an exact "
+        "match now is not important."
+    )
+
+
+@router.message(AddVendor.label)
+async def addvendor_label(message: Message, state: FSMContext) -> None:
+    from db.repo import derive_prefix
+
+    label = (message.text or "").strip()
+    if len(label) < 2:
+        await message.answer("Give it a name of at least two characters.")
+        return
+
+    try:
+        suggested = derive_prefix(label)
+    except ValueError:
+        await message.answer(
+            "I cannot make a deal prefix out of that name. Use one with some "
+            "letters or numbers in it."
+        )
+        return
+
+    await state.update_data(label=label, prefix=suggested)
+    await state.set_state(AddVendor.prefix)
+    kb = InlineKeyboardMarkup(inline_keyboard=[[
+        InlineKeyboardButton(text=f"Use {suggested}", callback_data="av_prefix")
+    ]])
+    await message.answer(
+        f"Deal numbers for {label} will read {suggested}1, {suggested}2, and "
+        "so on.\n\nUse that, or type a different prefix.",
+        reply_markup=kb,
+    )
+
+
+async def _addvendor_ask_client(target, state: FSMContext, repo) -> None:
+    clients = await repo.list_parties("client")
+    await state.set_state(AddVendor.client)
+    await target.answer(
+        "Which client does this vendor settle with?",
+        reply_markup=_party_keyboard(clients, "av_cli"),
+    )
+
+
+@router.callback_query(AddVendor.prefix, F.data == "av_prefix")
+async def addvendor_prefix_keep(call: CallbackQuery, state: FSMContext, repo) -> None:
+    await _addvendor_ask_client(call.message, state, repo)
+    await call.answer()
+
+
+@router.message(AddVendor.prefix)
+async def addvendor_prefix_typed(message: Message, state: FSMContext, repo) -> None:
+    prefix = (message.text or "").strip().upper()
+    if not prefix.isalnum() or not 2 <= len(prefix) <= 6:
+        await message.answer(
+            "A prefix is 2 to 6 letters or digits, nothing else. "
+            "It is the front of every deal number this vendor ever gets."
+        )
+        return
+    await state.update_data(prefix=prefix)
+    await _addvendor_ask_client(message, state, repo)
+
+
+@router.callback_query(AddVendor.client, F.data.startswith("av_cli:"))
+async def addvendor_client(call: CallbackQuery, state: FSMContext) -> None:
+    await state.update_data(client_id=int(call.data.split(":", 1)[1]))
+    await state.set_state(AddVendor.chat)
+    await call.message.edit_text(
+        "What is the vendor group's chat id?\n\n"
+        "Add the supplier bot to the group and I will post the id here. "
+        "It starts with a minus sign."
+    )
+    await call.answer()
+
+
+@router.message(AddVendor.chat)
+async def addvendor_chat(message: Message, state: FSMContext) -> None:
+    raw = (message.text or "").strip()
+    try:
+        chat_id = int(raw)
+    except ValueError:
+        await message.answer(
+            "That is not a chat id. It is a number, usually beginning with "
+            "-100. Add the supplier bot to the group and I will post it here."
+        )
+        return
+
+    # A group id is negative. A positive one is a private chat with a person,
+    # and registering that as a vendor would hand one individual the whole
+    # supplier role rather than a group the Bridge controls the membership of.
+    if chat_id >= 0:
+        await message.answer(
+            "That is a personal chat, not a group. Access is granted by group "
+            "membership, so a vendor has to be a group you administer."
+        )
+        return
+
+    await state.update_data(chat_id=chat_id)
+    await state.set_state(AddVendor.address)
+    await message.answer(
+        "Which internal wallet address receives this vendor's USDT?\n\n"
+        "It must be one nobody else uses — a deposit is attributed by the "
+        "wallet it lands in, so a shared address makes two vendors "
+        "indistinguishable."
+    )
+
+
+@router.message(AddVendor.address)
+async def addvendor_address(message: Message, state: FSMContext, repo) -> None:
+    address = (message.text or "").strip()
+    if not _is_tron_address(address):
+        await message.answer(
+            "That does not look like a TRON address. TRC20 addresses start "
+            "with T and are 34 characters long."
+        )
+        return
+
+    data = await state.update_data(address=address)
+    client = await repo.party_label(data["client_id"])
+
+    await state.set_state(AddVendor.confirm)
+    kb = InlineKeyboardMarkup(inline_keyboard=[[
+        InlineKeyboardButton(text="Register", callback_data="av_yes"),
+        InlineKeyboardButton(text="Cancel", callback_data="av_no"),
+    ]])
+    await message.answer(
+        f"Vendor      {data['label']}\n"
+        f"Deals       {data['prefix']}1, {data['prefix']}2, ...\n"
+        f"Settles     {client}\n"
+        f"Group       {data['chat_id']}\n"
+        f"Wallet      {address}\n\n"
+        "Register this?",
+        reply_markup=kb,
+    )
+
+
+@router.callback_query(AddVendor.confirm, F.data == "av_yes")
+async def addvendor_confirm(
+    call: CallbackQuery, state: FSMContext, party, repo
+) -> None:
+    data = await state.get_data()
+    await state.clear()
+
+    ok, msg, detail = await repo.onboard_supplier(
+        label=data["label"], telegram_chat_id=data["chat_id"],
+        prefix=data["prefix"], client_id=data["client_id"],
+        wallet_address=data["address"], actor_party_id=party["id"],
+    )
+    if not ok:
+        await call.message.edit_text(f"{msg}\n\nNothing was created.")
+        await call.answer()
+        return
+
+    # Two things are deliberately missing, and saying so here is the point:
+    # a vendor that looks finished but cannot trade is worse than one that
+    # plainly is not finished yet.
+    await call.message.edit_text(
+        f"{detail['label']} is registered and its wallet is being watched.\n\n"
+        "Two things left before it can trade:\n\n"
+        f"  /setrate — no rate exists for {detail['label']} → "
+        f"{detail['client_label']} yet, so a deposit would open no trade\n"
+        "  /walletlink — say which address this pairing pays the client on\n\n"
+        "Anything already on that wallet counts as history. Only transfers "
+        "from now on are deposits."
+    )
+    await call.answer()
+
+
+@router.callback_query(F.data == "av_no")
+async def addvendor_cancel(call: CallbackQuery, state: FSMContext) -> None:
+    await state.clear()
+    await call.message.edit_text("Cancelled. No vendor was registered.")
     await call.answer()
 
 

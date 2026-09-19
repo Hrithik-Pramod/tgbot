@@ -834,6 +834,257 @@ class TestPriorPayoutGuard:
         assert await repo.prior_payouts_for_trade(paired["trade"]) == []
 
 
+class TestOnboardingAVendor:
+    """
+    seed-supplier.sql, as a command, against a real schema. Every guard here
+    exists because the failure it prevents only shows up later — at the first
+    deposit, or in a reference nobody can attribute.
+    """
+
+    async def _onboard(self, world, repo, **over):
+        args = dict(
+            label="Supplier C", telegram_chat_id=-1009, prefix="SUPC",
+            client_id=world["client"], wallet_address="TC1jkLmNoPqRsTuVwXyZaBcDeFgHiJkLmN",
+            actor_party_id=world["bridge"],
+        )
+        args.update(over)
+        return await repo.onboard_supplier(**args)
+
+    @pytest.mark.asyncio
+    async def test_it_creates_all_three_records(self, world, repo):
+        ok, msg, detail = await self._onboard(world, repo)
+        assert ok, msg
+
+        async with repo.pool.acquire() as conn:
+            party = await conn.fetchrow(
+                "SELECT role, telegram_chat_id FROM parties WHERE id = $1",
+                detail["party_id"])
+            prefix = await conn.fetchval(
+                "SELECT prefix FROM supplier_counters WHERE supplier_id = $1",
+                detail["party_id"])
+            wallet = await conn.fetchrow(
+                "SELECT is_internal, supplier_id, client_id, is_monitored "
+                "FROM wallets WHERE id = $1", detail["wallet_id"])
+
+        assert party["role"] == "supplier"
+        assert party["telegram_chat_id"] == -1009
+        assert prefix == "SUPC"
+        assert wallet["is_internal"] and wallet["is_monitored"]
+        assert wallet["supplier_id"] == detail["party_id"]
+        assert wallet["client_id"] == world["client"]
+
+    @pytest.mark.asyncio
+    async def test_the_first_deposit_can_get_a_reference(self, world, repo):
+        """
+        The failure a missing counter causes, reproduced. Without the counter
+        row next_reference raises and the vendor's first deposit fails.
+        """
+        ok, _, detail = await self._onboard(world, repo)
+        assert ok
+        async with repo.pool.acquire() as conn:
+            async with conn.transaction():
+                ref = await repo.next_reference(conn, detail["party_id"])
+        assert ref == "SUPC1"
+
+    @pytest.mark.asyncio
+    async def test_no_rate_and_no_adoption(self, world, repo):
+        ok, _, detail = await self._onboard(world, repo)
+        assert ok
+        async with repo.pool.acquire() as conn:
+            assert await conn.fetchval(
+                "SELECT count(*) FROM rates WHERE supplier_id = $1",
+                detail["party_id"]) == 0
+            assert await conn.fetchval(
+                "SELECT count(*) FROM monitor_state WHERE wallet_id = $1",
+                detail["wallet_id"]) == 0
+
+    @pytest.mark.asyncio
+    async def test_a_duplicate_prefix_is_refused(self, world, repo):
+        """Nothing in the schema stops this, and SUPA1 twice is unresolvable."""
+        ok, msg, _ = await self._onboard(world, repo, prefix="supa")
+        assert not ok
+        assert "prefix" in msg
+
+    @pytest.mark.asyncio
+    async def test_a_taken_chat_is_refused(self, world, repo):
+        ok, msg, _ = await self._onboard(world, repo, telegram_chat_id=-1002)
+        assert not ok
+        assert "already registered" in msg
+
+    @pytest.mark.asyncio
+    async def test_a_taken_label_is_refused(self, world, repo):
+        ok, msg, _ = await self._onboard(world, repo, label="supplier a")
+        assert not ok
+
+    @pytest.mark.asyncio
+    async def test_a_taken_address_is_refused(self, world, repo):
+        ok, msg, _ = await self._onboard(
+            world, repo, wallet_address="TFLEpkCtXFSCYCvzqgtUENDaSUKcFUX2zb")
+        assert not ok
+        assert "already registered" in msg
+
+    @pytest.mark.asyncio
+    async def test_a_refusal_leaves_nothing_behind(self, world, repo):
+        """Half a vendor is worse than none — it looks finished."""
+        async with repo.pool.acquire() as conn:
+            before = await conn.fetchval("SELECT count(*) FROM parties")
+        await self._onboard(world, repo, telegram_chat_id=-1002)
+        async with repo.pool.acquire() as conn:
+            assert await conn.fetchval("SELECT count(*) FROM parties") == before
+
+    @pytest.mark.asyncio
+    async def test_a_supplier_id_is_not_accepted_as_the_client(self, world, repo):
+        ok, msg, _ = await self._onboard(world, repo, client_id=world["supplier"])
+        assert not ok
+
+
+class TestReopeningAStrandedDeposit:
+    """
+    The 16 September repair, as a button. SUPB3 and SUPD1 were cancelled and
+    their 2,354 and 7,000 USDT sat on dead trades for two days — delivered to
+    the client, billed to nobody.
+    """
+
+    @pytest_asyncio.fixture
+    async def cancelled(self, world, repo):
+        """A cancelled trade holding two deposits, 2,354 and 3,000."""
+        async with repo.pool.acquire() as conn:
+            trade = await conn.fetchval(
+                """
+                INSERT INTO trades (reference, supplier_id, client_id, wallet_id,
+                    rate_id, supply_rate, sell_rate, usdt_received, inr_expected,
+                    usdt_owed_client, margin_usdt, status)
+                VALUES ('SUPA1',$1,$2,$3,$4,105.50,106.50,5354,564847,5303.73,
+                        50.27,'cancelled')
+                RETURNING id
+                """, world["supplier"], world["client"], world["wallet"],
+                world["rate"])
+            # SUPA1 is taken by the trade above, so the counter must agree —
+            # a reopened deposit continues the sequence rather than reusing a
+            # number that already means something.
+            await conn.execute(
+                "UPDATE supplier_counters SET last_number = 1 "
+                "WHERE supplier_id = $1", world["supplier"])
+        ids = []
+        for tx, amt in (("first", D("2354")), ("second", D("3000"))):
+            await repo.record_deposit(
+                tx_hash=tx, wallet_id=world["wallet"], amount_usdt=amt,
+                from_address="TSup", block_number=1)
+            async with repo.pool.acquire() as conn:
+                ids.append(await conn.fetchval(
+                    "UPDATE deposits SET trade_id = $1 WHERE tx_hash = $2 "
+                    "RETURNING id", trade, tx))
+        return {"trade": trade, "deposits": ids}
+
+    @pytest.mark.asyncio
+    async def test_it_finds_what_is_stranded(self, repo, cancelled):
+        found = await repo.stranded_deposits(cancelled["trade"])
+        assert [f["amount_usdt"] for f in found] == [D("2354"), D("3000")]
+
+    @pytest.mark.asyncio
+    async def test_the_deposit_gets_its_own_trade_at_todays_rate(
+        self, world, repo, cancelled
+    ):
+        await repo.set_rate(
+            supplier_id=world["supplier"], client_id=world["client"],
+            supply_rate=D("106.20"), sell_rate=D("107.70"), set_by=world["bridge"])
+
+        ok, msg, detail = await repo.reopen_deposit_as_trade(
+            deposit_id=cancelled["deposits"][0], actor_party_id=world["bridge"])
+        assert ok, msg
+
+        assert detail["reference"] == "SUPA2"
+        assert detail["inr_expected"] == D("249995")   # 2,354 x 106.20
+        assert detail["usdt_owed"] == D("2321.22")
+
+        row = await repo.trade_detail(detail["trade_id"])
+        assert row["status"] == "awaiting_payment"
+        assert row["announced_at"] is not None
+        assert row["instructed_at"] is None, "opening is not instructing"
+
+    @pytest.mark.asyncio
+    async def test_the_source_trade_is_restated(self, world, repo, cancelled):
+        """
+        The half that was missed for three days. 5,354 minus the 2,354 that
+        moved leaves 3,000, at the cancelled trade's OWN rates.
+        """
+        ok, _, detail = await repo.reopen_deposit_as_trade(
+            deposit_id=cancelled["deposits"][0], actor_party_id=world["bridge"])
+        assert ok
+
+        src = await repo.trade_detail(cancelled["trade"])
+        assert src["usdt_received"] == D("3000")
+        assert src["inr_expected"] == D("316500")       # 3,000 x 105.50
+        assert src["supply_rate"] == D("105.50"), "a restatement is not a reprice"
+        assert detail["restated"]["from_usdt"] == D("5354")
+
+    @pytest.mark.asyncio
+    async def test_moving_the_last_deposit_empties_the_source(
+        self, world, repo, cancelled
+    ):
+        for deposit in cancelled["deposits"]:
+            ok, msg, _ = await repo.reopen_deposit_as_trade(
+                deposit_id=deposit, actor_party_id=world["bridge"])
+            assert ok, msg
+
+        src = await repo.trade_detail(cancelled["trade"])
+        assert src["usdt_received"] == 0
+        assert src["inr_expected"] == 0
+        assert src["usdt_owed_client"] == 0
+
+    @pytest.mark.asyncio
+    async def test_nothing_is_left_disagreeing_with_its_deposits(
+        self, world, repo, cancelled
+    ):
+        """The condition the healthcheck warns on must be clear afterwards."""
+        await repo.reopen_deposit_as_trade(
+            deposit_id=cancelled["deposits"][0], actor_party_id=world["bridge"])
+        async with repo.pool.acquire() as conn:
+            drift = await conn.fetchval(
+                """
+                SELECT count(*) FROM (
+                    SELECT t.id FROM trades t
+                    LEFT JOIN deposits d ON d.trade_id = t.id
+                    GROUP BY t.id, t.usdt_received
+                    HAVING COALESCE(sum(d.amount_usdt), 0) <> t.usdt_received
+                       AND t.usdt_received > 0
+                ) x
+                """)
+        assert drift == 0
+
+    @pytest.mark.asyncio
+    async def test_a_live_trades_deposit_is_refused(self, world, repo, cancelled):
+        async with repo.pool.acquire() as conn:
+            await conn.execute(
+                "UPDATE trades SET status = 'awaiting_payment' WHERE id = $1",
+                cancelled["trade"])
+        ok, msg, _ = await repo.reopen_deposit_as_trade(
+            deposit_id=cancelled["deposits"][0], actor_party_id=world["bridge"])
+        assert not ok
+        assert "already has one" in msg
+
+    @pytest.mark.asyncio
+    async def test_no_rate_means_no_trade_and_no_change(
+        self, world, repo, cancelled
+    ):
+        async with repo.pool.acquire() as conn:
+            await conn.execute(
+                "UPDATE trades SET rate_id = NULL WHERE FALSE")  # keep the FK happy
+            await conn.execute(
+                "DELETE FROM rates WHERE id <> $1", world["rate"])
+            await conn.execute(
+                "UPDATE rates SET supplier_id = $1 WHERE id = $2",
+                world["bridge"], world["rate"])
+
+        ok, msg, _ = await repo.reopen_deposit_as_trade(
+            deposit_id=cancelled["deposits"][0], actor_party_id=world["bridge"])
+        assert not ok
+        assert "no rate" in msg
+
+        src = await repo.trade_detail(cancelled["trade"])
+        assert src["usdt_received"] == D("5354"), "a refusal changes nothing"
+
+
 class TestAccountsAndExport:
     @pytest.mark.asyncio
     async def test_removed_account_is_soft_deleted(self, world, repo):

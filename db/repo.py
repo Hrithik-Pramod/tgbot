@@ -141,6 +141,142 @@ class Repo:
                 )
                 return party_id
 
+    async def onboard_supplier(
+        self, *, label: str, telegram_chat_id: int, prefix: str,
+        client_id: int, wallet_address: str, actor_party_id: int,
+    ) -> tuple[bool, str, Optional[dict]]:
+        """
+        Register a vendor: party, deal counter and internal wallet, at once.
+
+        Client request, 18 September 2026:
+
+            Additional FX groups: To save time, I'm going to create some more
+            FX groups now so they are ready for later use add bots
+
+        Until now this was deploy/seed-supplier.sql, run by me. Every vendor
+        added since go-live has needed a developer at a terminal, which is a
+        poor answer to "so they are ready for later".
+
+        WHY ALL THREE TOGETHER
+
+        A party with no counter looks fine until its first deposit, when
+        next_reference raises and the deposit fails — the worst possible
+        moment for a setup mistake to surface. A party with no internal wallet
+        can never receive anything. Half an onboarding is not a vendor, so
+        this is one transaction and either all of it exists or none does.
+
+        WHAT IT REFUSES
+
+          unknown client       the pairing would point at nothing
+          chat already used    that group is already somebody
+          label already used   references and every message would be ambiguous
+          prefix already used  SUPB1 from two vendors is unresolvable, and
+                               nothing in the schema stops it
+          address registered   a deposit is attributed by which wallet
+                               received it, so a shared address makes two
+                               vendors indistinguishable
+
+        The wallet is NOT adopted. The monitor adopts it on its first poll and
+        records the baseline then, so whatever is already on the address is
+        history. Seeding that by hand is how 38 old transfers were once
+        ingested as live deposits.
+
+        No rate is set either. /setrate shows the rate in force, warns when
+        the sell rate is not above the supply rate, and records who set it;
+        setting one here would bypass all three. Until a rate exists a deposit
+        opens no trade and the Bridge is told why, so the gap is visible.
+        """
+        label = label.strip()
+        prefix = prefix.strip().upper()
+
+        async with self.pool.acquire() as conn:
+            async with conn.transaction():
+                client = await conn.fetchrow(
+                    "SELECT id, label FROM parties "
+                    "WHERE id = $1 AND role = 'client' AND is_active",
+                    client_id,
+                )
+                if client is None:
+                    return False, "That client no longer exists.", None
+
+                clash = await conn.fetchrow(
+                    "SELECT label, role FROM parties WHERE telegram_chat_id = $1",
+                    telegram_chat_id,
+                )
+                if clash is not None:
+                    return False, (
+                        f"That chat is already registered as "
+                        f"{clash['label']} ({clash['role']})."
+                    ), None
+
+                if await conn.fetchval(
+                    "SELECT 1 FROM parties WHERE lower(label) = lower($1)", label
+                ):
+                    return False, f"There is already a party called {label}.", None
+
+                taken = await conn.fetchval(
+                    """
+                    SELECT p.label FROM supplier_counters sc
+                    JOIN parties p ON p.id = sc.supplier_id
+                    WHERE upper(sc.prefix) = $1
+                    """,
+                    prefix,
+                )
+                if taken is not None:
+                    return False, (
+                        f"{taken} already uses the prefix {prefix}. Two "
+                        "vendors sharing one makes their deal numbers "
+                        "impossible to tell apart."
+                    ), None
+
+                if await conn.fetchval(
+                    "SELECT 1 FROM wallets WHERE address = $1", wallet_address
+                ):
+                    return False, "That wallet address is already registered.", None
+
+                party_id = await conn.fetchval(
+                    """
+                    INSERT INTO parties (role, label, display_name,
+                                         telegram_chat_id, telegram_user_id)
+                    VALUES ('supplier', $1, $1, $2, NULL)
+                    RETURNING id
+                    """,
+                    label, telegram_chat_id,
+                )
+                await conn.execute(
+                    "INSERT INTO supplier_counters (supplier_id, prefix) "
+                    "VALUES ($1, $2)",
+                    party_id, prefix,
+                )
+                wallet_id = await conn.fetchval(
+                    """
+                    INSERT INTO wallets (address, is_internal, supplier_id,
+                                         client_id, label, is_monitored)
+                    VALUES ($1, TRUE, $2, $3, $4, TRUE)
+                    RETURNING id
+                    """,
+                    wallet_address, party_id, client_id,
+                    f"{label} → {client['label']}",
+                )
+                await self.audit(
+                    conn, actor_party_id=actor_party_id,
+                    action="supplier.onboarded",
+                    entity_type="party", entity_id=party_id,
+                    detail={
+                        "label": label, "prefix": prefix,
+                        "client": client["label"],
+                        "chat_id": telegram_chat_id,
+                        "wallet_id": wallet_id,
+                    },
+                )
+                return True, f"{label} registered.", {
+                    "party_id":     party_id,
+                    "wallet_id":    wallet_id,
+                    "label":        label,
+                    "prefix":       prefix,
+                    "client_label": client["label"],
+                }
+
     # ----------------------------------------------------------- bank accounts
 
     async def list_bank_accounts(self, party_id: int) -> list[asyncpg.Record]:
@@ -1636,6 +1772,103 @@ class Repo:
                 older_than_minutes,
             )
 
+    async def outstanding_claims(self) -> list[asyncpg.Record]:
+        """
+        Every "I have sent" with no deposit behind it yet.
+
+        Unlike stale_pending_sends this ignores age and whether it has been
+        reported — it is the Bridge asking what is outstanding, not the
+        monitor deciding what to raise.
+        """
+        async with self.pool.acquire() as conn:
+            return await conn.fetch(
+                """
+                SELECT ps.id, ps.hash_url, ps.created_at,
+                       p.label AS supplier_label,
+                       b.account_name
+                FROM pending_sends ps
+                JOIN parties p ON p.id = ps.supplier_id
+                LEFT JOIN bank_accounts b ON b.id = ps.bank_account_id
+                WHERE ps.matched_trade_id IS NULL
+                ORDER BY ps.created_at
+                """
+            )
+
+    async def drop_pending_send(
+        self, *, pending_id: int, actor_party_id: int,
+    ) -> tuple[bool, str]:
+        """
+        Withdraw a claim that is never going to be matched.
+
+        WHY THIS EXISTS (live, 19 September 2026)
+
+        The Bridge ran a test /send from Malegao - Sam with the hash
+        "1234test", the monitor correctly reported that nothing had arrived,
+        and then:
+
+            i did a test, but i am unable to cancel it myself?
+
+        He was right. /cancel only ever listed trades, and a claim is not a
+        trade. There was no way to withdraw one at all.
+
+        WHY IT MATTERS MORE THAN THE NAGGING
+
+        An unmatched claim is what latest_nomination reads. So the test
+        nomination — "Afrin fathima" — would have been pre-selected on
+        Malegao's NEXT REAL deposit, with the Bridge shown "Supplier
+        nominated: Afrin fathima" for a trade nobody had said that about.
+
+        That is the 11 September fault exactly, arriving through a test
+        instead of through the audit log: a default that reads as a decision
+        is one tap away from sending a client to pay the wrong account.
+
+        The row is deleted rather than flagged, because latest_nomination and
+        stale_pending_sends both key on matched_trade_id IS NULL and a
+        withdrawn claim must disappear from both. What it was survives in the
+        audit log, which is the permanent record.
+        """
+        async with self.pool.acquire() as conn:
+            async with conn.transaction():
+                row = await conn.fetchrow(
+                    """
+                    SELECT ps.*, p.label AS supplier_label, b.account_name
+                    FROM pending_sends ps
+                    JOIN parties p ON p.id = ps.supplier_id
+                    LEFT JOIN bank_accounts b ON b.id = ps.bank_account_id
+                    WHERE ps.id = $1
+                    FOR UPDATE OF ps
+                    """,
+                    pending_id,
+                )
+                if row is None:
+                    return False, "That claim no longer exists."
+                if row["matched_trade_id"] is not None:
+                    return False, (
+                        "That claim has already been matched to a deposit. "
+                        "Nothing to withdraw."
+                    )
+
+                await conn.execute(
+                    "DELETE FROM pending_sends WHERE id = $1", pending_id
+                )
+                await self.audit(
+                    conn, actor_party_id=actor_party_id,
+                    action="send.withdrawn", entity_type="party",
+                    entity_id=row["supplier_id"],
+                    detail={
+                        "supplier": row["supplier_label"],
+                        "account": row["account_name"],
+                        "hash": row["hash_url"],
+                        "claimed_at": row["created_at"].isoformat(),
+                    },
+                )
+                return True, (
+                    f"Withdrawn {row['supplier_label']}'s claim"
+                    + (f" ({row['hash_url']})" if row["hash_url"] else "")
+                    + ".\n\nIt will no longer be offered as a nomination on "
+                      "their next deposit."
+                )
+
     async def mark_pending_alerted(self, pending_id: int) -> bool:
         """Claim the right to report this one, exactly once."""
         async with self.pool.acquire() as conn:
@@ -1738,6 +1971,194 @@ class Repo:
                     detail={"reason": reason, "previous_status": trade["status"]},
                 )
                 return True, f"{trade['reference']} cancelled."
+
+    async def stranded_deposits(self, trade_id: int) -> list[asyncpg.Record]:
+        """Deposits still sitting on a cancelled trade, with nothing to pay them."""
+        async with self.pool.acquire() as conn:
+            return await conn.fetch(
+                """
+                SELECT d.id, d.amount_usdt, d.tx_hash, d.detected_at
+                FROM deposits d
+                JOIN trades t ON t.id = d.trade_id
+                WHERE d.trade_id = $1 AND t.status = 'cancelled'
+                ORDER BY d.detected_at
+                """,
+                trade_id,
+            )
+
+    async def reopen_deposit_as_trade(
+        self, *, deposit_id: int, actor_party_id: int,
+    ) -> tuple[bool, str, Optional[dict]]:
+        """
+        Give a deposit its own trade at the rate in force, and correct the
+        one it came from.
+
+        Client request, 18 September 2026:
+
+            Cancellation control: There needs to be a way to cancel or correct
+            a transaction cleanly if something changes mid-process, while
+            keeping the related records linked correctly.
+
+        Cancelling was always clean. What happened afterwards was not. On
+        16 September SUPB3 and SUPD1 were cancelled over a rate change, and
+        their suppliers' 2,354 and 7,000 USDT stayed attached to dead trades:
+        9,354 USDT that had arrived, been paid onward to the client, and was
+        billed to nobody. ₹992,924 went missing from the ledger and nothing
+        said a word. The repair took two hand-written SQL scripts two days
+        later, which is the definition of not keeping the records linked.
+
+        TWO HALVES, ONE TRANSACTION
+
+        Moving the deposit is only half of it. The trade it came from keeps
+        claiming USDT it no longer holds — SUPA5 read 66,038 for days after
+        its 37,736 went to SUPA6, so ₹4,000,016 was counted on both and every
+        export overstated the period by that much. So the source trade is
+        restated to whatever deposits it still has, at its own rates, in the
+        same transaction. Half a repair is how the last one got missed.
+
+        WHAT IT REFUSES
+
+          a deposit on a live trade     it already has one, and moving it
+                                        would strip a trade the client may
+                                        be holding an instruction for
+          a counterparty wallet         only internal wallets open trades
+          a pairing with no rate        nothing to price it at
+
+        The new trade is stamped announced_at because the Bridge is doing
+        this himself and already knows. Leaving it null would have the
+        monitor post a notice saying the supplier had not entered details,
+        which is not what happened.
+        """
+        from core.money import inr_to_usdt, round_usdt, usdt_to_inr
+
+        async with self.pool.acquire() as conn:
+            async with conn.transaction():
+                d = await conn.fetchrow(
+                    "SELECT * FROM deposits WHERE id = $1 FOR UPDATE", deposit_id
+                )
+                if d is None:
+                    return False, "That deposit no longer exists.", None
+
+                source_id = d["trade_id"]
+                if source_id is not None:
+                    status = await conn.fetchval(
+                        "SELECT status FROM trades WHERE id = $1", source_id
+                    )
+                    if status != "cancelled":
+                        return False, (
+                            f"That deposit is on a trade that is {status}. "
+                            "It already has one."
+                        ), None
+
+                w = await conn.fetchrow(
+                    "SELECT * FROM wallets WHERE id = $1", d["wallet_id"]
+                )
+                if w is None or not w["is_internal"]:
+                    return False, (
+                        "That deposit landed on a counterparty wallet, not an "
+                        "internal one. Only internal wallets open trades."
+                    ), None
+
+                r = await conn.fetchrow(
+                    """
+                    SELECT id, supply_rate, sell_rate FROM rates
+                    WHERE supplier_id = $1 AND client_id = $2
+                    ORDER BY created_at DESC LIMIT 1
+                    """,
+                    w["supplier_id"], w["client_id"],
+                )
+                if r is None:
+                    return False, (
+                        "There is no rate for that pairing. Set one with "
+                        "/setrate first."
+                    ), None
+
+                ref = await self.next_reference(conn, w["supplier_id"])
+
+                usdt = d["amount_usdt"]
+                new_inr = usdt_to_inr(usdt, r["supply_rate"])
+                new_owed = inr_to_usdt(new_inr, r["sell_rate"])
+                new_margin = round_usdt(Decimal(usdt) - new_owed)
+
+                new_id = await conn.fetchval(
+                    """
+                    INSERT INTO trades (
+                        reference, supplier_id, client_id, wallet_id, rate_id,
+                        supply_rate, sell_rate, usdt_received, inr_expected,
+                        usdt_owed_client, margin_usdt, status, opened_at,
+                        announced_at)
+                    VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,
+                            'awaiting_payment',$12, now())
+                    RETURNING id
+                    """,
+                    ref, w["supplier_id"], w["client_id"], w["id"], r["id"],
+                    r["supply_rate"], r["sell_rate"], usdt, new_inr,
+                    new_owed, new_margin, d["detected_at"],
+                )
+                await conn.execute(
+                    "UPDATE deposits SET trade_id = $2 WHERE id = $1",
+                    deposit_id, new_id,
+                )
+
+                # The other half. Whatever the source trade still holds is
+                # what it should say it holds.
+                restated = None
+                if source_id is not None:
+                    src = await conn.fetchrow(
+                        "SELECT * FROM trades WHERE id = $1 FOR UPDATE", source_id
+                    )
+                    remaining = await conn.fetchval(
+                        "SELECT COALESCE(sum(amount_usdt), 0) FROM deposits "
+                        "WHERE trade_id = $1",
+                        source_id,
+                    ) or Decimal(0)
+                    if remaining != src["usdt_received"]:
+                        if remaining > 0:
+                            src_inr = usdt_to_inr(remaining, src["supply_rate"])
+                            src_owed = inr_to_usdt(src_inr, src["sell_rate"])
+                            src_margin = round_usdt(Decimal(remaining) - src_owed)
+                        else:
+                            src_inr = src_owed = src_margin = Decimal(0)
+                        await conn.execute(
+                            """
+                            UPDATE trades
+                            SET usdt_received = $2, inr_expected = $3,
+                                usdt_owed_client = $4, margin_usdt = $5
+                            WHERE id = $1
+                            """,
+                            source_id, remaining, src_inr, src_owed, src_margin,
+                        )
+                        restated = {
+                            "reference": src["reference"],
+                            "from_usdt": src["usdt_received"],
+                            "to_usdt":   remaining,
+                            "from_inr":  src["inr_expected"],
+                            "to_inr":    src_inr,
+                        }
+                        await self.audit(
+                            conn, actor_party_id=actor_party_id,
+                            action="trade.restated", entity_type="trade",
+                            entity_id=source_id, detail=restated,
+                        )
+
+                await self.audit(
+                    conn, actor_party_id=actor_party_id,
+                    action="trade.reopened_from_deposit",
+                    entity_type="trade", entity_id=new_id,
+                    detail={
+                        "reference": ref, "usdt": usdt,
+                        "rates": f"{r['supply_rate']} / {r['sell_rate']}",
+                        "inr_expected": new_inr, "usdt_owed": new_owed,
+                        "from_cancelled_trade": source_id,
+                        "tx_hash": d["tx_hash"],
+                    },
+                )
+                return True, f"{ref} opened.", {
+                    "reference": ref, "trade_id": new_id, "usdt": usdt,
+                    "supply_rate": r["supply_rate"], "sell_rate": r["sell_rate"],
+                    "inr_expected": new_inr, "usdt_owed": new_owed,
+                    "restated": restated,
+                }
 
     async def reopen_trade(
         self, *, trade_id: int, actor_party_id: int, reason: str,

@@ -78,7 +78,8 @@ COMMANDS = [
     "/done", "/done@pt_client_desk_bot", "/accounts", "/add",
     "/account", "/account_remove", "/send", "/setrate", "/wallet",
     "/walletchange", "/summary", "/viewrate", "/progress",
-    "/cancel", "/correct", "/export", "/reprice", "/start", "/help",
+    "/cancel", "/correct", "/export", "/reprice", "/addvendor",
+    "/start", "/help",
 ]
 
 
