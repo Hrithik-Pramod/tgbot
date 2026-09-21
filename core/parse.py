@@ -60,6 +60,32 @@ _LBL_BEN = re.compile(
     re.I,
 )
 
+# The other end of the transfer, which is never the beneficiary.
+#
+# A bank slip names both sides. "to SUPER TRADING" is who was paid; "from
+# 881410110011285" is the client's own account, and the payment has nothing
+# to do with it.
+#
+# Live, 21 September 2026, mid-trade: a slip carrying that line had it read
+# as the beneficiary, because the final rule in classify() is "anything that
+# reads as words is a name" and "from 881410110011285" contains a word. The
+# bot then compared "from881410110011285" against every registered account
+# name, matched nothing, and asked — ₹228,000 on UTR
+# BKIDR12026092100006053, stalled with the Bridge on the phone.
+#
+#     and what stopped the bot pick up slips?
+#
+# It never had a chance: it was looking at the wrong half of the slip.
+#
+# Deliberately narrow. Only a line that BEGINS with one of these, because
+# "Transfer from HDFC to Ekta Traders" names the beneficiary further along
+# and must still be read.
+_LBL_FROM = re.compile(
+    r"^\s*(?:from|sender|debit(?:ed)?(?:\s+from)?|payer|remitter)(?![a-z])"
+    r"[:\-–.\s]*",
+    re.I,
+)
+
 # Lines that carry no payment data. Pasting alongside a screenshot brings the
 # surrounding chrome with it.
 _NOISE_TIME = re.compile(
@@ -147,6 +173,12 @@ def classify(line: str) -> tuple[str, str]:
     raw = line.strip()
     if not raw:
         return "noise", ""
+
+    # The sender's side of the slip, before anything else looks at it.
+    # Whatever follows "from" describes where the money left, not where it
+    # went, so there is nothing here worth keeping.
+    if _LBL_FROM.match(raw):
+        return "noise", raw
 
     # Labels first — they are the client telling us directly.
     if (m := _LBL_BEN.match(raw)) and raw[m.end():].strip():
