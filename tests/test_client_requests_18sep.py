@@ -276,7 +276,10 @@ class TestCancellingOffersToKeepTheRecordsLinked:
         Opening a trade and instructing a client are separate decisions, and
         have been since 11 September.
         """
-        src = _code(bridge_trade.reopen_stranded_deposit)
+        # The rendering moved into _reopen on 22 September, when reopening
+        # under a named vendor gained its own entry point. Both routes share
+        # it, so this is still the one place the decision is made.
+        src = _code(bridge_trade._reopen)
         assert "/issue" in src
         assert "issue_slots" not in src
 

@@ -910,13 +910,21 @@ async def _finish_cancel(target, state: FSMContext, party, repo, reason: str) ->
         "open a fresh trade for it at the current rate so the client is "
         "invoiced.",
     ]
-    kb = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(
+    rows: list[list[InlineKeyboardButton]] = []
+    for d in stranded:
+        rows.append([InlineKeyboardButton(
             text=f"Reopen {fmt_usdt_plain(d['amount_usdt'])} USDT as a new trade",
             callback_data=f"rd:{d['id']}",
-        )]
-        for d in stranded
-    ] + [[InlineKeyboardButton(
+        )])
+        # Suppliers who share a sending wallet cannot be told apart by the
+        # address the USDT arrives at, so the one the bot picked may be the
+        # wrong one (22 September 2026: 4,708 USDT for Tata Mahalaxmi landed
+        # on Malegao's address and opened SUPB7 against Malegao).
+        rows.append([InlineKeyboardButton(
+            text="…under a different vendor",
+            callback_data=f"rdv:{d['id']}",
+        )])
+    kb = InlineKeyboardMarkup(inline_keyboard=rows + [[InlineKeyboardButton(
         text="Leave it — settling by hand",
         # Carries the deposit, so the choice can be recorded against the
         # trade rather than merely acknowledged on screen.
@@ -1029,13 +1037,70 @@ async def cancel_reason(message: Message, state: FSMContext, party, repo) -> Non
     await _finish_cancel(message, state, party, repo, reason)
 
 
+@router.callback_query(F.data.startswith("rdv:"))
+async def reopen_under_different_vendor(
+    call: CallbackQuery, party, repo
+) -> None:
+    """
+    Ask who actually sent it, when the address cannot say.
+
+    The client is not in question — the money arrived at an address that
+    belongs to one client and no other. Only the supplier is, so only the
+    supplier is offered.
+    """
+    deposit_id = int(call.data.split(":", 1)[1])
+    pairing = await repo.pairing_for_deposit(deposit_id)
+    if pairing is None:
+        await call.message.answer("That deposit is no longer on an internal wallet.")
+        await call.answer()
+        return
+
+    suppliers = await repo.suppliers_for_client(pairing["client_id"])
+    others = [s for s in suppliers if s["id"] != pairing["supplier_id"]]
+    if not others:
+        await call.message.answer(
+            "This client is only paired with "
+            f"{pairing['supplier_label']}, so there is no one else it could "
+            "have come from. Add the vendor with /addvendor first."
+        )
+        await call.answer()
+        return
+
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(
+            text=s["label"], callback_data=f"rds:{deposit_id}:{s['id']}"
+        )]
+        for s in others
+    ])
+    await call.message.answer(
+        f"It arrived on {pairing['supplier_label']}'s address. Who actually "
+        "sent it?\n\nThe trade opens under whoever you pick — their rate, "
+        "their accounts, their deal numbers. The deposit still records where "
+        "it landed.",
+        reply_markup=kb,
+    )
+    await call.answer()
+
+
+@router.callback_query(F.data.startswith("rds:"))
+async def reopen_stranded_deposit_as(
+    call: CallbackQuery, party, repo
+) -> None:
+    _, deposit_id, supplier_id = call.data.split(":", 2)
+    await _reopen(call, party, repo, int(deposit_id), int(supplier_id))
+
+
 @router.callback_query(F.data.startswith("rd:"))
 async def reopen_stranded_deposit(
     call: CallbackQuery, party, repo
 ) -> None:
-    deposit_id = int(call.data.split(":", 1)[1])
+    await _reopen(call, party, repo, int(call.data.split(":", 1)[1]), None)
+
+
+async def _reopen(call, party, repo, deposit_id: int, supplier_id) -> None:
     ok, msg, detail = await repo.reopen_deposit_as_trade(
-        deposit_id=deposit_id, actor_party_id=party["id"]
+        deposit_id=deposit_id, actor_party_id=party["id"],
+        supplier_id=supplier_id,
     )
     if not ok:
         await call.message.answer(msg)
@@ -1061,6 +1126,15 @@ async def reopen_stranded_deposit(
             f"{r['reference']} restated to the deposits it still holds: "
             f"{fmt_usdt_plain(r['from_usdt'])} → {fmt_usdt_plain(r['to_usdt'])} "
             f"USDT, ₹{fmt_inr(r['from_inr'])} → ₹{fmt_inr(r['to_inr'])}.",
+        ]
+    # A trade whose deal number belongs to a vendor the USDT did not arrive
+    # from will look like a mistake to anyone reading it later. Say it was
+    # deliberate, on the message he keeps.
+    if detail.get("reattributed"):
+        lines += [
+            "",
+            "Opened against the vendor you named, not the address it landed "
+            "on. The deposit still records where it arrived.",
         ]
     lines += ["", "Send it to the client with /issue."]
 

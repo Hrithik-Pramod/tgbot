@@ -2132,8 +2132,30 @@ class Repo:
                 trade_id,
             )
 
+    async def pairing_for_deposit(self, deposit_id: int) -> Optional[asyncpg.Record]:
+        """
+        Which pairing a deposit landed on.
+
+        Backs the "reopen under a different vendor" choice: the client is
+        fixed by the address the money arrived at, the supplier is the one
+        being questioned.
+        """
+        async with self.pool.acquire() as conn:
+            return await conn.fetchrow(
+                """
+                SELECT w.supplier_id, w.client_id, w.address,
+                       s.label AS supplier_label
+                FROM deposits d
+                JOIN wallets w ON w.id = d.wallet_id
+                JOIN parties s ON s.id = w.supplier_id
+                WHERE d.id = $1 AND w.is_internal
+                """,
+                deposit_id,
+            )
+
     async def reopen_deposit_as_trade(
         self, *, deposit_id: int, actor_party_id: int,
+        supplier_id: Optional[int] = None,
     ) -> tuple[bool, str, Optional[dict]]:
         """
         Give a deposit its own trade at the rate in force, and correct the
@@ -2162,6 +2184,42 @@ class Repo:
         restated to whatever deposits it still has, at its own rates, in the
         same transaction. Half a repair is how the last one got missed.
 
+        WHEN THE MONEY LANDED ON THE WRONG SUPPLIER'S ADDRESS
+
+        Normally the deposit's own wallet names both sides: an internal
+        wallet exists per supplier-client pairing, so where the USDT arrived
+        is who sent it. `supplier_id` overrides that, and exists because on
+        TRON the arriving transaction carries a destination and nothing
+        else.
+
+        22 September 2026: 4,708 USDT arrived for Tata Mahalaxmi on
+        Malegao - Sam's address. The two suppliers send from a shared wallet,
+        so the bot had no way to tell them apart and opened SUPB7 against
+        Malegao — wrong supplier, wrong accounts, wrong prefix. The Bridge:
+        "cancel it and reopen under Tata."
+
+        WHAT THE OVERRIDE DOES AND DOES NOT MOVE
+
+        The new trade is opened on the NAMED supplier's pairing: their
+        wallet, their rate, their reference prefix, their bank accounts. The
+        deposit keeps its own wallet_id, because that is a statement about
+        where the money physically arrived and it is true. So
+        deposit.wallet_id and trade.wallet_id differ on a re-attributed
+        trade, deliberately.
+
+        Both readers of trade.wallet_id stay correct under that split. The
+        merge window (notifier) asks which open trade a NEW deposit on this
+        address should join, and a re-attributed trade is no longer on this
+        address — right, because the next deposit there is a fresh trade for
+        whoever that address belongs to. The double-send guard resolves the
+        payout address through the trade's pairing, which is the client
+        address for the supplier actually being billed — also right.
+
+        Rewriting deposit.wallet_id instead would make the record claim the
+        USDT arrived somewhere it did not, and the on-chain history would
+        disagree with the ledger for ever. This system has already paid for
+        one set of figures that looked tidy and were false.
+
         WHAT IT REFUSES
 
           a deposit on a live trade     it already has one, and moving it
@@ -2169,6 +2227,8 @@ class Repo:
                                         be holding an instruction for
           a counterparty wallet         only internal wallets open trades
           a pairing with no rate        nothing to price it at
+          a supplier not paired with    there is no pairing to open the
+          this client                   trade on, so no wallet and no rate
 
         The new trade is stamped announced_at because the Bridge is doing
         this himself and already knows. Leaving it null would have the
@@ -2204,6 +2264,29 @@ class Repo:
                         "That deposit landed on a counterparty wallet, not an "
                         "internal one. Only internal wallets open trades."
                     ), None
+
+                # Where it landed stays on the deposit. Who gets billed can
+                # be overridden, because a shared sending wallet makes the
+                # destination a poor witness to the sender's identity.
+                landed_on = w
+                reattributed = (
+                    supplier_id is not None
+                    and supplier_id != landed_on["supplier_id"]
+                )
+                if reattributed:
+                    w = await conn.fetchrow(
+                        """
+                        SELECT * FROM wallets
+                        WHERE is_internal AND supplier_id = $1 AND client_id = $2
+                        """,
+                        supplier_id, landed_on["client_id"],
+                    )
+                    if w is None:
+                        return False, (
+                            "That supplier has no wallet with this client, so "
+                            "there is no pairing to open the trade on. Add one "
+                            "with /addvendor first."
+                        ), None
 
                 r = await conn.fetchrow(
                     """
@@ -2297,13 +2380,34 @@ class Repo:
                         "inr_expected": new_inr, "usdt_owed": new_owed,
                         "from_cancelled_trade": source_id,
                         "tx_hash": d["tx_hash"],
+                        # Always recorded, not only when overridden, so the
+                        # log answers "where did this actually arrive?"
+                        # without a join to a table that may have moved on.
+                        "landed_on_wallet": landed_on["id"],
+                        "landed_on_address": landed_on["address"],
+                        "reattributed": reattributed,
                     },
                 )
+                if reattributed:
+                    await self.audit(
+                        conn, actor_party_id=actor_party_id,
+                        action="deposit.reattributed", entity_type="deposit",
+                        entity_id=deposit_id,
+                        detail={
+                            "tx_hash": d["tx_hash"],
+                            "usdt": usdt,
+                            "from_supplier_id": landed_on["supplier_id"],
+                            "to_supplier_id": w["supplier_id"],
+                            "landed_on_address": landed_on["address"],
+                            "billed_as": ref,
+                        },
+                    )
                 return True, f"{ref} opened.", {
                     "reference": ref, "trade_id": new_id, "usdt": usdt,
                     "supply_rate": r["supply_rate"], "sell_rate": r["sell_rate"],
                     "inr_expected": new_inr, "usdt_owed": new_owed,
                     "restated": restated,
+                    "reattributed": reattributed,
                 }
 
     async def mark_settled_by_hand(

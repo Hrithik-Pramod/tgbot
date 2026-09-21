@@ -1,5 +1,19 @@
-# Secrets — never commit
-.env
+# Secrets — never commit.
+#
+# The bare `.env` rule matched only that exact name. On 22 September 2026
+# three files — .env.bak.2026-09-09-1841 and two .env.bak.golive-* — were
+# found STAGED on the production server, having been picked up by a
+# `git add -A` there. This repository is public, and those files carry the
+# bot tokens and the database password.
+#
+# So: ignore every variant, then re-admit the one template that is meant to
+# be committed and contains no real values.
+#
+# `.env*` rather than `.env.*` because the README tells you to run
+# `nano .env`, and nano leaves .env~ behind — which has no dot after the
+# name and would have slipped through.
+.env*
+!.env.example
 
 # Client-confidential material. Kept locally, deliberately not in a public repo:
 # the brief and the returned documents contain bank details, real wallet
