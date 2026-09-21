@@ -170,6 +170,22 @@ CREATE TABLE trades (
     supply_rate     NUMERIC(20, 6) NOT NULL,
     sell_rate       NUMERIC(20, 6) NOT NULL,
 
+    -- The vendor's name AS IT WAS when the trade was done.
+    --
+    -- Labels are not stable. sync_labels rewrites every party's label from
+    -- its Telegram group title every 30 minutes, so renaming a group renames
+    -- the vendor on every trade they have ever done — a settled deal reads
+    -- back under a name it was never struck under, and a reconciliation
+    -- against a bank statement or an invoice stops lining up.
+    --
+    -- Bridge, 19 September 2026, after a vendor was renamed mid-book. The
+    -- rate is snapshotted for exactly this reason and the name is no
+    -- different: both are terms of a deal that has already happened.
+    --
+    -- NULL on trades opened before this column existed and on nothing else;
+    -- readers fall back to the live label, which is what they showed before.
+    supplier_label_at_trade TEXT,
+
     usdt_received   NUMERIC(20, 6) NOT NULL DEFAULT 0,
     inr_expected    NUMERIC(20, 2) NOT NULL DEFAULT 0,
     usdt_owed_client NUMERIC(20, 6) NOT NULL DEFAULT 0,

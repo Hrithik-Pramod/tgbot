@@ -905,7 +905,10 @@ class Repo:
         async with self.pool.acquire() as conn:
             return await conn.fetchrow(
                 """
-                SELECT t.*, s.label AS supplier_label, c.label AS client_label
+                SELECT t.*,
+                       COALESCE(t.supplier_label_at_trade, s.label)
+                           AS supplier_label,
+                       c.label AS client_label
                 FROM trades t
                 JOIN parties s ON s.id = t.supplier_id
                 JOIN parties c ON c.id = t.client_id
@@ -950,7 +953,10 @@ class Repo:
         async with self.pool.acquire() as conn:
             return await conn.fetch(
                 """
-                SELECT t.*, s.label AS supplier_label, c.label AS client_label
+                SELECT t.*,
+                       COALESCE(t.supplier_label_at_trade, s.label)
+                           AS supplier_label,
+                       c.label AS client_label
                 FROM trades t
                 JOIN parties s ON s.id = t.supplier_id
                 JOIN parties c ON c.id = t.client_id
@@ -1266,7 +1272,11 @@ class Repo:
             return await conn.fetch(
                 """
                 SELECT DISTINCT ON (r.supplier_id, r.client_id)
-                       s.label AS supplier_label, c.label AS client_label,
+                       -- The LIVE label, deliberately. A rate is what is on
+                       -- offer now, so it belongs to the vendor as they are
+                       -- called now. Only a trade pins the name.
+                       s.label AS supplier_label,
+                       c.label AS client_label,
                        r.supply_rate, r.sell_rate, r.created_at,
                        EXTRACT(EPOCH FROM (now() - r.created_at)) / 3600 AS age_hours
                 FROM rates r
@@ -1393,7 +1403,10 @@ class Repo:
         async with self.pool.acquire() as conn:
             return await conn.fetchrow(
                 """
-                SELECT t.*, s.label AS supplier_label, c.label AS client_label,
+                SELECT t.*,
+                       COALESCE(t.supplier_label_at_trade, s.label)
+                           AS supplier_label,
+                       c.label AS client_label,
                        COALESCE((SELECT SUM(amount_inr) FROM payments
                                  WHERE trade_id = t.id), 0) AS paid_inr
                 FROM trades t
@@ -1409,7 +1422,9 @@ class Repo:
             return await conn.fetch(
                 """
                 SELECT t.id, t.reference, t.inr_expected,
-                       s.label AS supplier_label, c.label AS client_label,
+                       COALESCE(t.supplier_label_at_trade, s.label)
+                           AS supplier_label,
+                       c.label AS client_label,
                        COALESCE((SELECT sum(p.amount_inr) FROM payments p
                                  WHERE p.trade_id = t.id), 0) AS paid_inr
                 FROM trades t
@@ -1437,7 +1452,9 @@ class Repo:
                        t.supply_rate, t.sell_rate,
                        t.inr_expected, t.usdt_owed_client,
                        t.instructed_at,
-                       s.label AS supplier_label, c.label AS client_label,
+                       COALESCE(t.supplier_label_at_trade, s.label)
+                           AS supplier_label,
+                       c.label AS client_label,
                        COALESCE((SELECT sum(p.amount_inr) FROM payments p
                                  WHERE p.trade_id = t.id), 0) AS paid_inr,
                        r.id          AS current_rate_id,
@@ -1503,7 +1520,10 @@ class Repo:
             async with conn.transaction():
                 t = await conn.fetchrow(
                     """
-                    SELECT t.*, s.label AS supplier_label, c.label AS client_label
+                    SELECT t.*,
+                       COALESCE(t.supplier_label_at_trade, s.label)
+                           AS supplier_label,
+                       c.label AS client_label
                     FROM trades t
                     JOIN parties s ON s.id = t.supplier_id
                     JOIN parties c ON c.id = t.client_id
@@ -1720,7 +1740,9 @@ class Repo:
             return await conn.fetch(
                 """
                 SELECT t.id, t.reference, t.completed_at,
-                       s.label AS supplier_label, c.label AS client_label
+                       COALESCE(t.supplier_label_at_trade, s.label)
+                           AS supplier_label,
+                       c.label AS client_label
                 FROM trades t
                 JOIN parties s ON s.id = t.supplier_id
                 JOIN parties c ON c.id = t.client_id
@@ -2315,9 +2337,13 @@ class Repo:
                         reference, supplier_id, client_id, wallet_id, rate_id,
                         supply_rate, sell_rate, usdt_received, inr_expected,
                         usdt_owed_client, margin_usdt, status, opened_at,
-                        announced_at)
+                        announced_at, supplier_label_at_trade)
                     VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,
-                            'awaiting_payment',$12, now())
+                            'awaiting_payment',$12, now(),
+                            -- The vendor being billed, which on a
+                            -- re-attribution is not the one the USDT
+                            -- arrived from.
+                            (SELECT label FROM parties WHERE id = $2))
                     RETURNING id
                     """,
                     ref, w["supplier_id"], w["client_id"], w["id"], r["id"],

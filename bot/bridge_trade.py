@@ -764,6 +764,16 @@ async def cmd_cancel(message: Message, state: FSMContext, repo) -> None:
             "arrived yet. Left in place, the account they named will be "
             "offered as the nomination on their next deposit."
         )
+    # cancel_pick is gated on Cancel.pick. Without this the cx: buttons match
+    # no handler at all, aiogram logs "Update is not handled", nothing calls
+    # answer(), and the button spins for ever with no error anywhere.
+    #
+    # Bridge, 22 September 2026: "why was it not letting me cancelling last
+    # time? Its doing it again, says loading does not let me."
+    #
+    # The claim buttons carry no state filter, so clearing a claim always
+    # worked — which is what made it look intermittent rather than broken.
+    await state.set_state(Cancel.pick)
     await message.answer(
         f"What do you want to cancel?{note}",
         reply_markup=InlineKeyboardMarkup(inline_keyboard=rows),

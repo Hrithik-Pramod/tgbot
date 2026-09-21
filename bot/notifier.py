@@ -373,8 +373,12 @@ class Notifier:
                         """
                         INSERT INTO trades (reference, supplier_id, client_id, wallet_id,
                                             rate_id, supply_rate, sell_rate, status,
-                                            nominated_account_id)
-                        VALUES ($1, $2, $3, $4, $5, $6, $7, 'open', $8)
+                                            nominated_account_id,
+                                            supplier_label_at_trade)
+                        VALUES ($1, $2, $3, $4, $5, $6, $7, 'open', $8,
+                                -- Pinned here rather than passed in, so a
+                                -- caller cannot open a trade without it.
+                                (SELECT label FROM parties WHERE id = $2))
                         RETURNING id
                         """,
                         reference, supplier_id, client_id, wallet["id"],
@@ -429,10 +433,20 @@ class Notifier:
         async with self.repo.pool.acquire() as conn:
             labels = await conn.fetchrow(
                 """
-                SELECT s.label AS supplier_label, c.label AS client_label
-                FROM parties s, parties c WHERE s.id = $1 AND c.id = $2
+                -- Read through the trade, not the parties directly, so the
+                -- announcement carries the same pinned name that every
+                -- later screen will show for this deal. Taking it from
+                -- parties would make the first message drift away from the
+                -- rest the moment the group is renamed.
+                SELECT COALESCE(t.supplier_label_at_trade, s.label)
+                           AS supplier_label,
+                       c.label AS client_label
+                FROM trades t
+                JOIN parties s ON s.id = t.supplier_id
+                JOIN parties c ON c.id = t.client_id
+                WHERE t.id = $1
                 """,
-                supplier_id, client_id,
+                trade_id,
             )
             # Where this pairing settles to, so the Bridge does not have to
             # look it up while acting on the message.
