@@ -29,6 +29,7 @@ from .money import (
     check_total,
     fmt_inr,
     fmt_inr_plain,
+    fmt_rate,
     fmt_usdt,
     fmt_usdt_plain,
     round_inr,
@@ -327,7 +328,7 @@ def render_deposit_notification(
     # message and then has to act on it, so everything the action needs is in
     # it: what came in, at what rate, what goes back out, and at what rate.
     if supply_rate is not None:
-        body.append(f"Bought at {fmt_usdt_plain(supply_rate)}")
+        body.append(f"Bought at {fmt_rate(supply_rate)}")
     if usdt_out is not None:
         # Tap-to-copy: this is the figure the Bridge types into a wallet to
         # send the client, so it is the one that must be copyable on its own
@@ -336,7 +337,7 @@ def render_deposit_notification(
         line = (f"Send on to {esc(client_label)}: "
                 f"{f'<code>{out}</code>' if html else out} USDT")
         if sell_rate is not None:
-            line += f" at {fmt_usdt_plain(sell_rate)}"
+            line += f" at {fmt_rate(sell_rate)}"
         body.append(line)
 
         # And WHERE to send it.
@@ -409,7 +410,7 @@ def render_send_instruction(
     usdt = fmt_usdt_plain(usdt_out)
     line = f"USDT = {f'<code>{usdt}</code>' if html else usdt}"
     if sell_rate is not None:
-        line += f" at {fmt_usdt_plain(sell_rate)}"
+        line += f" at {fmt_rate(sell_rate)}"
     line += f" to Send INR {fmt_inr(inr_amount)}"
 
     esc = html_escape if html else (lambda s: s)

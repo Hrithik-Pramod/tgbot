@@ -192,6 +192,55 @@ def fmt_usdt(value) -> str:
     return f"{round_usdt(value):,.2f}"
 
 
+def pct_collected(paid, expected) -> str:
+    """
+    How far along a collection is, as a percentage.
+
+    Client request, 21 September 2026: "on MYFX, the progress can you add %
+    to my look up as well."
+
+    NEVER ROUNDS UP TO 100
+
+    A trade on ₹3,999,999 of ₹4,000,016 is 99.9996% collected, and every
+    obvious way of writing that prints "100%". A hundred per cent means
+    finished, and this system has spent a fortnight learning what a figure
+    that looks finished and is not costs: ₹902,460 on 11 September,
+    ₹995,495 twice the week after. So 100% appears only when nothing at
+    all is outstanding; anything short reads 99%.
+
+    Rounds DOWN for the same reason. 61.8% is 61%, because overstating
+    progress is the direction that hurts.
+    """
+    paid_d, expected_d = to_decimal(paid), to_decimal(expected)
+    if expected_d <= 0:
+        return "—"
+    if paid_d >= expected_d:
+        return "100%" if paid_d == expected_d else f"{int(paid_d / expected_d * 100)}%"
+    return f"{min(99, int(paid_d / expected_d * 100))}%"
+
+
+def fmt_rate(value) -> str:
+    """
+    A rate as somebody would say it: 106.2, not 106.200000.
+
+    Rates are NUMERIC(20, 6) so the database hands back every trailing zero,
+    and every screen that printed one interpolated it raw. /viewrate read
+    "Buy 106.200000", and so did /setrate, /reprice and the reopen notice.
+
+    Bridge, 21 September 2026, mid-trade:
+
+        copying from the telegram, something is not working right, copying
+        from Telegram gets extra long numbers set not value of trade
+
+    Trailing zeros only, never rounding: a rate of 106.125 keeps all three
+    decimals, because truncating a rate would change the arithmetic rather
+    than merely tidy the display.
+    """
+    d = to_decimal(value).normalize()
+    # normalize() turns 100 into 1E+2. Undo that.
+    return f"{d:f}"
+
+
 def fmt_usdt_plain(value) -> str:
     """
     Format USDT to 2 dp with no separators at all.

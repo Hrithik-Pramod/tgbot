@@ -18,7 +18,10 @@ from aiogram.types import CallbackQuery, InlineKeyboardButton, InlineKeyboardMar
 
 from decimal import Decimal
 
-from core.money import MoneyError, fmt_inr, fmt_usdt, fmt_usdt_plain, to_decimal
+from core.money import (
+    MoneyError, fmt_inr, fmt_rate, fmt_usdt, fmt_usdt_plain, pct_collected,
+    to_decimal,
+)
 
 log = logging.getLogger(__name__)
 router = Router()
@@ -113,8 +116,8 @@ async def setrate_client(call: CallbackQuery, state: FSMContext, repo) -> None:
         age = float(current["age_hours"])
         stale = "  (STALE)" if age > 24 else ""
         note = (
-            f"Current supply rate: {current['supply_rate']}\n"
-            f"Current sell rate:   {current['sell_rate']}\n"
+            f"Current supply rate: {fmt_rate(current['supply_rate'])}\n"
+            f"Current sell rate:   {fmt_rate(current['sell_rate'])}\n"
             f"Set {age:.1f} hours ago{stale}\n\n"
         )
     else:
@@ -171,7 +174,8 @@ async def setrate_sell(message: Message, state: FSMContext) -> None:
         InlineKeyboardButton(text="Cancel", callback_data="sr_no"),
     ]])
     await message.answer(
-        f"Supply rate: {supply}\nSell rate: {rate}\n\nIs this correct?{warning}",
+        f"Supply rate: {fmt_rate(supply)}\nSell rate: {fmt_rate(rate)}\n\n"
+        f"Is this correct?{warning}",
         reply_markup=kb,
     )
 
@@ -234,6 +238,7 @@ async def cmd_progress(message: Message, repo) -> None:
             lines.append(
                 f"  {deals}   ₹{fmt_inr(r['collected_inr'])}"
                 f" of ₹{fmt_inr(r['expected_inr'])}"
+                f"   {pct_collected(r['collected_inr'], r['expected_inr'])}"
             )
             if outstanding > 0:
                 lines.append(f"  Outstanding  ₹{fmt_inr(outstanding)}")
@@ -260,7 +265,17 @@ async def cmd_progress(message: Message, repo) -> None:
 
         lines.append("")
 
-    lines.append(f"Outstanding across the book  ₹{fmt_inr(total_out)}")
+    collected = sum(
+        (r["collected_inr"] for r in rows if r["open_trades"]), Decimal(0)
+    )
+    expected = sum(
+        (r["expected_inr"] for r in rows if r["open_trades"]), Decimal(0)
+    )
+    lines.append(
+        f"Outstanding across the book  ₹{fmt_inr(total_out)}"
+        + (f"   ({pct_collected(collected, expected)} collected)"
+           if expected > 0 else "")
+    )
     if total_stranded:
         lines.append(f"Never invoiced               ₹{fmt_inr(total_stranded)}")
 
@@ -299,8 +314,8 @@ async def cmd_viewrate(message: Message, repo) -> None:
         stale = "   ← CHECK THIS" if age > 24 else ""
 
         lines.append(f"{r['supplier_label']} → {r['client_label']}{stale}")
-        lines.append(f"Buy  {r['supply_rate']}")
-        lines.append(f"Sell {r['sell_rate']}")
+        lines.append(f"Buy  {fmt_rate(r['supply_rate'])}")
+        lines.append(f"Sell {fmt_rate(r['sell_rate'])}")
         lines.append(f"Set {when}")
         lines.append("")
 

@@ -33,7 +33,9 @@ from aiogram.types import (
     InlineKeyboardMarkup, Message,
 )
 
-from core.money import MoneyError, fmt_inr, fmt_usdt_plain, round_inr, to_decimal
+from core.money import (
+    MoneyError, fmt_inr, fmt_rate, fmt_usdt_plain, round_inr, to_decimal,
+)
 from core.slots import check_new_slot
 from core.summary import (
     PaymentSlot, render_payment_slot, render_send_instruction,
@@ -660,9 +662,10 @@ async def reprice_pick(call: CallbackQuery, state: FSMContext, repo) -> None:
     ]])
     await call.message.edit_text(
         f"{t['reference']} — {fmt_usdt_plain(t['usdt_received'])} USDT\n\n"
-        f"Now:  buy {t['supply_rate']} / sell {t['sell_rate']}\n"
+        f"Now:  buy {fmt_rate(t['supply_rate'])} / sell {fmt_rate(t['sell_rate'])}\n"
         f"      client pays ₹{fmt_inr(t['inr_expected'])}\n\n"
-        f"New:  buy {t['current_supply_rate']} / sell {t['current_sell_rate']}\n"
+        f"New:  buy {fmt_rate(t['current_supply_rate'])} / "
+        f"sell {fmt_rate(t['current_sell_rate'])}\n"
         f"      client pays ₹{fmt_inr(new_inr)}\n\n"
         f"That is ₹{fmt_inr(abs(difference))} {direction}.\n\n"
         "Nothing has gone to the client for this trade yet, so this changes "
@@ -687,8 +690,10 @@ async def reprice_confirm(call: CallbackQuery, state: FSMContext, party, repo) -
 
     await call.message.edit_text(
         f"{detail['reference']} repriced.\n\n"
-        f"Buy  {detail['old_supply']} → {detail['new_supply']}\n"
-        f"Sell {detail['old_sell']} → {detail['new_sell']}\n\n"
+        f"Buy  {fmt_rate(detail['old_supply'])} → "
+        f"{fmt_rate(detail['new_supply'])}\n"
+        f"Sell {fmt_rate(detail['old_sell'])} → "
+        f"{fmt_rate(detail['new_sell'])}\n\n"
         f"Client pays ₹{fmt_inr(detail['old_inr'])} → "
         f"₹{fmt_inr(detail['new_inr'])}\n"
         f"Owed out {fmt_usdt_plain(detail['old_owed'])} → "
@@ -1041,7 +1046,8 @@ async def reopen_stranded_deposit(
         f"{detail['reference']} opened for "
         f"{fmt_usdt_plain(detail['usdt'])} USDT.",
         "",
-        f"Rate        {detail['supply_rate']} / {detail['sell_rate']}",
+        f"Rate        {fmt_rate(detail['supply_rate'])} / "
+        f"{fmt_rate(detail['sell_rate'])}",
         f"Client pays ₹{fmt_inr(detail['inr_expected'])}",
         f"Owed out    {fmt_usdt_plain(detail['usdt_owed'])} USDT",
     ]
