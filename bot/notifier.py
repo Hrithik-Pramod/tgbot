@@ -277,9 +277,15 @@ class Notifier:
                 usdt_out=trade["usdt_owed_client"],
                 nominated_account=trade["nominated_name"],
                 payout_address=trade["payout_address"],
+                # Tap-to-copy on the settlement figure. Both halves are
+                # needed — the renderer emits <code> only when html=True,
+                # and to_bridge sends parse_mode only when told to. Either
+                # one alone gives literal <code> tags or no markup at all.
+                html=True,
             )
             + note,
             reply_markup=confirm_keyboard(trade_id),
+            html=True,
         )
         log.info("announced trade %s (waited=%s)", trade["reference"], waited)
         return True
@@ -521,7 +527,9 @@ class Notifier:
                 previous_usdt=trade["usdt_received"] if trade else None,
                 nominated_account=nominated_name,
                 payout_address=payout_address,
+                html=True,
             )
             + stale_note,
             reply_markup=confirm_keyboard(trade_id),
+            html=True,
         )
