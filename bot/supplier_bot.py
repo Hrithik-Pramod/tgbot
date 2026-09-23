@@ -16,7 +16,7 @@ from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.types import CallbackQuery, InlineKeyboardButton, InlineKeyboardMarkup, Message
 
-from core.summary import render_collection_progress
+from core.summary import render_mini_statement
 
 log = logging.getLogger(__name__)
 router = Router()
@@ -130,7 +130,18 @@ async def cmd_progress(message: Message, party, repo) -> None:
         )
         return
 
-    await message.answer(render_collection_progress(
+    # The UTRs, since 23 September: "think that this would be useful vendor
+    # side option, same progress with UTRs so far listed."
+    #
+    # Safe to show, and worth being explicit about why: these are payments
+    # into THIS supplier's own bank accounts on THIS supplier's own trade.
+    # Every line is already on their bank statement. Nothing here names the
+    # client, the deal, the rate or the margin — the render is given no
+    # reference and no vendor, so it cannot print them (decision D4, and the
+    # 11 September disclosure).
+    payments = await repo.trade_payments(trade["id"])
+    await message.answer(render_mini_statement(
+        payments=payments,
         expected_inr=trade["inr_expected"],
         paid_inr=trade["paid_inr"],
     ))

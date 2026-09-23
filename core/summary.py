@@ -32,6 +32,7 @@ from .money import (
     fmt_rate,
     fmt_usdt,
     fmt_usdt_plain,
+    pct_collected,
     round_inr,
 )
 
@@ -220,8 +221,6 @@ def render_collection_progress(
     if outstanding < 0:
         outstanding = Decimal(0)
 
-    pct = (paid_inr / expected_inr * 100) if expected_inr else Decimal(0)
-
     return "\n".join([
         "Collection progress",
         "",
@@ -229,8 +228,89 @@ def render_collection_progress(
         f"Collected     ₹{fmt_inr(paid_inr)}",
         f"Outstanding   ₹{fmt_inr(outstanding)}",
         "",
-        f"{pct:.0f}% collected",
+        # Was f"{pct:.0f}%", which ROUNDS. A supplier owed ₹17 on ₹4,000,016
+        # was told "100% collected" and had no reason to chase it. That is
+        # the same flattering figure pct_collected was written for on the
+        # Bridge's side on 21 September; the supplier had been reading it
+        # for eleven days longer.
+        f"{pct_collected(paid_inr, expected_inr)} collected",
     ])
+
+
+def render_mini_statement(
+    *,
+    payments: Sequence,
+    expected_inr: Decimal,
+    paid_inr: Decimal,
+    reference: str | None = None,
+    vendor: str | None = None,
+) -> str:
+    """
+    Every UTR against one trade, and what they add up to.
+
+    Client request, 23 September 2026:
+
+        i need to have option of mini statement on trading ... after choosing
+        trade it gives a summary of utrs so far and a total with percentage
+        ... Also think that this would be useful vendor side option, same
+        progress with UTRs so far listed
+
+    WHY IT IS ONE FUNCTION FOR BOTH SIDES
+
+    The Bridge and the supplier are being shown the same facts — which
+    payments have landed against this trade — so rendering them twice would
+    let the two drift, and a supplier disputing a figure against a screen
+    that says something slightly different is worse than no screen.
+
+    WHAT THE SUPPLIER DOES NOT GET
+
+    `reference` and `vendor` are the Bridge's alone and default to None.
+    Decision D4, and the 11 September disclosure: the supplier sees the
+    collection of their own INR and nothing that identifies the deal, the
+    counterparty, or the Bridge's book. The UTRs and amounts ARE theirs —
+    money paid into their own accounts, which they can see in their own bank
+    statement — so listing them tells them nothing they do not already have a
+    right to.
+
+    The percentage rounds down, like every other one in this system.
+    """
+    outstanding = expected_inr - paid_inr
+
+    lines: list[str] = []
+    if reference:
+        head = reference if not vendor else f"{reference} — {vendor}"
+        lines += [head, ""]
+    lines.append("Payments received")
+    lines.append("")
+
+    if not payments:
+        lines.append("  Nothing has been paid against this yet.")
+    else:
+        for n, p in enumerate(payments, 1):
+            lines.append(f"  {n}. {p['utr']}")
+            # The account matters: a trade re-issued to a different account
+            # mid-collection has payments against both, and "why is this one
+            # in the old account" is a question the statement should answer
+            # without anybody opening the audit log.
+            lines.append(
+                f"     ₹{fmt_inr(p['amount_inr'])}   →  {p['account_name']}"
+            )
+
+    lines += [
+        "",
+        f"Collected     ₹{fmt_inr(paid_inr)}"
+        f"  ({len(payments)} payment{'' if len(payments) == 1 else 's'})",
+        f"Expected      ₹{fmt_inr(expected_inr)}",
+    ]
+    if outstanding > 0:
+        lines.append(f"Outstanding   ₹{fmt_inr(outstanding)}")
+    elif outstanding < 0:
+        lines.append(f"OVERPAID      ₹{fmt_inr(-outstanding)}")
+    else:
+        lines.append("Outstanding   nil")
+
+    lines += ["", f"{pct_collected(paid_inr, expected_inr)} collected"]
+    return "\n".join(lines)
 
 
 def render_completion_notice(

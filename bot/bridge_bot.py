@@ -22,6 +22,7 @@ from core.money import (
     MoneyError, fmt_inr, fmt_rate, fmt_usdt, fmt_usdt_plain, pct_collected,
     to_decimal,
 )
+from core.summary import render_mini_statement
 
 log = logging.getLogger(__name__)
 router = Router()
@@ -265,21 +266,67 @@ async def cmd_progress(message: Message, repo) -> None:
 
         lines.append("")
 
-    collected = sum(
-        (r["collected_inr"] for r in rows if r["open_trades"]), Decimal(0)
-    )
-    expected = sum(
-        (r["expected_inr"] for r in rows if r["open_trades"]), Decimal(0)
-    )
-    lines.append(
-        f"Outstanding across the book  ₹{fmt_inr(total_out)}"
-        + (f"   ({pct_collected(collected, expected)} collected)"
-           if expected > 0 else "")
-    )
+    # The rupee total stays. The PERCENTAGE does not.
+    #
+    # Client request, 22 September 2026: "I'd like percentage is per vendor
+    # not total." Added the day before on my own reading of "add % to my look
+    # up", which was wrong — a book-wide figure averages vendors who have
+    # collected nothing against vendors who are finished and describes
+    # neither. 61% across the book tells him to chase nobody in particular.
+    #
+    # A sum of rupees is not the same mistake: money owed genuinely adds up,
+    # and it is the number he acts on.
+    lines.append(f"Outstanding across the book  ₹{fmt_inr(total_out)}")
     if total_stranded:
         lines.append(f"Never invoiced               ₹{fmt_inr(total_stranded)}")
 
-    await message.answer("\n".join(lines))
+    # The next step he asked for on 23 September: "we have a next step,
+    # choose trade ... then after choosing trade it gives a summary of utrs
+    # so far and a total with percentage."
+    #
+    # NOT state-gated, deliberately. cancel_pick was, nothing set the state,
+    # and the buttons were silently dead for days (22 September). A mini
+    # statement is a read — a button pressed on yesterday's message should
+    # just render today's figures, not match no handler.
+    live = await repo.list_open_trades()
+    kb = None
+    if live:
+        kb = InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(
+                text=f"{t['reference']} — {t['supplier_label']}",
+                callback_data=f"mst:{t['id']}",
+            )]
+            for t in live
+        ])
+        lines += ["", "Pick a trade for its payments so far:"]
+
+    await message.answer("\n".join(lines), reply_markup=kb)
+
+
+@router.callback_query(F.data.startswith("mst:"))
+async def mini_statement(call: CallbackQuery, repo) -> None:
+    """
+    Every UTR against one trade, for the Bridge.
+
+    He gets the reference and the vendor on it; the supplier's copy of the
+    same statement does not (decision D4).
+    """
+    trade_id = int(call.data.split(":", 1)[1])
+    trade = await repo.trade_detail(trade_id)
+    if trade is None:
+        await call.message.answer("That trade no longer exists.")
+        await call.answer()
+        return
+
+    payments = await repo.trade_payments(trade_id)
+    await call.message.answer(render_mini_statement(
+        payments=payments,
+        expected_inr=trade["inr_expected"],
+        paid_inr=trade["paid_inr"],
+        reference=trade["reference"],
+        vendor=trade["supplier_label"],
+    ))
+    await call.answer()
 
 
 # --------------------------------------------------------------- /viewrate

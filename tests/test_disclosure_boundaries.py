@@ -104,6 +104,37 @@ class TestTheSupplierNeverLearnsTheReference:
         for leaked in ("SUPA", "SUPB", "Transaction", "Client"):
             assert leaked not in out
 
+    def test_the_mini_statement_omits_it_too(self):
+        """
+        On 23 September the supplier's /progress moved onto
+        render_mini_statement, so the boundary test above stopped guarding
+        the live path. The same renderer serves the Bridge WITH a reference
+        and vendor, which is exactly the shape that leaks if the supplier
+        call ever passes them.
+        """
+        from decimal import Decimal as D
+        from core.summary import render_mini_statement
+
+        out = render_mini_statement(
+            payments=[{"utr": "UTR1", "amount_inr": D("1000"),
+                       "account_name": "Their Own Account"}],
+            expected_inr=D("2000"), paid_inr=D("1000"),
+        )
+        for leaked in ("SUPA", "SUPB", "Transaction", "Client", "None"):
+            assert leaked not in out, out
+
+    def test_the_supplier_call_passes_no_reference_or_vendor(self):
+        """
+        The renderer cannot leak what it is not given, so the guarantee is
+        at the call site. Asserted on the source because a supplier reading
+        another party's deal reference is the incident this whole file
+        exists for.
+        """
+        src = inspect.getsource(supplier_bot.cmd_progress)
+        assert "render_mini_statement(" in src
+        assert "reference=" not in src
+        assert "vendor=" not in src
+
 
 class TestTheBridgeStillSeesEverything:
     """

@@ -82,25 +82,30 @@ class TestItAppearsOnProgress:
         src = inspect.getsource(bridge_bot.cmd_progress)
         assert "pct_collected(r['collected_inr'], r['expected_inr'])" in src
 
-    def test_the_book_carries_one_too(self):
+    def test_the_book_total_carries_no_percentage(self):
         """
-        He asked for it on the look-up, and the look-up ends with a total.
-        """
-        src = inspect.getsource(bridge_bot.cmd_progress)
-        assert "pct_collected(collected, expected)" in src
+        Reversed on 22 September 2026, the day after it shipped:
 
-    def test_the_book_total_only_counts_live_trades(self):
-        """
-        A cancelled trade's expectation is not something anyone is still
-        collecting, and counting it would drag the figure down for ever.
-        """
-        src = inspect.getsource(bridge_bot.cmd_progress)
-        assert 'for r in rows if r["open_trades"]' in src
+            I'd like percentage is per vendor not total
 
-    def test_no_percentage_when_nothing_is_open(self):
-        """Dividing by an empty book would read 0% collected on a clear one."""
+        I had added a book-wide figure on my own reading of "add % to my
+        look up". It averages a vendor who has collected nothing against one
+        who is finished and describes neither, so it points at no action.
+
+        The rupee total stays — money owed genuinely adds up.
+        """
         src = inspect.getsource(bridge_bot.cmd_progress)
-        assert "if expected > 0 else" in src
+        assert "pct_collected(collected, expected)" not in src
+        assert "Outstanding across the book" in src
+        assert "fmt_inr(total_out)" in src
+
+    def test_the_per_vendor_percentage_survived_that(self):
+        """
+        The half he asked for and kept asking for. Removing the total must
+        not take these with it.
+        """
+        src = inspect.getsource(bridge_bot.cmd_progress)
+        assert "pct_collected(r['collected_inr'], r['expected_inr'])" in src
 
     def test_the_money_lines_are_unchanged(self):
         """The percentage is added beside the figures, not instead of them."""
