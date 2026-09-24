@@ -137,10 +137,47 @@ class TestTheMenusStayApart:
         assert "open_trade_for_supplier" in src
         assert "book_progress" not in src
 
+    # Names the client and the supplier both use, for different things on
+    # their own bots.
+    #
+    #   accounts  the supplier sees the accounts they have registered (their
+    #             own, client request 24 September 2026); the client sees the
+    #             accounts they may pay into for this trade, narrowed on
+    #             11 September to stop it listing the Bridge's whole book
+    CLIENT_SUPPLIER_SHARED = {"accounts"}
+
     def test_the_client_is_not_shown_supplier_commands(self):
+        """
+        Relaxed from "no overlap at all" on 24 September, when /accounts was
+        added for vendors.
+
+        The boundary that matters is not the word — each bot publishes only
+        its own menu, so a client never sees the supplier's list. It is that
+        a shared word must not become a shared implementation, which the
+        next test holds.
+        """
         client = {c for c, _ in MENUS["client"]}
         supplier = {c for c, _ in MENUS["supplier"]}
-        assert not client & supplier
+        assert (client & supplier) <= self.CLIENT_SUPPLIER_SHARED, (
+            "client and supplier share commands that were not thought about: "
+            f"{(client & supplier) - self.CLIENT_SUPPLIER_SHARED}"
+        )
+
+    def test_a_name_shared_with_the_client_is_a_different_handler(self):
+        """
+        The real guard. /accounts on the supplier bot answers "which
+        accounts are mine"; on the client bot it answers "where may I pay".
+        One function serving both would hand a client the vendor's list or
+        a vendor the client's — and the second of those is the 11 September
+        disclosure.
+        """
+        from bot import client_bot, supplier_bot
+
+        for name in self.CLIENT_SUPPLIER_SHARED:
+            s = getattr(supplier_bot, f"cmd_{name}", None)
+            c = getattr(client_bot, f"cmd_{name}", None)
+            if s is not None and c is not None:
+                assert s is not c, f"/{name} is the same function on both bots"
 
     def test_all_three_roles_have_a_menu(self):
         assert set(MENUS) == {"bridge", "supplier", "client"}

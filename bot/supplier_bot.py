@@ -16,7 +16,7 @@ from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.types import CallbackQuery, InlineKeyboardButton, InlineKeyboardMarkup, Message
 
-from core.summary import render_mini_statement
+from core.summary import render_mini_statement, render_own_accounts
 
 log = logging.getLogger(__name__)
 router = Router()
@@ -148,6 +148,28 @@ async def cmd_progress(message: Message, party, repo) -> None:
 
 
 # ---------------------------------------------------------- /account_remove
+
+@router.message(Command("accounts"))
+async def cmd_accounts(message: Message, party, repo) -> None:
+    """
+    Show a vendor the accounts they have live.
+
+    Client request, 24 September 2026: "Just an /accounts, and it shows
+    their accounts and details."
+
+    Scoped to party["id"] — their own. list_bank_accounts filters to
+    is_active, so a removed account does not appear and "live" needs no
+    caveat in the text.
+    """
+    accounts = await repo.list_bank_accounts(party["id"])
+    # parse_mode explicitly, because main.py sets DefaultBotProperties(
+    # parse_mode=None). Without it the <code> around the account number is
+    # printed literally — the 23 September "copy paste is not working"
+    # fault, which was exactly this pair of switches being half set.
+    await message.answer(
+        render_own_accounts(accounts, html=True), parse_mode="HTML"
+    )
+
 
 @router.message(Command("account_remove"))
 async def cmd_account_remove(message: Message, party, repo) -> None:

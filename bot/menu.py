@@ -62,6 +62,7 @@ MENUS: dict[str, list[tuple[str, str]]] = {
     ],
     "supplier": [
         ("send",           "tell us you have sent, and to which account"),
+        ("accounts",       "show the bank accounts you have live"),
         ("account",        "register a bank account"),
         ("account_remove", "remove a bank account"),
         ("progress",       "how much of your INR has arrived"),

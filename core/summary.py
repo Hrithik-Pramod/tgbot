@@ -82,6 +82,65 @@ class PaymentSlot:
     amount_inr: Decimal
 
 
+def render_own_accounts(accounts: Sequence, *, html: bool = False) -> str:
+    """
+    A vendor's own registered accounts, in the house layout.
+
+    Client request, 24 September 2026:
+
+        Vendor is looking for option to display accounts and details they
+        have live, bank accounts ... Just an /accounts ... And it shows
+        their accounts and details
+
+    WHY THIS DISCLOSES NOTHING
+
+    Every account here belongs to the party asking. The caller passes their
+    own party id to list_bank_accounts, which also filters to is_active — so
+    "live" is answered by the query, not by a note in the text. Nothing about
+    the client, the deal, the rate or any other vendor appears.
+
+    That is a different question from /accounts on the CLIENT bot, which
+    shows a client the accounts they may pay into and had to be narrowed on
+    11 September to stop it listing the Bridge's whole book.
+
+    THE LAYOUT IS DELIBERATELY THE SAME AS AN INSTRUCTION
+
+    "Acc num / Ifsc / Acc name" is the shape the client's payment slots use,
+    which is the shape everyone in this system already reads. A vendor
+    checking their details against what a client was sent should be
+    comparing like with like, not translating between two formats.
+
+    The number is tap-to-copy under html=True for the same reason it is on a
+    slot: it gets transcribed, and a mistyped digit sends money nowhere.
+    """
+    esc = html_escape if html else (lambda s: s)
+
+    if not accounts:
+        return (
+            "You have no accounts registered.\n\n"
+            "Add one with /account."
+        )
+
+    head = (
+        "Your registered accounts"
+        if len(accounts) == 1
+        else f"Your registered accounts ({len(accounts)})"
+    )
+    parts = [head, ""]
+    for a in accounts:
+        num = a["account_number"]
+        parts.append(
+            f"Acc num - {f'<code>{num}</code>' if html else num}\n"
+            f"Ifsc - {esc(a['ifsc'])}\n"
+            f"Acc name - {esc(a['account_name'])}"
+        )
+        parts.append("")
+
+    parts.append("These are the accounts clients can be told to pay.")
+    parts.append("Add one with /account, take one off with /account_remove.")
+    return "\n".join(parts).rstrip()
+
+
 def render_payment_slot(slot: PaymentSlot, *, html: bool = False) -> str:
     """
     The instruction sent to the client, in the exact layout the client specified.
