@@ -108,7 +108,18 @@ CREATE TABLE wallets (
 
     created_at      TIMESTAMPTZ NOT NULL DEFAULT now(),
 
-    CONSTRAINT wallets_address_unique UNIQUE (address),
+    -- Retired, not deleted (25 September 2026).
+    --
+    -- trades.wallet_id and deposits.wallet_id both reference this table and
+    -- are NOT NULL — wallet 8 alone carried ALPH1 through ALPH5 — so a
+    -- delete either fails on the foreign key or takes settled trades with
+    -- it. History has to keep pointing at the wallet it settled through.
+    --
+    -- The same shape bank_accounts has used since the first build. A
+    -- retired row keeps its address and its history and stops reserving
+    -- either of the unique constraints below, so the address can be
+    -- registered again and the vendor can be given a new wallet.
+    retired_at      TIMESTAMPTZ,
 
     -- An internal wallet defines a pairing and must name both sides.
     -- An external wallet belongs to exactly one party.
@@ -127,10 +138,18 @@ CREATE TABLE wallets (
 -- the same day. A client may have any number of wallets to be paid at; a
 -- pairing still has exactly one address that deposits land on, because that
 -- address is what identifies the pairing.
-CREATE UNIQUE INDEX wallets_pairing_unique
-    ON wallets (supplier_id, client_id) WHERE is_internal;
+-- Both partial on retired_at since 25 September 2026: a retired wallet must
+-- not go on reserving the address or the pairing slot, or retiring one
+-- would be no better than the is_monitored flag it replaces.
+CREATE UNIQUE INDEX wallets_address_live_unique
+    ON wallets (address) WHERE retired_at IS NULL;
 
-CREATE INDEX wallets_monitored_idx ON wallets (address) WHERE is_monitored;
+CREATE UNIQUE INDEX wallets_pairing_unique
+    ON wallets (supplier_id, client_id)
+    WHERE is_internal AND retired_at IS NULL;
+
+CREATE INDEX wallets_monitored_idx
+    ON wallets (address) WHERE is_monitored AND retired_at IS NULL;
 
 
 -- ---------------------------------------------------------------- rates

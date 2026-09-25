@@ -57,6 +57,7 @@ MENUS: dict[str, list[tuple[str, str]]] = {
         ("walletadd",    "register a new wallet address"),
         ("walletlink",   "set where a pairing pays the client"),
         ("walletchange", "change an existing wallet's address"),
+        ("walletremove", "retire a wallet, keeping its history"),
         ("send",         "note a transfer you have made"),
         ("export",       "download the ledger as a CSV"),
     ],

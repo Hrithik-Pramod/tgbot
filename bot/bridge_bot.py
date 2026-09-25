@@ -671,6 +671,121 @@ async def walletchange_cancel(call: CallbackQuery, state: FSMContext) -> None:
     await call.answer()
 
 
+# ------------------------------------------------------------ /walletremove
+
+@router.message(Command("walletremove"))
+async def cmd_walletremove(message: Message, repo) -> None:
+    """
+    Take a wallet out of service, keeping everything that went through it.
+
+    Client request, 25 September 2026: "if i needed to remove an account
+    wallet for a provider, and not have an associated wallet in place, can
+    you add this".
+
+    No FSM state. cancel_pick was gated on a state nothing set and the
+    buttons were dead for days (22 September); a picker that re-reads the
+    wallet on press has no reason to be gated, and the confirmation step is
+    where the safety lives.
+    """
+    wallets = await repo.list_wallets()
+    if not wallets:
+        await message.answer("No wallets are configured.")
+        return
+
+    rows = []
+    for w in wallets:
+        if w["is_internal"]:
+            text = f"Internal: {w['supplier_label']} → {w['client_label']}"
+        else:
+            text = f"{w['owner_label']}"
+        rows.append([InlineKeyboardButton(text=text, callback_data=f"wr:{w['id']}")])
+
+    await message.answer(
+        "Which wallet do you want to retire?\n\n"
+        "Nothing is deleted — its trades and deposits stay exactly as they "
+        "are. The bot stops watching the address, and the address and the "
+        "vendor slot become free to use again.",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=rows),
+    )
+
+
+@router.callback_query(F.data.startswith("wr:"))
+async def walletremove_which(call: CallbackQuery, repo) -> None:
+    """
+    Say what will happen before it happens, in figures.
+
+    A wallet with five settled trades behind it should not be retired on a
+    two-word button. The count is read live rather than carried in the
+    callback, so a stale button cannot understate what is at stake.
+    """
+    wallet_id = int(call.data.split(":", 1)[1])
+    w = await repo.wallet_detail(wallet_id)
+    if w is None:
+        await call.message.answer("That wallet no longer exists.")
+        await call.answer()
+        return
+
+    who = (f"{w['supplier_label']} → {w['client_label']}"
+           if w["is_internal"] else w["owner_label"])
+    lines = [
+        f"Retire this wallet?", "",
+        who,
+        w["address"], "",
+        f"Trades settled through it   {w['trades']}",
+        f"Deposits received           {w['deposits']}",
+        "",
+        "Those stay. The address stops being watched.",
+    ]
+    if w["live_trades"]:
+        lines += [
+            "",
+            f"⚠ {w['live_trades']} LIVE trade on this wallet. Retiring is "
+            "blocked until it closes — the counterparty may be about to "
+            "send to this address.",
+        ]
+    elif w["deposits"]:
+        # Worth saying every time there is history, not only when something
+        # is open. The address does not stop existing on TRON.
+        lines += [
+            "",
+            "⚠ Anything sent to this address afterwards will arrive and the "
+            "bot will not see it. Tell them the address is dead.",
+        ]
+
+    kb = InlineKeyboardMarkup(inline_keyboard=[[
+        InlineKeyboardButton(text="Retire it", callback_data=f"wr_yes:{wallet_id}"),
+        InlineKeyboardButton(text="Cancel", callback_data="wr_no"),
+    ]])
+    await call.message.answer("\n".join(lines), reply_markup=kb)
+    await call.answer()
+
+
+@router.callback_query(F.data.startswith("wr_yes:"))
+async def walletremove_confirm(call: CallbackQuery, party, repo) -> None:
+    wallet_id = int(call.data.split(":", 1)[1])
+    ok, msg, detail = await repo.retire_wallet(
+        wallet_id=wallet_id, actor_party_id=party["id"]
+    )
+    if not ok:
+        await call.message.answer(msg)
+        await call.answer()
+        return
+
+    await call.message.answer(
+        f"{msg}\n\n"
+        f"{detail['trades_kept']} trade(s) and {detail['deposits_kept']} "
+        f"deposit(s) kept.\n"
+        f"{detail['address']} is free to register again with /walletadd."
+    )
+    await call.answer()
+
+
+@router.callback_query(F.data == "wr_no")
+async def walletremove_cancel(call: CallbackQuery) -> None:
+    await call.message.edit_text("Cancelled. No wallet was retired.")
+    await call.answer()
+
+
 # -------------------------------------------------------------- /addvendor
 #
 # Client request, 18 September 2026: "I'm going to create some more FX groups

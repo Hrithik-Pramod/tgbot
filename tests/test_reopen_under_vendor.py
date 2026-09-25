@@ -95,8 +95,11 @@ class _Conn:
             return dict(DEPOSIT)
         if "FROM wallets WHERE id" in s:
             return dict(MALEGAO_WALLET)
-        if "WHERE is_internal AND supplier_id" in s:
-            # The override's lookup: the named supplier's pairing.
+        if "FROM wallets" in s and "client_id = $2" in s:
+            # The override's lookup: the named supplier's pairing. Matched on
+            # the two bound parameters rather than the literal WHERE clause,
+            # which gained "retired_at IS NULL" on 25 September and broke a
+            # substring match that was never about retirement.
             return dict(TATA_WALLET) if self.pairing_exists else None
         if "FROM rates" in s:
             return ({"id": 4, "supply_rate": D("106.2"), "sell_rate": D("107.7")}

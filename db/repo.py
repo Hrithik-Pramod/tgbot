@@ -420,6 +420,7 @@ class Repo:
                 LEFT JOIN parties c ON c.id = w.client_id
                 LEFT JOIN parties o ON o.id = w.owner_party_id
                 LEFT JOIN wallets p ON p.id = w.payout_wallet_id
+                WHERE w.retired_at IS NULL
                 ORDER BY w.is_internal DESC, w.id
                 """
             )
@@ -476,6 +477,7 @@ class Repo:
                 """
                 SELECT id, address, label FROM wallets
                 WHERE owner_party_id = $1 AND NOT is_internal
+                  AND retired_at IS NULL
                 ORDER BY id
                 """,
                 party_id,
@@ -566,7 +568,8 @@ class Repo:
                     taken = await conn.fetchval(
                         """
                         SELECT w.id FROM wallets w
-                        WHERE w.is_internal AND w.supplier_id = $1 AND w.client_id = $2
+                        WHERE w.is_internal AND w.retired_at IS NULL
+                          AND w.supplier_id = $1 AND w.client_id = $2
                         """,
                         supplier_id, client_id,
                     )
@@ -708,10 +711,160 @@ class Repo:
                        m.last_timestamp_ms, m.adopted_at_ms
                 FROM wallets w
                 LEFT JOIN monitor_state m ON m.wallet_id = w.id
-                WHERE w.is_monitored
+                WHERE w.is_monitored AND w.retired_at IS NULL
                 """
             )
 
+
+    async def wallet_detail(self, wallet_id: int) -> Optional[asyncpg.Record]:
+        """
+        One wallet with what hangs off it, for the retire confirmation.
+
+        The counts are read at the moment of asking rather than carried in a
+        callback, so a button pressed on an old message cannot understate
+        what is about to be taken out of service.
+        """
+        async with self.pool.acquire() as conn:
+            return await conn.fetchrow(
+                """
+                SELECT w.id, w.address, w.is_internal, w.retired_at,
+                       s.label AS supplier_label,
+                       c.label AS client_label,
+                       o.label AS owner_label,
+                       (SELECT count(*) FROM trades t
+                          WHERE t.wallet_id = w.id)                AS trades,
+                       (SELECT count(*) FROM trades t
+                          WHERE t.wallet_id = w.id
+                            AND t.status IN ('open','awaiting_payment'))
+                                                                   AS live_trades,
+                       (SELECT count(*) FROM deposits d
+                          WHERE d.wallet_id = w.id)                AS deposits
+                FROM wallets w
+                LEFT JOIN parties s ON s.id = w.supplier_id
+                LEFT JOIN parties c ON c.id = w.client_id
+                LEFT JOIN parties o ON o.id = w.owner_party_id
+                WHERE w.id = $1
+                """,
+                wallet_id,
+            )
+
+    async def retire_wallet(
+        self, *, wallet_id: int, actor_party_id: int,
+    ) -> tuple[bool, str, Optional[dict]]:
+        """
+        Take a wallet out of service without losing what went through it.
+
+        Client request, 25 September 2026: "if i needed to remove an account
+        wallet for a provider, and not have an associated wallet in place,
+        can you add this".
+
+        WHAT IT DOES NOT DO
+
+        Delete. trades.wallet_id and deposits.wallet_id are NOT NULL
+        references — wallet 8 carried ALPH1 to ALPH5 — so a delete either
+        fails or takes settled trades with it. The row stays, keeps its
+        address, and keeps its history. retired_at is what changes, and both
+        unique indexes are partial on it, so the address and the pairing slot
+        are released.
+
+        WHAT IT REFUSES
+
+          a live trade          the counterparty may be holding an
+                                instruction and about to send to this
+                                address; retiring it means their USDT
+                                arrives somewhere nothing is watching
+          a payout target       another pairing settles its client through
+                                this wallet, and that mapping would be left
+                                pointing at a retired row
+          already retired       so a second call cannot rewrite the date
+
+        WHAT IT CANNOT PROTECT AGAINST
+
+        Once retired, the address may be registered again — that is the
+        point. If it is registered to a DIFFERENT pairing, a late deposit
+        from the old counterparty will be attributed to the new vendor.
+        Silent, and wrong rather than missing. The caller is told; the
+        judgement is the Bridge's.
+        """
+        async with self.pool.acquire() as conn:
+            async with conn.transaction():
+                w = await conn.fetchrow(
+                    """
+                    SELECT w.*, s.label AS supplier_label, c.label AS client_label
+                    FROM wallets w
+                    LEFT JOIN parties s ON s.id = w.supplier_id
+                    LEFT JOIN parties c ON c.id = w.client_id
+                    WHERE w.id = $1
+                    FOR UPDATE OF w
+                    """,
+                    wallet_id,
+                )
+                if w is None:
+                    return False, "That wallet no longer exists.", None
+                if w["retired_at"] is not None:
+                    return False, "That wallet is already retired.", None
+
+                live = await conn.fetchval(
+                    """
+                    SELECT count(*) FROM trades
+                    WHERE wallet_id = $1
+                      AND status IN ('open', 'awaiting_payment')
+                    """,
+                    wallet_id,
+                )
+                if live:
+                    return False, (
+                        f"{w['supplier_label']} has {live} live trade"
+                        f"{'' if live == 1 else 's'} on this wallet. Close or "
+                        "cancel them first — retiring it now would stop the "
+                        "bot watching an address they may still send to."
+                    ), None
+
+                dependants = await conn.fetchval(
+                    "SELECT count(*) FROM wallets WHERE payout_wallet_id = $1",
+                    wallet_id,
+                )
+                if dependants:
+                    return False, (
+                        f"{dependants} pairing"
+                        f"{'' if dependants == 1 else 's'} settle their client "
+                        "through this wallet. Point them elsewhere with "
+                        "/walletlink first."
+                    ), None
+
+                trades = await conn.fetchval(
+                    "SELECT count(*) FROM trades WHERE wallet_id = $1", wallet_id
+                )
+                deposits = await conn.fetchval(
+                    "SELECT count(*) FROM deposits WHERE wallet_id = $1", wallet_id
+                )
+
+                await conn.execute(
+                    """
+                    UPDATE wallets
+                    SET retired_at = now(), is_monitored = FALSE
+                    WHERE id = $1
+                    """,
+                    wallet_id,
+                )
+                # The cursor belonged to an address nobody is watching now.
+                await conn.execute(
+                    "DELETE FROM monitor_state WHERE wallet_id = $1", wallet_id
+                )
+
+                detail = {
+                    "address": w["address"],
+                    "supplier": w["supplier_label"],
+                    "client": w["client_label"],
+                    "internal": w["is_internal"],
+                    "trades_kept": trades,
+                    "deposits_kept": deposits,
+                }
+                await self.audit(
+                    conn, actor_party_id=actor_party_id, action="wallet.retired",
+                    entity_type="wallet", entity_id=wallet_id, detail=detail,
+                )
+                return True, f"{w['supplier_label']}'s wallet retired.", detail
 
     async def update_wallet_address(
         self, *, wallet_id: int, new_address: str, actor_party_id: int,
@@ -934,7 +1087,8 @@ class Repo:
                 SELECT DISTINCT s.id, s.label
                 FROM wallets w
                 JOIN parties s ON s.id = w.supplier_id
-                WHERE w.is_internal AND w.client_id = $1 AND s.is_active
+                WHERE w.is_internal AND w.retired_at IS NULL
+                  AND w.client_id = $1 AND s.is_active
                 ORDER BY s.label
                 """,
                 client_id,
@@ -1094,6 +1248,13 @@ class Repo:
                        ON t.supplier_id = s.id
                       AND t.client_id = w.client_id
                       AND t.status IN ('open', 'awaiting_payment')
+                -- Retired pairings are DELIBERATELY still here. This is
+                -- the matcher: a slip for a vendor who has since been
+                -- retired must still read, or it is 16 September again —
+                -- 'unmatched beneficiary Barkaati Textile', a real
+                -- account dropped from the candidates because its trade
+                -- was gone. Money already paid does not stop existing
+                -- because a wallet was taken out of service.
                 WHERE w.is_internal AND w.client_id = $1
                 ORDER BY
                     b.id,
@@ -1256,6 +1417,10 @@ class Repo:
                 FROM wallets w
                 JOIN parties s ON s.id = w.supplier_id
                 JOIN parties c ON c.id = w.client_id
+                -- Retired pairings stay in the book. A retired wallet can
+                -- still hold USDT on a cancelled trade that was never
+                -- invoiced, and hiding that line is how ₹995,495 went
+                -- unnoticed twice. Tidiness is not worth a blind spot.
                 WHERE w.is_internal AND s.is_active AND c.is_active
                 ORDER BY s.label, c.label
                 """
@@ -2170,6 +2335,9 @@ class Repo:
                 FROM deposits d
                 JOIN wallets w ON w.id = d.wallet_id
                 JOIN parties s ON s.id = w.supplier_id
+                -- No retired filter: this answers 'where did this deposit
+                -- land', which is history and does not change when the
+                -- wallet is taken out of service.
                 WHERE d.id = $1 AND w.is_internal
                 """,
                 deposit_id,
@@ -2299,7 +2467,8 @@ class Repo:
                     w = await conn.fetchrow(
                         """
                         SELECT * FROM wallets
-                        WHERE is_internal AND supplier_id = $1 AND client_id = $2
+                        WHERE is_internal AND retired_at IS NULL
+                          AND supplier_id = $1 AND client_id = $2
                         """,
                         supplier_id, landed_on["client_id"],
                     )
