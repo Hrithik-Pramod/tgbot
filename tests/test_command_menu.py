@@ -137,14 +137,16 @@ class TestTheMenusStayApart:
         assert "open_trade_for_supplier" in src
         assert "book_progress" not in src
 
-    # Names the client and the supplier both use, for different things on
-    # their own bots.
+    # Empty, and worth keeping rather than collapsing back into a bare
+    # "assert not client & supplier".
     #
-    #   accounts  the supplier sees the accounts they have registered (their
-    #             own, client request 24 September 2026); the client sees the
-    #             accounts they may pay into for this trade, narrowed on
-    #             11 September to stop it listing the Bridge's whole book
-    CLIENT_SUPPLIER_SHARED = {"accounts"}
+    # On 24 September the vendors' account list shipped as /accounts, which
+    # the client bot already used for a different question — theirs lists
+    # where they may pay, narrowed on 11 September to stop it printing the
+    # Bridge's whole book. The Bridge renamed it to /live the next day, so
+    # the overlap is gone. The set stays so that the next shared word is a
+    # decision somebody writes down, not an accident.
+    CLIENT_SUPPLIER_SHARED: set[str] = set()
 
     def test_the_client_is_not_shown_supplier_commands(self):
         """

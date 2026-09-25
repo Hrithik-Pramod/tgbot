@@ -23,12 +23,18 @@ Every account shown belongs to the party asking. The handler passes
 party["id"] — their own — and list_bank_accounts filters to is_active, so
 "live" is answered by the query rather than by a promise in the text.
 
-/accounts also exists on the CLIENT bot and answers a different question:
-which accounts that client may pay into. That one was narrowed on
-11 September after it listed the Bridge's whole book into a counterparty's
-group. Two commands, one word, two handlers — asserted in
-test_command_menu.py, because one function serving both is how the narrowed
-version gets undone by accident.
+RENAMED TO /live (Bridge, 25 September 2026)
+
+It shipped as /accounts and lasted a day. Two reasons the new name is
+better, not merely different:
+
+  * /account registers one and /accounts listed them — a single character
+    apart, adjacent in the dropdown, on a bot used at speed.
+  * /accounts already existed on the CLIENT bot answering a different
+    question: which accounts that client may pay into, narrowed on
+    11 September after it printed the Bridge's whole book into a
+    counterparty's group. Two bots, one word, two handlers is survivable
+    but it is a trap laid for whoever edits next.
 
 THE TWO SWITCHES
 
@@ -127,7 +133,7 @@ class TestTheNumberIsCopyable:
 
 class TestTheHandlerIsWiredUp:
     def test_it_exists(self):
-        assert hasattr(supplier_bot, "cmd_accounts")
+        assert hasattr(supplier_bot, "cmd_live")
 
     def test_both_html_switches_are_set(self):
         """
@@ -135,7 +141,7 @@ class TestTheHandlerIsWiredUp:
         tags; parse_mode without html=True sends markup-free HTML that looks
         fine and simply cannot be copied. Neither raises.
         """
-        src = inspect.getsource(supplier_bot.cmd_accounts)
+        src = inspect.getsource(supplier_bot.cmd_live)
         assert "html=True" in src
         assert 'parse_mode="HTML"' in src
 
@@ -145,11 +151,11 @@ class TestTheHandlerIsWiredUp:
         list_bank_accounts takes a party id; passing anything but the
         caller's own would hand one vendor another's banking details.
         """
-        src = inspect.getsource(supplier_bot.cmd_accounts)
+        src = inspect.getsource(supplier_bot.cmd_live)
         assert "list_bank_accounts(party['id'])" in src.replace('"', "'")
 
     def test_it_does_not_reach_for_another_partys_list(self):
-        src = inspect.getsource(supplier_bot.cmd_accounts)
+        src = inspect.getsource(supplier_bot.cmd_live)
         for leak in ("suppliers_for_client", "matchable_accounts",
                      "open_trade_accounts", "book_progress"):
             assert leak not in src
@@ -159,29 +165,31 @@ class TestTheHandlerIsWiredUp:
         One place decides what "no accounts" reads like. A separate early
         return in the handler is a second copy to keep in step.
         """
-        src = inspect.getsource(supplier_bot.cmd_accounts)
+        src = inspect.getsource(supplier_bot.cmd_live)
         assert src.count("message.answer") == 1
 
 
 class TestItIsDiscoverable:
     def test_it_is_in_the_supplier_menu(self):
-        assert "accounts" in {c for c, _ in MENUS["supplier"]}
+        assert "live" in {c for c, _ in MENUS["supplier"]}
 
     def test_it_is_not_added_to_the_bridge_menu(self):
         """
         The Bridge has /wallet and /summary for this. An extra entry on his
         list is noise on the one menu that is already fifteen long.
         """
-        assert "accounts" not in {c for c, _ in MENUS["bridge"]}
+        assert "live" not in {c for c, _ in MENUS["bridge"]}
 
     def test_the_description_distinguishes_it_from_slash_account(self):
         """
-        /account and /accounts differ by one character and sit next to each
-        other in the dropdown. The descriptions have to do the work.
+        /live and /account sit next to each other in a five-item dropdown
+        and do opposite things — one reads, one writes. The descriptions
+        have to carry that, since the names no longer look alike enough to
+        be confused but still name the same objects.
         """
         supplier = dict(MENUS["supplier"])
-        assert "accounts" in supplier, "/accounts is not in the supplier menu"
+        assert "live" in supplier, "/live is not in the supplier menu"
         assert "account" in supplier, "/account is not in the supplier menu"
-        assert supplier["accounts"] != supplier["account"]
-        assert "show" in supplier["accounts"].lower()
+        assert supplier["live"] != supplier["account"]
+        assert "show" in supplier["live"].lower()
         assert "register" in supplier["account"].lower()

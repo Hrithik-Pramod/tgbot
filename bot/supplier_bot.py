@@ -149,13 +149,17 @@ async def cmd_progress(message: Message, party, repo) -> None:
 
 # ---------------------------------------------------------- /account_remove
 
-@router.message(Command("accounts"))
-async def cmd_accounts(message: Message, party, repo) -> None:
+@router.message(Command("live"))
+async def cmd_live(message: Message, party, repo) -> None:
     """
     Show a vendor the accounts they have live.
 
     Client request, 24 September 2026: "Just an /accounts, and it shows
-    their accounts and details."
+    their accounts and details." Renamed to /live the next day at his
+    request — and it is the better name: /account adds one and /accounts
+    listed them, two commands one character apart, sitting next to each
+    other in the dropdown. It also ends the collision with /accounts on the
+    client bot, which answers an entirely different question.
 
     Scoped to party["id"] — their own. list_bank_accounts filters to
     is_active, so a removed account does not appear and "live" needs no
