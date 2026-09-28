@@ -1180,11 +1180,25 @@ class Repo:
         async with self.pool.acquire() as conn:
             instructed = await conn.fetch(
                 """
-                SELECT id, account_name, account_number, ifsc, trade_id, reference
+                SELECT id, account_name, account_number, ifsc, trade_id,
+                       reference, outstanding
                 FROM (
                     SELECT DISTINCT ON (b.id)
                            b.id, b.account_name, b.account_number, b.ifsc,
-                           t.id AS trade_id, t.reference
+                           t.id AS trade_id, t.reference,
+                           -- What is still owed on THIS instruction.
+                           --
+                           -- The last thing left to tell two buttons apart
+                           -- when a collection account is shared: the name
+                           -- matches, the number matches, and only the
+                           -- amount differs. The client already holds both
+                           -- figures from their own instructions, and it
+                           -- says nothing about which supplier is behind
+                           -- either (11 September).
+                           t.inr_expected
+                             - COALESCE((SELECT sum(p.amount_inr) FROM payments p
+                                         WHERE p.trade_id = t.id), 0)
+                             AS outstanding
                     FROM trades t
                     JOIN payment_slots ps ON ps.trade_id = t.id
                     JOIN bank_accounts b ON b.party_id = t.supplier_id AND b.is_active
@@ -1209,7 +1223,10 @@ class Repo:
             return await conn.fetch(
                 """
                 SELECT b.id, b.account_name, b.account_number, b.ifsc,
-                       t.id AS trade_id, t.reference
+                       t.id AS trade_id, t.reference,
+                       t.inr_expected
+                         - COALESCE((SELECT sum(p.amount_inr) FROM payments p
+                                     WHERE p.trade_id = t.id), 0) AS outstanding
                 FROM trades t
                 JOIN bank_accounts b ON b.party_id = t.supplier_id AND b.is_active
                 WHERE t.client_id = $1 AND t.status IN ('open', 'awaiting_payment')
@@ -1252,6 +1269,33 @@ class Repo:
         async with self.pool.acquire() as conn:
             return await conn.fetch(
                 """
+                -- ONE CANDIDATE PER ACCOUNT ROW, AND IT MUST STAY THAT WAY.
+                --
+                -- A collection account can be registered under several
+                -- vendors — one of them is shared by three. It is tempting
+                -- to group by (account_number, ifsc) so a shared account
+                -- offers a single answer, and on 28 September 2026 that was
+                -- written, tested and very nearly deployed on the Bridge's
+                -- own description of how they trade:
+                --
+                --     the bot will fill one order at a time ... the client
+                --     is sending until full, then looking at next order
+                --
+                -- The live data said otherwise. At that moment two orders
+                -- were collecting into that one account SIMULTANEOUSLY —
+                -- one ₹1,734,800 short, the other ₹19,400 short. Grouping
+                -- them would have sent the second one's remaining balance
+                -- onto the first trade, because the ordering picks the
+                -- oldest unfilled order.
+                --
+                -- Asked directly, the Bridge confirmed: parallel.
+                --
+                -- So a shared account genuinely cannot be resolved from the
+                -- slip, and the honest answer is to offer every candidate
+                -- and let the client say which — which is what returning
+                -- one row per account row does. The "errors" reported that
+                -- night were the bot asking rather than guessing, and the
+                -- asking is the feature.
                 SELECT DISTINCT ON (b.id)
                        b.id, b.account_name, b.account_number, b.ifsc,
                        s.label AS supplier_label,
@@ -1273,10 +1317,19 @@ class Repo:
                 WHERE w.is_internal AND w.client_id = $1
                 ORDER BY
                     b.id,
+                    -- An account with a live trade beats one without.
                     (t.id IS NULL),
+                    -- One the client has actually been instructed to pay
+                    -- beats one they have not been told about.
                     (t.instructed_at IS NULL),
+                    -- THE "ONE ORDER AT A TIME" RULE. A trade still short
+                    -- of its figure beats one already filled, so payments
+                    -- keep landing on the order being collected until it is
+                    -- complete and only then move to the next.
                     (COALESCE((SELECT sum(p.amount_inr) FROM payments p
                                WHERE p.trade_id = t.id), 0) >= t.inr_expected),
+                    -- And between two unfilled orders on the same account,
+                    -- the older one. First in, first filled.
                     t.opened_at
                 """,
                 client_id,

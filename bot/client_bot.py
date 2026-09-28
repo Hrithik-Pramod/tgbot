@@ -80,14 +80,49 @@ def _account_button(account, among) -> str:
     client already holds the full number from the payment instruction, so
     this tells them nothing they were not given, and nothing about which
     supplier is behind it.
+
+    THE THIRD RUNG (28 September 2026)
+
+    The last four digits stop helping when the account is genuinely SHARED —
+    one multi-collection account registered under three vendors, same name,
+    same number. Both buttons then read identically and the client picks
+    blind, which is the exact failure the second rung was added to prevent.
+
+    That night two orders were collecting into that one account at the same
+    time, ₹1,734,800 and ₹19,400 outstanding. The only thing separating them
+    was the amount, so the amount is what the button shows.
+
+    It leaks nothing. The client was instructed to pay each of those figures
+    and already holds them; what stays hidden, as ever, is which supplier
+    sits behind which.
     """
     name = account["account_name"]
-    clashes = sum(
-        1 for a in among if a["account_name"].strip().lower() == name.strip().lower()
-    )
-    if clashes < 2:
+
+    def same_name(a) -> bool:
+        return a["account_name"].strip().lower() == name.strip().lower()
+
+    if sum(1 for a in among if same_name(a)) < 2:
         return name
-    return f"{name} ••{str(account['account_number'])[-4:]}"
+
+    number = str(account["account_number"])
+    tail = f"{name} ••{number[-4:]}"
+
+    # Does the number actually distinguish it, or is the account shared?
+    if sum(1 for a in among
+           if same_name(a) and str(a["account_number"]) == number) < 2:
+        return tail
+
+    # asyncpg Records raise KeyError for a column the query did not select,
+    # and this helper is called from two paths with different queries.
+    try:
+        outstanding = account["outstanding"]
+    except (KeyError, TypeError, IndexError):
+        outstanding = None
+    if outstanding is None:
+        # Nothing left to separate them by. Better an honest duplicate than
+        # a confident wrong label.
+        return tail
+    return f"{tail} — ₹{fmt_inr(outstanding)} left"
 
 
 def _render_accounts(accounts) -> list[str]:
