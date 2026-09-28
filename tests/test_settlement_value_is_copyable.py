@@ -57,7 +57,7 @@ from core.summary import render_deposit_notification  # noqa: E402
 BASE = dict(
     reference="SUPA22", supplier_label="Supplier A", client_label="Client A",
     usdt_in=D("4708"), inr_out=D("499990"), tx_hash="0xabc",
-    wallet_address="TWusjSZHj3HChBpM3ndBx3Rkdd1wfCujBB",
+    wallet_address="TExampleInternalWalletAddress00000",
     supply_rate=D("106.2"), sell_rate=D("107.7"),
     usdt_out=D("4642.43"),
 )

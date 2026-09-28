@@ -141,12 +141,33 @@ class TestForwardLookingQueriesForgetRetiredWallets:
 
     def test_adding_a_wallet_ignores_the_retired_one(self):
         """
-        The pairing-exists check inside add_wallet. Without the filter a
-        vendor whose wallet is retired could never be given another — which
-        is the entire request.
+        BOTH checks inside add_wallet, named separately.
+
+        This test used to be `assert "w.retired_at IS NULL" in src`, which
+        was true of the pairing check and blind to the address check two
+        lines above it. It passed while /walletadd refused every retired
+        address, and on 28 September the Bridge was left with two vendors
+        dark, mid-trade, unable to put their wallets back.
+
+        A function containing the right string is not a function doing the
+        right thing. The behaviour is covered in
+        tests/test_retired_address_can_be_reused.py; this keeps both call
+        sites honest.
         """
-        src = inspect.getsource(Repo.add_wallet)
-        assert "w.retired_at IS NULL" in src
+        src = " ".join(inspect.getsource(Repo.add_wallet).split())
+        src = src.replace('" "', "")
+
+        address_check = src.split("FROM wallets WHERE address")[1][:120]
+        assert "retired_at IS NULL" in address_check, (
+            "the address clash check does not skip retired wallets, so a "
+            "freed address can never be registered again"
+        )
+
+        pairing_check = src.split("w.is_internal")[1][:120]
+        assert "retired_at IS NULL" in pairing_check, (
+            "the pairing check does not skip retired wallets, so a vendor "
+            "whose wallet is retired can never be given another"
+        )
 
 
 class TestHistoricalQueriesRememberThem:

@@ -18,16 +18,19 @@
 -- The client has paid NOTHING against SUPB1, so no payment has to be
 -- re-attributed — the hard and dangerous part of a split does not arise.
 --
--- And the arithmetic divides exactly, with no rounding drift:
+-- And the arithmetic divides exactly, with no rounding drift: each deposit
+-- is priced at the trade's own snapshotted rates, and the two parts sum to
+-- what the single row held. Figures deliberately not reproduced here — this
+-- repository is public, and live rates and amounts do not belong in it.
 --
---     1,859 x 106     = 197,054      197,054 / 107.2 = 1,838.19
---     3,000 x 106     = 318,000      318,000 / 107.2 = 2,966.42
---     ---------------------------    ----------------------------
---     4,859             515,054                        4,804.61
+--     first deposit   x supply = its own INR   / sell = its own USDT owed
+--     second deposit  x supply = its own INR   / sell = its own USDT owed
+--     -----------------------------------------------------------------
+--     totals unchanged from the row being split
 --
--- 4,804.61 and the 54.39 margin are exactly what the SUPB1 row holds today.
 -- Nothing is lost and nothing is invented; the same totals are simply carried
--- by two rows instead of one.
+-- by two rows instead of one. Read the live figures with the SELECT at the
+-- top of this file before running it.
 --
 -- AFTERWARDS
 --

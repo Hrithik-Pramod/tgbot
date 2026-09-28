@@ -125,8 +125,16 @@ class TestOnboardingRefusesWhatWouldBreakLater:
         """
         A deposit is attributed by the wallet it lands in. Two vendors on one
         address are indistinguishable.
+
+        Narrowed on 28 September to a LIVE address: retirement exists to give
+        an address back, and this check was refusing every retired one, which
+        left two vendors unable to re-register mid-trade. The clause is
+        matched after joining the adjacent string literals it is now split
+        across.
         """
-        assert "FROM wallets WHERE address = $1" in _sql(Repo.onboard_supplier)
+        sql = _sql(Repo.onboard_supplier).replace('" "', "")
+        sql = " ".join(sql.split())
+        assert "FROM wallets WHERE address = $1 AND retired_at IS NULL" in sql
 
 
 class TestANewGroupAnnouncesItsChatId:

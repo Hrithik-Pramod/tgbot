@@ -44,11 +44,11 @@ from core.summary import (render_collection_progress,  # noqa: E402
                           render_mini_statement)
 
 PAYMENTS = [
-    {"utr": "BKIDR12026092100004142", "amount_inr": D("217000"),
+    {"utr": "BKIDR10000000000000001", "amount_inr": D("217000"),
      "account_name": "SUPER TRADING COMPANY (STC)"},
-    {"utr": "BKIDR12026092100004206", "amount_inr": D("307000"),
+    {"utr": "BKIDR10000000000000002", "amount_inr": D("307000"),
      "account_name": "SUPER TRADING COMPANY (STC)"},
-    {"utr": "PUNBR52026092100511473", "amount_inr": D("209000"),
+    {"utr": "PUNBR50000000000000003", "amount_inr": D("209000"),
      "account_name": "royal trading company"},
 ]
 
@@ -79,9 +79,9 @@ class TestEveryUtrIsListed:
     def test_they_are_numbered_in_order(self):
         out = render_mini_statement(
             payments=PAYMENTS, expected_inr=D("1000000"), paid_inr=D("733000"))
-        assert out.index("1. BKIDR12026092100004142") < \
-               out.index("2. BKIDR12026092100004206") < \
-               out.index("3. PUNBR52026092100511473")
+        assert out.index("1. BKIDR10000000000000001") < \
+               out.index("2. BKIDR10000000000000002") < \
+               out.index("3. PUNBR50000000000000003")
 
     def test_nothing_paid_says_so_plainly(self):
         """

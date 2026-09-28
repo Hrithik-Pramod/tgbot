@@ -57,10 +57,10 @@ from bot.menu import MENUS  # noqa: E402
 from core.summary import render_own_accounts  # noqa: E402
 
 ACCOUNTS = [
-    {"account_name": "NASEEM FASHION", "account_number": "0372073000001202",
-     "ifsc": "SIBL0000372"},
-    {"account_name": "royal trading company", "account_number": "50200122887492",
-     "ifsc": "HDFC0002843"},
+    {"account_name": "EXAMPLE FASHION", "account_number": "000000000000001",
+     "ifsc": "SIBL0000000"},
+    {"account_name": "example trading company", "account_number": "500000000000002",
+     "ifsc": "HDFC0000000"},
 ]
 
 
@@ -107,13 +107,13 @@ class TestEveryAccountIsShownWithItsDetails:
 class TestTheNumberIsCopyable:
     def test_it_is_a_code_span_in_html(self):
         out = render_own_accounts(ACCOUNTS, html=True)
-        assert "<code>0372073000001202</code>" in out
-        assert "<code>50200122887492</code>" in out
+        assert "<code>000000000000001</code>" in out
+        assert "<code>500000000000002</code>" in out
 
     def test_it_is_bare_in_plain_text(self):
         out = render_own_accounts(ACCOUNTS, html=False)
         assert "<code>" not in out
-        assert "0372073000001202" in out
+        assert "000000000000001" in out
 
     def test_names_from_user_input_are_escaped(self):
         """

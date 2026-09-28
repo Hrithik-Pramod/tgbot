@@ -289,8 +289,13 @@ class Repo:
                         "prefix, or a continuation of one."
                     ), None
 
+                # Same filter as add_wallet, for the same reason: an address
+                # freed by retirement must be usable again, including for a
+                # vendor onboarded from scratch.
                 if await conn.fetchval(
-                    "SELECT 1 FROM wallets WHERE address = $1", wallet_address
+                    "SELECT 1 FROM wallets "
+                    "WHERE address = $1 AND retired_at IS NULL",
+                    wallet_address,
                 ):
                     return False, "That wallet address is already registered.", None
 
@@ -558,8 +563,18 @@ class Repo:
         """
         async with self.pool.acquire() as conn:
             async with conn.transaction():
+                # retired_at, or a retired wallet goes on reserving its
+                # address for ever and retirement frees nothing.
+                #
+                # 28 September 2026: the Bridge retired BIG BOSS and Uncle
+                # and could not put them back — "tried add, it says already
+                # registered" — with trades arriving for both. The partial
+                # unique index allowed the insert; this check refused it
+                # before the database was ever asked.
                 clash = await conn.fetchval(
-                    "SELECT id FROM wallets WHERE address = $1", address
+                    "SELECT id FROM wallets "
+                    "WHERE address = $1 AND retired_at IS NULL",
+                    address,
                 )
                 if clash is not None:
                     return False, "That address is already registered."

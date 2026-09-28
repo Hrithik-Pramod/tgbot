@@ -6,13 +6,13 @@ WHAT HAPPENED (live, 21 September 2026, mid-trade)
 A payment slip was pasted carrying both ends of the transfer. The bot took
 the wrong one:
 
-    typed:  "from 881410110011285"
-    utr:    BKIDR12026092100006053
+    typed:  "from 900000000000000"
+    utr:    BKIDR10000000000000000
     amount: ₹228,000
 
-881410110011285 is not a registered account and never was — it is the
+900000000000000 is not a registered account and never was — it is the
 client's own, the account the money LEFT. The bot compared
-"from881410110011285" against every supplier account name, matched nothing,
+"from900000000000000" against every supplier account name, matched nothing,
 and asked which account it was.
 
     and what stopped the bot pick up slips?
@@ -23,7 +23,7 @@ HOW IT GOT THERE
 
 classify() ends with "anything that reads as words is a name", which is
 right for "Barkaati Textile" and wrong for any line that happens to contain
-a word. "from 881410110011285" contains "from", so it fell through every
+a word. "from 900000000000000" contains "from", so it fell through every
 other rule and landed on the beneficiary catch-all.
 
 The parser already knew "to" means the beneficiary. It had never been told
@@ -47,23 +47,23 @@ from core.parse import classify, match_account, parse_payments  # noqa: E402
 
 class TestTheSendersLineIsDiscarded:
     def test_the_exact_line_from_the_incident(self):
-        assert classify("from 881410110011285")[0] == "noise"
+        assert classify("from 900000000000000")[0] == "noise"
 
     def test_case_does_not_matter(self):
-        for line in ["From 881410110011285", "FROM 881410110011285"]:
+        for line in ["From 900000000000000", "FROM 900000000000000"]:
             assert classify(line)[0] == "noise"
 
     def test_the_other_words_banks_use(self):
-        for line in ["Sender: 881410110011285",
-                     "Debited from 881410110011285",
-                     "Debit 881410110011285",
-                     "Payer 881410110011285",
+        for line in ["Sender: 900000000000000",
+                     "Debited from 900000000000000",
+                     "Debit 900000000000000",
+                     "Payer 900000000000000",
                      "Remitter: HDFC 0012"]:
             assert classify(line)[0] == "noise", line
 
     def test_a_separator_after_the_word_is_handled(self):
-        for line in ["from: 881410110011285", "from - 881410110011285",
-                     "From. 881410110011285"]:
+        for line in ["from: 900000000000000", "from - 900000000000000",
+                     "From. 900000000000000"]:
             assert classify(line)[0] == "noise", line
 
 
@@ -108,14 +108,14 @@ class TestTheWholeSlipNow:
         unmatched.
         """
         result = parse_payments(
-            "BKIDR12026092100006053\n"
+            "BKIDR10000000000000000\n"
             "228000\n"
-            "from 881410110011285\n"
+            "from 900000000000000\n"
             "to Barkaati Textile"
         )
         assert len(result.payments) == 1
         p = result.payments[0]
-        assert p.utr == "BKIDR12026092100006053"
+        assert p.utr == "BKIDR10000000000000000"
         assert p.amount_inr == D("228000")
         assert p.beneficiary == "Barkaati Textile"
 
@@ -126,14 +126,14 @@ class TestTheWholeSlipNow:
         sender's number as an answer.
         """
         result = parse_payments(
-            "BKIDR12026092100006053\n228000\nfrom 881410110011285"
+            "BKIDR10000000000000000\n228000\nfrom 900000000000000"
         )
         assert len(result.payments) == 1
         assert result.payments[0].beneficiary is None
 
     def test_the_amount_and_utr_survive_a_sender_line(self):
         result = parse_payments(
-            "from 881410110011285\nBKIDR12026092100006053\n228000"
+            "from 900000000000000\nBKIDR10000000000000000\n228000"
         )
         assert result.saw_utr
         assert result.payments[0].amount_inr == D("228000")
