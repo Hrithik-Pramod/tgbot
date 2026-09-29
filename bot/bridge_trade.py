@@ -33,6 +33,8 @@ from aiogram.types import (
     InlineKeyboardMarkup, Message,
 )
 
+from html import escape as esc
+
 from core.money import (
     MoneyError, fmt_inr, fmt_rate, fmt_usdt_plain, round_inr, to_decimal,
 )
@@ -330,15 +332,29 @@ async def _show_final(message, state: FSMContext, repo, *, edit: bool) -> None:
     # cannot drift away from what actually gets sent. The separator marks where
     # one client message ends and the next begins — they go out individually.
     allocated = sum(to_decimal(m) for _, m in data["slots"])
+    # html=True on BOTH, and parse_mode on the send below.
+    #
+    # 29 September 2026: "its doing the copy and paste problem again". The
+    # real sends at confirm_final have carried html=True since 10 September,
+    # so the CLIENT's figures were tap-to-copy and the Bridge's own
+    # confirmation screen — the one he reads and copies the USDT figure off
+    # before pressing Send — was plain text.
+    #
+    # The comment above says this preview is built from the same renderers
+    # "so the preview cannot drift away from what actually gets sent". It
+    # had drifted anyway, because the arguments differed rather than the
+    # renderers.
     preview = "\n\n".join([
         render_send_instruction(
             client_label=trade["client_label"],
             usdt_out=trade["usdt_owed_client"],
             inr_amount=allocated,
             sell_rate=trade["sell_rate"],
+            html=True,
         ),
-        f"To {trade['client_label']}, as {len(slot_objs)} separate message(s):",
-        *[render_payment_slot(s) for s in slot_objs],
+        f"To {esc(trade['client_label'])}, as {len(slot_objs)} separate "
+        "message(s):",
+        *[render_payment_slot(s, html=True) for s in slot_objs],
     ])
 
     await state.set_state(Confirm.final)
@@ -348,9 +364,9 @@ async def _show_final(message, state: FSMContext, repo, *, edit: bool) -> None:
     ]])
 
     if edit:
-        await message.edit_text(preview, reply_markup=kb)
+        await message.edit_text(preview, reply_markup=kb, parse_mode="HTML")
     else:
-        await message.answer(preview, reply_markup=kb)
+        await message.answer(preview, reply_markup=kb, parse_mode="HTML")
 
 
 @router.callback_query(Confirm.final, F.data == "cfyes")
