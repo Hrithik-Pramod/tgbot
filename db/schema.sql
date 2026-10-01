@@ -246,12 +246,34 @@ CREATE TABLE trades (
     -- supplier who sends and goes quiet must never be invisible.
     announced_at    TIMESTAMPTZ,
 
+    -- Set on the SECOND half of a split, pointing at the trade it was carved
+    -- out of (Bridge, 1 October 2026: "it only splits in 2 not anymore than
+    -- this ... let me decide how much the first order is").
+    --
+    -- A deposit row points at one trade and one only, and deposits_tx_unique
+    -- is what stops the same transfer being credited twice, so neither is
+    -- bent to make this work. The deposit stays whole on the first part and
+    -- the second part says here where its USDT came from.
+    --
+    -- A trade holding no deposits of its own is legitimate ONLY when this is
+    -- set. For a parent P the arithmetic that must hold is
+    --
+    --     sum(deposits on P) = P.usdt_received + sum(children.usdt_received)
+    --
+    -- which is why reopening a stranded deposit under a parent, and
+    -- cancelling a parent with a live child, are both refused.
+    split_from_trade_id BIGINT REFERENCES trades(id),
+
     status          trade_status NOT NULL DEFAULT 'open',
     opened_at       TIMESTAMPTZ NOT NULL DEFAULT now(),
     completed_at    TIMESTAMPTZ,
 
     CONSTRAINT trades_reference_unique UNIQUE (reference)
 );
+
+CREATE INDEX trades_split_parent_idx
+    ON trades (split_from_trade_id)
+    WHERE split_from_trade_id IS NOT NULL;
 
 -- B6, as amended 11 September 2026.
 --

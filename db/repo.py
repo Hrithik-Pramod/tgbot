@@ -2387,6 +2387,233 @@ class Repo:
                 trade_id,
             )
 
+    async def split_parts(self, trade_id: int) -> list[asyncpg.Record]:
+        """
+        The second halves carved out of this trade. Empty for every trade
+        that has never been split, which is almost all of them.
+        """
+        async with self.pool.acquire() as conn:
+            return await conn.fetch(
+                """
+                SELECT id, reference, usdt_received, status
+                FROM trades
+                WHERE split_from_trade_id = $1
+                ORDER BY id
+                """,
+                trade_id,
+            )
+
+    async def split_trade(
+        self, *, trade_id: int, first_usdt: Decimal, actor_party_id: int,
+    ) -> tuple[bool, str, Optional[dict]]:
+        """
+        Carve one order into two, the Bridge choosing where the line falls.
+
+        Bridge, 1 October 2026:
+
+            if usdt is deposited, i want the option my end to split the
+            payment ... so 10000 usdt comes in ... i have option to send in
+            2 parts ... it only splits in 2 not anymore than this ... it
+            just needs to let me decide how much the first order is and the
+            ability to send the second part later
+
+        This has been done once already, by hand. On 11 September 2026 a
+        3,000 USDT deposit merged into SUPB1 ten minutes after the client had
+        been instructed to pay for 1,859, and fix-supb1-split.sql carved
+        SUPB2 back out of it in a transaction written line by line with the
+        bot stopped. Every figure in that script was typed by a person.
+
+        WHERE THE DEPOSIT GOES
+
+        Nowhere. A deposit row points at one trade, and deposits_tx_unique is
+        what stops the same transfer being credited twice when the monitor
+        sees it again — neither is worth bending for this. The deposit stays
+        whole on the FIRST part, and the second part records in
+        split_from_trade_id where its USDT came from. The invariant that
+        replaces "every trade's USDT is the sum of its deposits" is
+
+            sum(deposits on parent) = parent.usdt_received
+                                    + sum(children.usdt_received)
+
+        WHY BOTH PARTS ARE PRICED AT THE PARENT'S OWN RATES
+
+        The snapshot on the trade row, never the current rate. The USDT
+        arrived once, under one deal, and a rate change between the deposit
+        landing and the Bridge splitting it must not make half of it worth
+        more than the other half. Each part is priced independently from its
+        own USDT rather than the second being the first subtracted from the
+        total, because a difference of rounded figures is not the rounding of
+        the difference.
+
+        WHAT IT REFUSES
+
+          a trade already issued       the client is holding an instruction
+                                       for the old, larger figure; moving
+                                       the goalposts underneath it is the
+                                       exact fault that made SUPB1 need
+                                       splitting in the first place
+          a trade with payments on it  the money is already attributed, and
+                                       re-attributing payments means moving
+                                       UTRs, which are globally unique
+          a part of an earlier split   "it only splits in 2 not anymore
+          or a trade already split     than this"
+          cancelled or completed       there is nothing live to divide
+          an amount of nothing, or     a part of zero is not a part, and a
+          the whole thing              part of everything is not a split
+        """
+        from core.money import inr_to_usdt, round_usdt, usdt_to_inr
+
+        async with self.pool.acquire() as conn:
+            async with conn.transaction():
+                t = await conn.fetchrow(
+                    "SELECT * FROM trades WHERE id = $1 FOR UPDATE", trade_id
+                )
+                if t is None:
+                    return False, "That trade no longer exists.", None
+
+                ref = t["reference"]
+
+                if t["status"] in ("cancelled", "completed"):
+                    return False, (
+                        f"{ref} is {t['status']}. There is nothing live to split."
+                    ), None
+
+                if t["split_from_trade_id"] is not None:
+                    parent = await conn.fetchval(
+                        "SELECT reference FROM trades WHERE id = $1",
+                        t["split_from_trade_id"],
+                    )
+                    return False, (
+                        f"{ref} is already the second half of {parent}. "
+                        "An order splits in two, and no further."
+                    ), None
+
+                child = await conn.fetchval(
+                    "SELECT reference FROM trades WHERE split_from_trade_id = $1 "
+                    "ORDER BY id LIMIT 1",
+                    trade_id,
+                )
+                if child is not None:
+                    return False, (
+                        f"{ref} has already been split — {child} is its second "
+                        "half. An order splits in two, and no further."
+                    ), None
+
+                if t["instructed_at"] is not None:
+                    return False, (
+                        f"{ref} has already been sent to the client, who is "
+                        "holding an instruction for the full amount. Splitting "
+                        "it now would leave them paying against a figure that no "
+                        "longer exists. Cancel it with /cancel and reopen the "
+                        "deposit, or collect it as one order."
+                    ), None
+
+                paid = await conn.fetchval(
+                    "SELECT COALESCE(sum(amount_inr), 0) FROM payments "
+                    "WHERE trade_id = $1",
+                    trade_id,
+                ) or Decimal(0)
+                if paid > 0:
+                    return False, (
+                        f"{ref} already has ₹{paid:,.2f} logged against it. "
+                        "Splitting it would leave that money attached to half a "
+                        "trade. Use /correct to move the payment first."
+                    ), None
+
+                total = Decimal(t["usdt_received"])
+                first = round_usdt(Decimal(first_usdt))
+
+                if first <= 0:
+                    return False, "The first part has to be more than zero.", None
+                if first >= total:
+                    return False, (
+                        f"{ref} holds {total:f} USDT in total. The first part "
+                        "has to be less than that, or there is no second part."
+                    ), None
+
+                second = round_usdt(total - first)
+
+                supply, sell = t["supply_rate"], t["sell_rate"]
+
+                first_inr = usdt_to_inr(first, supply)
+                first_owed = inr_to_usdt(first_inr, sell)
+                first_margin = round_usdt(first - first_owed)
+
+                second_inr = usdt_to_inr(second, supply)
+                second_owed = inr_to_usdt(second_inr, sell)
+                second_margin = round_usdt(second - second_owed)
+
+                new_ref = await self.next_reference(conn, t["supplier_id"])
+
+                new_id = await conn.fetchval(
+                    """
+                    INSERT INTO trades (
+                        reference, supplier_id, client_id, wallet_id, rate_id,
+                        supply_rate, sell_rate, supplier_label_at_trade,
+                        usdt_received, inr_expected, usdt_owed_client,
+                        margin_usdt, nominated_account_id,
+                        split_from_trade_id, status, opened_at, announced_at)
+                    VALUES ($1,$2,$3,$4,$5,$6,$7,
+                            -- The name the deal was struck under, carried
+                            -- across rather than looked up again: both halves
+                            -- are the same deal and must read back the same
+                            -- way even if the vendor is renamed tomorrow.
+                            --
+                            -- The fallback is for a parent opened before the
+                            -- column existed, where NULL means "we never
+                            -- recorded it" and the live label is what every
+                            -- reader already shows for it. Taken off the
+                            -- supplier_id this INSERT is using, so it cannot
+                            -- disagree with the vendor being billed.
+                            COALESCE($8, (SELECT label FROM parties WHERE id = $2)),
+                            $9,$10,$11,$12,$13,$14,'awaiting_payment',$15,now())
+                    RETURNING id
+                    """,
+                    new_ref, t["supplier_id"], t["client_id"], t["wallet_id"],
+                    t["rate_id"], supply, sell, t["supplier_label_at_trade"],
+                    second, second_inr, second_owed, second_margin,
+                    t["nominated_account_id"], trade_id, t["opened_at"],
+                )
+
+                await conn.execute(
+                    """
+                    UPDATE trades
+                    SET usdt_received = $2, inr_expected = $3,
+                        usdt_owed_client = $4, margin_usdt = $5,
+                        -- The threshold is a proportion of a total that has
+                        -- just changed, so the one warning this trade gets is
+                        -- owed against the new figure, not the old one.
+                        nearing_completion_notified = FALSE
+                    WHERE id = $1
+                    """,
+                    trade_id, first, first_inr, first_owed, first_margin,
+                )
+
+                detail = {
+                    "from_usdt": total,
+                    "first": {
+                        "reference": ref, "trade_id": trade_id, "usdt": first,
+                        "inr_expected": first_inr, "usdt_owed": first_owed,
+                    },
+                    "second": {
+                        "reference": new_ref, "trade_id": new_id, "usdt": second,
+                        "inr_expected": second_inr, "usdt_owed": second_owed,
+                    },
+                    "supply_rate": supply, "sell_rate": sell,
+                }
+
+                await self.audit(
+                    conn, actor_party_id=actor_party_id, action="trade.split",
+                    entity_type="trade", entity_id=trade_id, detail=detail,
+                )
+                await self.audit(
+                    conn, actor_party_id=actor_party_id,
+                    action="trade.split_created", entity_type="trade",
+                    entity_id=new_id, detail=detail,
+                )
+
+                return True, f"{ref} split into {ref} and {new_ref}.", detail
+
     async def live_trades_on_account(
         self, *, client_id: int, account_number: str, ifsc: str,
     ) -> list[asyncpg.Record]:
@@ -2747,6 +2974,28 @@ class Repo:
                         return False, (
                             f"That deposit is on a trade that is {status}. "
                             "It already has one."
+                        ), None
+
+                    # Part of this deposit is already funding a second trade.
+                    # Reopening it would open a trade for the WHOLE amount
+                    # while that second one is still live and still owed, and
+                    # the same USDT would be billed twice. The deposit is only
+                    # stranded to the extent the cancelled trade claimed it.
+                    sibling = await conn.fetchrow(
+                        """
+                        SELECT reference, status FROM trades
+                        WHERE split_from_trade_id = $1
+                        ORDER BY id LIMIT 1
+                        """,
+                        source_id,
+                    )
+                    if sibling is not None and sibling["status"] != "cancelled":
+                        return False, (
+                            f"That deposit was split, and {sibling['reference']} "
+                            f"is still {sibling['status']} on part of it. "
+                            f"Reopening the whole deposit would bill the same "
+                            f"USDT twice. Cancel {sibling['reference']} first if "
+                            f"the whole send is to be reopened."
                         ), None
 
                 w = await conn.fetchrow(

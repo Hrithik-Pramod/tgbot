@@ -54,6 +54,11 @@ class Confirm(StatesGroup):
     final = State()
 
 
+class Split(StatesGroup):
+    """Carving one deposit into two orders. One question: how big is the first."""
+    amount = State()
+
+
 class Cancel(StatesGroup):
     pick = State()
     why = State()
@@ -174,6 +179,20 @@ async def confirm_start(call: CallbackQuery, state: FSMContext, repo) -> None:
         mark = "✓ " if a["id"] == nominated else ""
         rows.append([InlineKeyboardButton(
             text=f"{mark}{a['account_name']}", callback_data=f"cfa:{a['id']}"
+        )])
+
+    # The split offer sits here because here is the only moment it is safe.
+    # Before this screen there is nothing to split; after the instruction goes
+    # out the client is holding a figure, and moving it underneath them is the
+    # exact fault that made SUPB1 need splitting by hand on 11 September.
+    #
+    # Shown only when it would actually work, so the button is never a button
+    # that answers back. /cancel spent three days with dead buttons on it.
+    if await _can_split(trade, repo):
+        rows.append([InlineKeyboardButton(
+            text=f"Split {fmt_usdt_plain(trade['usdt_received'])} USDT "
+                 "into 2 orders",
+            callback_data=f"sp:{trade_id}",
         )])
 
     note = ""
@@ -564,6 +583,157 @@ async def confirm_restart(call: CallbackQuery, state: FSMContext) -> None:
 
 
 # ======================================================================
+# Splitting one deposit into two orders
+# ======================================================================
+#
+# Bridge, 1 October 2026:
+#
+#     if usdt is deposited, i want the option my end to split the payment
+#     so 10000 usdt comes in, with bank instructions
+#     i have option to send in 2 parts
+#     Make it as least complicated it only splits in 2 not anymore than this
+#     it just needs to let me decide how much the first order is
+#     and the ability to send the second part later
+#
+# So: one button, one question, two orders. The second half is a normal trade
+# from the moment it exists — it appears in /issue, /live, /progress and the
+# exports with its own reference, and is sent whenever he is ready. "Later" is
+# not a state the bot has to hold.
+
+async def _can_split(trade, repo) -> bool:
+    """
+    Whether this trade can still be divided — the same conditions
+    repo.split_trade enforces, asked before the button is drawn rather than
+    after it is pressed.
+
+    The repo check is the real one and stays. This exists so the Bridge is
+    not offered a split that will refuse, and the two must not drift: see
+    tests/test_split_into_two_orders.py.
+    """
+    if trade["instructed_at"] is not None:
+        return False
+    if (trade["paid_inr"] or Decimal(0)) > 0:
+        return False
+    if trade.get("split_from_trade_id") is not None:
+        return False
+    if Decimal(trade["usdt_received"] or 0) <= 0:
+        return False
+    return not await repo.split_parts(trade["id"])
+
+
+@router.callback_query(F.data.startswith("sp:"))
+async def split_start(call: CallbackQuery, state: FSMContext, repo) -> None:
+    trade_id = int(call.data.split(":", 1)[1])
+    trade = await repo.trade_detail(trade_id)
+
+    if trade is None:
+        await call.answer("That trade no longer exists.", show_alert=True)
+        return
+    if not await _can_split(trade, repo):
+        await call.answer(
+            "That order can no longer be split. It has either been sent to "
+            "the client, been paid against, or been split already.",
+            show_alert=True,
+        )
+        return
+
+    total = Decimal(trade["usdt_received"])
+
+    # The Confirm flow may be mid-conversation on this trade. Replacing the
+    # state rather than adding to it, so a half-built allocation cannot be
+    # applied to a trade whose total is about to change underneath it.
+    await state.set_state(Split.amount)
+    await state.update_data(split_trade_id=trade_id, split_total=str(total))
+
+    # edit_text, not answer: the message being replaced is the account list,
+    # whose buttons belong to Confirm.account — a state we have just left. Left
+    # on screen they would be taps that reach nothing, which is the fault
+    # /cancel carried for three days.
+    await call.message.edit_text(
+        f"{trade['reference']} holds {fmt_usdt_plain(total)} USDT.\n\n"
+        "How much should the FIRST order be? Send just the number in USDT.\n"
+        "The rest becomes a second order you can send whenever you like.",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[[
+            InlineKeyboardButton(text="Leave it as one order",
+                                 callback_data="spno")
+        ]]),
+    )
+    await call.answer()
+
+
+@router.callback_query(Split.amount, F.data == "spno")
+async def split_abandon(call: CallbackQuery, state: FSMContext) -> None:
+    await state.clear()
+    await call.message.edit_text(
+        "Left as one order. Nothing changed. Run /issue when you want to send it."
+    )
+    await call.answer()
+
+
+@router.message(Split.amount)
+async def split_amount_typed(
+    message: Message, state: FSMContext, party, repo
+) -> None:
+    data = await state.get_data()
+    total = to_decimal(data["split_total"])
+
+    try:
+        first = to_decimal(message.text or "")
+    except MoneyError:
+        await message.answer(
+            "I could not read that as an amount. Send just the number of USDT "
+            "for the first order — for example 4000."
+        )
+        return
+
+    if first <= 0 or first >= total:
+        await message.answer(
+            f"The first order has to be between 0 and "
+            f"{fmt_usdt_plain(total)} USDT, so that there is a second one. "
+            "Send a different number."
+        )
+        return
+
+    ok, msg, detail = await repo.split_trade(
+        trade_id=data["split_trade_id"], first_usdt=first,
+        actor_party_id=party["id"],
+    )
+    await state.clear()
+
+    if not ok:
+        await message.answer(msg)
+        return
+
+    a, b = detail["first"], detail["second"]
+    log.info("trade %s split into %s and %s", a["reference"], a["reference"],
+             b["reference"])
+
+    await message.answer(
+        "\n".join([
+            f"Split at {fmt_rate(detail['supply_rate'])} / "
+            f"{fmt_rate(detail['sell_rate'])}, the rates this deposit "
+            "already had.",
+            "",
+            f"{a['reference']}  {fmt_usdt_plain(a['usdt'])} USDT  "
+            f"→ client pays ₹{fmt_inr(a['inr_expected'])}",
+            f"{b['reference']}  {fmt_usdt_plain(b['usdt'])} USDT  "
+            f"→ client pays ₹{fmt_inr(b['inr_expected'])}",
+            "",
+            "Send whichever you like, now or later. Neither has gone to the "
+            "client yet.",
+        ]),
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(
+                text=f"Send {a['reference']} now",
+                callback_data=f"cf:{a['trade_id']}")],
+            [InlineKeyboardButton(
+                text=f"Send {b['reference']} now",
+                callback_data=f"cf:{b['trade_id']}")],
+        ]),
+    )
+
+
+# ======================================================================
 # /reprice
 # ======================================================================
 #
@@ -917,6 +1087,32 @@ async def _finish_cancel(target, state: FSMContext, party, repo, reason: str) ->
     stranded = await repo.stranded_deposits(data["trade_id"])
     if not stranded:
         await target.answer(msg)
+        return
+
+    # A split deposit is not stranded in the way this offer assumes. The
+    # deposit row sits on the first part, but its USDT funds two trades, and
+    # reopening the whole of it while the second part is still live would
+    # invoice the same money twice. So the offer is replaced by the fact.
+    live_parts = [
+        p for p in await repo.split_parts(data["trade_id"])
+        if p["status"] != "cancelled"
+    ]
+    if live_parts:
+        await target.answer("\n".join([
+            msg,
+            "",
+            "This order was split, and "
+            + ", ".join(
+                f"{p['reference']} ({fmt_usdt_plain(p['usdt_received'])} USDT)"
+                for p in live_parts
+            )
+            + " is still live on part of the same deposit.",
+            "",
+            "The deposit record holds the whole send, so reopening it from "
+            "here would invoice USDT the live part is already invoicing. "
+            "Cancel the other part too if the whole send is to be reopened, "
+            "and then this offer comes back.",
+        ]))
         return
 
     lines = [

@@ -356,13 +356,27 @@ fi
 # quietest: giving a deposit its own trade leaves the trade it came from
 # claiming USDT it no longer holds. SUPB3 was sitting in that gap on
 # 18 September while this line read green.
+# Amended 1 October 2026, when one deposit was allowed to fund two orders.
+#
+# The deposit row stays whole on the first part — deposits_tx_unique is what
+# stops the same transfer being credited twice and is not worth bending — so
+# per-trade the figures NO LONGER match by design, and checked per trade this
+# line would cry wolf on every split until someone stopped reading it.
+#
+# The invariant moves up a level, to the family: a trade and the part carved
+# out of it must between them claim exactly the USDT their deposits hold.
+# Splits go one deep and no further, so the parent id is the whole family.
+# This still catches everything the per-trade version caught, because an
+# unsplit trade is a family of one.
 DRIFT="$(q "SELECT count(*) FROM (
-                SELECT t.id
+                SELECT COALESCE(t.split_from_trade_id, t.id) AS family
                 FROM trades t
-                LEFT JOIN deposits d ON d.trade_id = t.id
-                GROUP BY t.id, t.usdt_received
-                HAVING COALESCE(sum(d.amount_usdt), 0) <> t.usdt_received
-                   AND t.usdt_received > 0
+                LEFT JOIN (SELECT trade_id, sum(amount_usdt) AS got
+                           FROM deposits GROUP BY trade_id) d
+                       ON d.trade_id = t.id
+                GROUP BY COALESCE(t.split_from_trade_id, t.id)
+                HAVING sum(t.usdt_received) <> COALESCE(sum(d.got), 0)
+                   AND sum(t.usdt_received) > 0
             ) x")"
 if [ "${DRIFT:-0}" -eq 0 ]; then
     ok "every trade's USDT matches its deposits"
