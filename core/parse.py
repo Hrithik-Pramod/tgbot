@@ -459,6 +459,89 @@ def _has_live_trade(account) -> bool:
         return False
 
 
+def shared_account_for(name: Optional[str], accounts) -> Optional[tuple]:
+    """
+    When a name is ambiguous, is it ambiguous because ONE account is
+    registered to several vendors?
+
+    Returns (account_number, ifsc) if so, otherwise None.
+
+    THE DISTINCTION THIS DRAWS (Bridge, 1 October 2026)
+
+        when 1 account is across 2 clients, is there a way we can make bot
+        clear on this? ... think Bot cannot distinguish two seperate orders
+        to 1 account
+
+    Two different kinds of ambiguity reach match_account as the same None:
+
+      two vendors, two DIFFERENT accounts, same holder name
+            13 September: "Girish Kumar Ahirwar" at two banks. The client
+            knows which one they paid and can say so — the last four digits
+            tell them apart. Asking the client is right.
+
+      two vendors, ONE account
+            A multi-collection account. The client cannot answer, because
+            from their side there is only one account and only one payment.
+            Nothing on the slip distinguishes the orders. Asking them is
+            asking a question they have no way to answer, and on
+            30 September that produced three payments on the wrong order.
+
+    Only the second is the Bridge's to answer, so only the second is
+    detected here. Everything else is left exactly as it was.
+    """
+    if not name:
+        return None
+
+    def norm(s: str) -> str:
+        return re.sub(r"[^a-z0-9]", "", s.lower())
+
+    target = norm(name)
+    if not target:
+        return None
+
+    hits = [a for a in accounts if norm(a["account_name"]) == target]
+    if len(hits) < 2:
+        # Partial matches are deliberately not considered. A guess about
+        # which account was meant, combined with a guess about which order,
+        # is two guesses deep — and the second one moves money.
+        return None
+
+    keys = {(str(a["account_number"]), str(a["ifsc"])) for a in hits}
+    if len(keys) != 1:
+        return None          # different accounts; the client can answer that
+    return keys.pop()
+
+
+def choose_established_path(trades) -> Optional[int]:
+    """
+    Which order is already being collected into this account.
+
+    THE RULE (Bridge, 1 October 2026)
+
+        if a trade is in flow, and a different vendor chooses same account
+        for deposiits, the flow of the original is not interupted as the
+        path is already set
+
+    An order that has taken money into this account is the one the client is
+    working through. A second vendor opening an order on the same account
+    does not change that, and must not interrupt it — so no question is
+    asked while a path exists.
+
+    The path is DERIVED rather than stored. A stored choice is another piece
+    of state to keep in step with reality, and it would go stale the moment a
+    trade completed or was cancelled. "Has it started collecting and is it
+    still short" answers the same question from facts already in the ledger.
+
+    Returns the trade id, or None when there is no path — either nothing has
+    started, or more than one has, and in both cases the Bridge is asked.
+    """
+    started = [t for t in trades
+               if t["collected"] > 0 and t["collected"] < t["inr_expected"]]
+    if len(started) == 1:
+        return started[0]["id"]
+    return None
+
+
 def match_beneficiary(name: Optional[str], accounts) -> Optional[int]:
     """
     Match a beneficiary, breaking a tie on which supplier actually sent.

@@ -435,4 +435,56 @@ CREATE TABLE monitor_state (
     adopted_at_ms       BIGINT
 );
 
+
+-- ---------------------------------------------------------------- held payments
+--
+-- A payment the bot refuses to allocate on its own, waiting on the Bridge.
+--
+-- Two vendors can collect into one bank account — "a multi collection
+-- account, not owned by any one" (Bridge, 28 September 2026). When both have
+-- an order open, a slip naming that account cannot say which order it is
+-- for: the UTR, the amount and the beneficiary name are identical either
+-- way. On 30 September three payments were put on the wrong order that way
+-- and took two days to find.
+--
+-- So the bot asks the Bridge, who knows which order is which. The client is
+-- not asked: they do not know the orders exist, and telling them would leak
+-- the shape of the book (11 September).
+--
+-- It is written down rather than held in memory because the wait between
+-- question and answer is where money disappears. Four payments totalling
+-- ₹902,460 were lost in exactly that window on 11 September 2026 — a pending
+-- conversation in MemoryStorage, never answered, discarded by a restart.
+CREATE TABLE held_payments (
+    id              BIGSERIAL PRIMARY KEY,
+
+    client_id       BIGINT      NOT NULL REFERENCES parties(id),
+
+    utr             TEXT        NOT NULL,
+    amount_inr      NUMERIC(20, 2) NOT NULL CHECK (amount_inr > 0),
+
+    -- The PHYSICAL account named on the slip, not an account row. Several
+    -- rows share these two values, which is the whole reason this payment is
+    -- waiting; naming one of them would be the guess being avoided.
+    account_number  TEXT        NOT NULL,
+    ifsc            TEXT        NOT NULL,
+
+    chat_id         BIGINT,
+    message_id      BIGINT,
+
+    asked_at        TIMESTAMPTZ NOT NULL DEFAULT now(),
+    chased_at       TIMESTAMPTZ,
+
+    resolved_at     TIMESTAMPTZ,
+    resolved_trade_id BIGINT    REFERENCES trades(id),
+
+    -- payments.utr is unique because one transfer is one payment. The same
+    -- must hold while it waits, or a client re-pasting an unanswered slip
+    -- would queue it twice and record it twice when the Bridge answers.
+    CONSTRAINT held_payments_utr_unique UNIQUE (utr)
+);
+
+CREATE INDEX held_payments_waiting_idx
+    ON held_payments (asked_at) WHERE resolved_at IS NULL;
+
 COMMIT;

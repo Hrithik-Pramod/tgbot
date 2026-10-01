@@ -50,6 +50,80 @@ class Notifier:
             # where losing the deposit is not.
             log.exception("failed to notify bridge channel")
 
+    async def ask_which_order(
+        self, *, held_id: int, utr: str, amount_inr, account_number: str,
+        trades,
+    ) -> None:
+        """
+        One account, two live orders. Ask the Bridge which this belongs to.
+
+        THE REQUEST (Bridge, 1 October 2026)
+
+            think the bot asks something, on my side ... it asks, which
+            trade ... but if the bot asks me, it needs to tell me the time or
+            the age of each trade ... so it say send to XXX or XXX buttons,
+            with a time it was added. i choose, it sets the bot off on the
+            right path
+
+        The time is on the buttons as he asked. The OUTSTANDING figure is on
+        them too, because on 30 September that was the decisive fact and the
+        age was not: a ₹390,000 slip went onto an order with ₹60,439 left to
+        collect, and the balance would have made that obviously wrong at a
+        glance where "opened at 16:38" would not.
+
+        This goes to the Bridge and never to the client. The client does not
+        know these orders exist, and showing them would hand a counterparty
+        the shape of the book (11 September 2026).
+        """
+        from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup
+
+        rows = [[InlineKeyboardButton(
+            text=(f"{t['reference']} · {t['opened_at']:%d %b %H:%M} · "
+                  f"₹{fmt_inr(t['outstanding'])} left"),
+            callback_data=f"hp:{held_id}:{t['id']}",
+        )] for t in trades]
+
+        await self.to_bridge(
+            "WHICH ORDER?\n\n"
+            f"₹{fmt_inr(amount_inr)} arrived into an account two vendors "
+            "share, and both have an order open. The slip cannot say which "
+            "one it is for.\n\n"
+            f"UTR {utr}\n"
+            f"Account ...{account_number[-4:]}\n\n"
+            "Nothing is recorded until you pick. Once you do, the rest of "
+            "this order's payments follow the same path without asking "
+            "again.",
+            reply_markup=InlineKeyboardMarkup(inline_keyboard=rows),
+        )
+
+    async def chase_held_payments(self, older_than_minutes: int = 15) -> int:
+        """
+        Remind the Bridge about payments still waiting on an answer.
+
+        A held payment is money the client has sent and the ledger does not
+        know about. On 11 September 2026 four of them, ₹902,460, sat in an
+        unanswered prompt until a restart discarded them, and the first
+        anyone knew was the client asking about a balance.
+
+        Once each, not on every sweep: a notice that repeats is a notice
+        nobody reads, and this one has to be read.
+        """
+        waiting = await self.repo.waiting_held_payments(
+            older_than_minutes=older_than_minutes
+        )
+        for h in waiting:
+            await self.to_bridge(
+                "STILL WAITING — a payment is not recorded.\n\n"
+                f"₹{fmt_inr(h['amount_inr'])}   UTR {h['utr']}\n"
+                f"Account ...{h['account_number'][-4:]}\n"
+                f"Asked {h['asked_at']:%d %b %H:%M}\n\n"
+                "Two vendors share this account and I will not guess between "
+                "their orders. Until you pick one, this money is not on "
+                "anyone's books."
+            )
+            await self.repo.mark_held_chased(h["id"])
+        return len(waiting)
+
     async def to_party(self, party_id: int, text: str, *, html: bool = False) -> None:
         async with self.repo.pool.acquire() as conn:
             row = await conn.fetchrow(

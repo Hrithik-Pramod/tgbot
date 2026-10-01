@@ -1204,6 +1204,59 @@ async def leave_stranded_deposit(call: CallbackQuery, party, repo) -> None:
 # /correct  (answer E5)
 # ======================================================================
 
+@router.callback_query(F.data.startswith("hp:"))
+async def place_held_payment(call: CallbackQuery, party, repo, notifier) -> None:
+    """
+    The Bridge picks which order a held payment belongs to.
+
+    Not state-gated. The question can sit for an hour before anyone answers
+    it, a restart may happen in between, and a button that dies in the
+    meantime would leave the money exactly where it was before — unrecorded
+    and now unanswerable (22 September, and 11 September before that).
+
+    Idempotent by construction: resolve_held_payment refuses a hold that is
+    already resolved, so two taps on the same button record one payment.
+    """
+    _, held_id, trade_id = call.data.split(":", 2)
+
+    held = await repo.held_payment(int(held_id))
+    if held is None:
+        await call.message.answer("That payment is no longer waiting.")
+        await call.answer()
+        return
+
+    trades = await repo.live_trades_on_account(
+        client_id=held["client_id"],
+        account_number=held["account_number"], ifsc=held["ifsc"],
+    )
+    chosen = next((t for t in trades if t["id"] == int(trade_id)), None)
+    if chosen is None:
+        await call.message.answer(
+            "That order is no longer open. Use /correct to place this one by "
+            "hand."
+        )
+        await call.answer()
+        return
+
+    ok, msg = await repo.resolve_held_payment(
+        held_id=int(held_id), trade_id=chosen["id"],
+        account_id=chosen["account_id"], actor_party_id=party["id"],
+    )
+    await call.message.answer(
+        msg if not ok else
+        f"{msg}\n\n"
+        f"{chosen['vendor']} — ₹{fmt_inr(chosen['outstanding'] - held['amount_inr'])} "
+        "still to collect.\n\n"
+        "The rest of this order's payments will follow the same path without "
+        "asking again."
+    )
+    await call.answer()
+
+    # A payment landing can be the one that finishes the trade.
+    if ok and notifier is not None:
+        await notifier.check_completion(chosen["id"])
+
+
 @router.message(Command("correct"))
 async def cmd_correct(message: Message, state: FSMContext, repo) -> None:
     trades = await repo.recent_completed_trades(10)

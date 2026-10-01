@@ -28,7 +28,10 @@ from aiogram.types import (
 from core.money import (
     MoneyError, fmt_inr, fmt_inr_plain, normalise_utr, round_inr, to_decimal,
 )
-from core.parse import match_beneficiary, parse_payments
+from core.parse import (
+    choose_established_path, match_beneficiary, parse_payments,
+    shared_account_for,
+)
 from core.summary import (
     CLIENT_CLOSING_SUMMARY, Payment, render_completion_notice,
     render_supplier_summary, render_trade_summary,
@@ -123,6 +126,73 @@ def _account_button(account, among) -> str:
         # a confident wrong label.
         return tail
     return f"{tail} — ₹{fmt_inr(outstanding)} left"
+
+
+async def _place_on_shared_account(message, p, matchable, party, repo, notifier):
+    """
+    One account, two vendors. Decide without asking the client.
+
+    Returns the line to show them, or None when this is not that case — in
+    which case the caller carries on exactly as before. Every other kind of
+    unmatched name still goes to the client, including two vendors at two
+    different banks under one holder's name, which they can answer.
+
+    THREE OUTCOMES
+
+      not this case          None, and nothing has happened
+      a path is set          recorded against the order already collecting,
+                             silently, because that is what the client is
+                             working through (Bridge: "the flow of the
+                             original is not interupted")
+      no path                held in the database and the Bridge is asked
+
+    The client is never told there are two orders. They do not know the
+    orders exist and it is not theirs to know (11 September disclosure).
+    """
+    key = shared_account_for(p.beneficiary, matchable)
+    if key is None:
+        return None
+    account_number, ifsc = key
+
+    trades = await repo.live_trades_on_account(
+        client_id=party["id"], account_number=account_number, ifsc=ifsc,
+    )
+    if len(trades) < 2:
+        # The names clashed but only one order is live, so there is nothing
+        # to decide. match_beneficiary's own tiebreak already covers this;
+        # falling through keeps one behaviour rather than two.
+        return None
+
+    path = choose_established_path(trades)
+    if path is not None:
+        chosen = next(t for t in trades if t["id"] == path)
+        ok, _ = await repo.add_payment(
+            trade_id=chosen["id"], utr=p.utr, amount_inr=p.amount_inr,
+            beneficiary_account_id=chosen["account_id"],
+            added_by=party["id"],
+        )
+        if not ok:
+            # A duplicate, almost certainly. Let the ordinary path report it
+            # properly rather than inventing a second way of saying so.
+            return None
+        name = next((a["account_name"] for a in matchable
+                     if str(a["account_number"]) == account_number), None)
+        return f"to {name}" if name else "recorded"
+
+    held, held_id = await repo.hold_payment(
+        client_id=party["id"], utr=p.utr, amount_inr=p.amount_inr,
+        account_number=account_number, ifsc=ifsc,
+        chat_id=message.chat.id, message_id=message.message_id,
+    )
+    if not held:
+        return None          # already recorded or already waiting
+
+    if notifier is not None:
+        await notifier.ask_which_order(held_id=held_id, utr=p.utr,
+                                       amount_inr=p.amount_inr,
+                                       account_number=account_number,
+                                       trades=trades)
+    return "held — being confirmed, nothing further needed from you"
 
 
 def _render_accounts(accounts) -> list[str]:
@@ -421,9 +491,34 @@ async def on_pasted_payment(message: Message, state: FSMContext, party, repo,
     by_id = {a["id"]: a for a in matchable}
 
     staged, lines = [], ["Read this as:", ""]
+    held_any = False
     for p in result.payments:
         account_id = match_beneficiary(p.beneficiary, matchable)
         row = by_id.get(account_id)
+
+        # One account, two vendors, both with an order open.
+        #
+        # The client cannot answer "which order" — from their side there is
+        # one account and one payment, and nothing on the slip distinguishes
+        # the two. Asking them produced three payments on the wrong order on
+        # 30 September. So this case alone goes to the Bridge instead, who
+        # knows which order is which (his request, 1 October 2026).
+        #
+        # Every other kind of unmatched name is untouched and still asks the
+        # client, including two vendors at two different banks under the same
+        # holder name — they CAN answer that one.
+        if account_id is None:
+            placed = await _place_on_shared_account(
+                message, p, matchable, party, repo, notifier
+            )
+            if placed is not None:
+                held_any = True
+                lines.append(p.utr)
+                lines.append(fmt_inr_plain(p.amount_inr))
+                lines.append(placed)
+                lines.append("")   # same spacing as every other entry
+                continue
+
         staged.append({
             "utr": p.utr, "amount": str(p.amount_inr), "account_id": account_id,
             "trade_id": row["trade_id"] if row else None,
@@ -479,6 +574,13 @@ async def on_pasted_payment(message: Message, state: FSMContext, party, repo,
                 },
             )
         lines.append("")
+
+    # Everything in this message was placed or held on the Bridge's side.
+    # There is nothing left for the client to confirm or be asked.
+    if held_any and not staged:
+        await state.clear()
+        await message.reply("\n".join(lines))
+        return
 
     # Matched an account, but that supplier has nothing open to record it
     # against. The account is real and the client paid it — this is the

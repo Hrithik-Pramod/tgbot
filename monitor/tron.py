@@ -443,6 +443,25 @@ class DepositMonitor:
         await self._report_unconfirmed()
         await self._report_unmatched_sends()
         await self._release_held_announcements()
+        await self._chase_held_payments()
+
+    async def _chase_held_payments(self) -> None:
+        """
+        A payment waiting on the Bridge is money off the books.
+
+        When two vendors share an account the bot holds the payment and asks
+        which order it belongs to. Until that is answered the client has sent
+        money the ledger knows nothing about — which is the 11 September
+        ₹902,460 exactly: four payments in an unanswered prompt, lost to a
+        restart, discovered when the client asked about a balance.
+
+        Swallowed like every other sweep step. A reminder failing must never
+        stop the polling that detects deposits.
+        """
+        try:
+            await self.notifier.chase_held_payments()
+        except Exception:
+            log.exception("could not chase held payments")
 
     async def _release_held_announcements(self) -> None:
         """

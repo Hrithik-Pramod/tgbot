@@ -2387,6 +2387,195 @@ class Repo:
                 trade_id,
             )
 
+    async def live_trades_on_account(
+        self, *, client_id: int, account_number: str, ifsc: str,
+    ) -> list[asyncpg.Record]:
+        """
+        Every live order collecting into one PHYSICAL bank account.
+
+        Keyed on the number and IFSC rather than an account row, because the
+        case this exists for is one account registered under several vendors
+        — each row is a different vendor's claim on the same account.
+
+        `collected` is what that order has already taken, and it is what
+        decides the established path: an order that has started collecting
+        into this account is the one the client is working through.
+        """
+        async with self.pool.acquire() as conn:
+            return await conn.fetch(
+                """
+                SELECT DISTINCT ON (t.id)
+                       t.id, t.reference, t.opened_at, t.instructed_at,
+                       t.inr_expected,
+                       COALESCE((SELECT sum(p.amount_inr) FROM payments p
+                                 WHERE p.trade_id = t.id), 0) AS collected,
+                       t.inr_expected
+                         - COALESCE((SELECT sum(p.amount_inr) FROM payments p
+                                     WHERE p.trade_id = t.id), 0) AS outstanding,
+                       b.id AS account_id,
+                       COALESCE(t.supplier_label_at_trade, s.label) AS vendor
+                FROM trades t
+                JOIN parties s       ON s.id = t.supplier_id
+                JOIN bank_accounts b ON b.party_id = t.supplier_id
+                                    AND b.account_number = $2 AND b.ifsc = $3
+                WHERE t.client_id = $1
+                  AND t.status IN ('open', 'awaiting_payment')
+                ORDER BY t.id, b.is_active DESC, t.opened_at
+                """,
+                client_id, account_number, ifsc,
+            )
+
+    async def hold_payment(
+        self, *, client_id: int, utr: str, amount_inr: Decimal,
+        account_number: str, ifsc: str,
+        chat_id: Optional[int] = None, message_id: Optional[int] = None,
+    ) -> tuple[bool, Optional[int]]:
+        """
+        Park a payment the bot will not allocate on its own.
+
+        Returns (held, id). `held` is False when this UTR is already waiting
+        or already recorded — a client re-pasting an unanswered slip must not
+        queue it twice, or answering once would record it twice.
+        """
+        async with self.pool.acquire() as conn:
+            async with conn.transaction():
+                if await conn.fetchval(
+                    "SELECT 1 FROM payments WHERE utr = $1", utr
+                ):
+                    return False, None
+                try:
+                    held_id = await conn.fetchval(
+                        """
+                        INSERT INTO held_payments
+                            (client_id, utr, amount_inr, account_number, ifsc,
+                             chat_id, message_id)
+                        VALUES ($1,$2,$3,$4,$5,$6,$7)
+                        RETURNING id
+                        """,
+                        client_id, utr, amount_inr, account_number, ifsc,
+                        chat_id, message_id,
+                    )
+                except asyncpg.UniqueViolationError:
+                    return False, None
+
+                await self.audit(
+                    conn, actor_party_id=client_id, action="payment.held",
+                    entity_type="held_payment", entity_id=held_id,
+                    detail={"utr": utr, "amount_inr": amount_inr,
+                            "account_number": account_number,
+                            "why": "two vendors have a live order on this "
+                                   "account and neither has started "
+                                   "collecting; asking the Bridge"},
+                )
+                return True, held_id
+
+    async def held_payment(self, held_id: int) -> Optional[asyncpg.Record]:
+        async with self.pool.acquire() as conn:
+            return await conn.fetchrow(
+                "SELECT * FROM held_payments WHERE id = $1", held_id
+            )
+
+    async def waiting_held_payments(
+        self, *, older_than_minutes: int,
+    ) -> list[asyncpg.Record]:
+        """
+        Held payments nobody has answered, for the chaser.
+
+        chased_at keeps the reminder to once a cycle. A notice repeated every
+        sweep is one nobody reads, and this one has to be read.
+        """
+        async with self.pool.acquire() as conn:
+            return await conn.fetch(
+                """
+                SELECT * FROM held_payments
+                WHERE resolved_at IS NULL
+                  AND asked_at < now() - ($1::text || ' minutes')::interval
+                  AND chased_at IS NULL
+                ORDER BY asked_at
+                """,
+                str(older_than_minutes),
+            )
+
+    async def mark_held_chased(self, held_id: int) -> None:
+        async with self.pool.acquire() as conn:
+            await conn.execute(
+                "UPDATE held_payments SET chased_at = now() WHERE id = $1",
+                held_id,
+            )
+
+    async def resolve_held_payment(
+        self, *, held_id: int, trade_id: int, account_id: int,
+        actor_party_id: int,
+    ) -> tuple[bool, str]:
+        """
+        Record a held payment against the order the Bridge chose.
+
+        The write and the release happen together: a payment cannot be
+        recorded without the hold being closed, nor the hold closed without
+        the payment landing.
+        """
+        async with self.pool.acquire() as conn:
+            async with conn.transaction():
+                h = await conn.fetchrow(
+                    "SELECT * FROM held_payments WHERE id = $1 FOR UPDATE",
+                    held_id,
+                )
+                if h is None:
+                    return False, "That payment is no longer waiting."
+                if h["resolved_at"] is not None:
+                    return False, (
+                        f"{h['utr']} has already been placed. Nothing changed."
+                    )
+
+                seq = await conn.fetchval(
+                    "SELECT COALESCE(MAX(sequence_no), 0) + 1 FROM payments "
+                    "WHERE trade_id = $1",
+                    trade_id,
+                )
+                try:
+                    payment_id = await conn.fetchval(
+                        """
+                        INSERT INTO payments (trade_id, utr, amount_inr,
+                                              beneficiary_account_id,
+                                              added_by, sequence_no)
+                        VALUES ($1,$2,$3,$4,$5,$6)
+                        RETURNING id
+                        """,
+                        trade_id, h["utr"], h["amount_inr"], account_id,
+                        h["client_id"], seq,
+                    )
+                except asyncpg.UniqueViolationError:
+                    await conn.execute(
+                        "UPDATE held_payments SET resolved_at = now() "
+                        "WHERE id = $1",
+                        held_id,
+                    )
+                    return False, (
+                        f"{h['utr']} was already recorded elsewhere. The hold "
+                        "has been cleared and nothing was added twice."
+                    )
+
+                await conn.execute(
+                    """
+                    UPDATE held_payments
+                    SET resolved_at = now(), resolved_trade_id = $2
+                    WHERE id = $1
+                    """,
+                    held_id, trade_id,
+                )
+                ref = await conn.fetchval(
+                    "SELECT reference FROM trades WHERE id = $1", trade_id
+                )
+                await self.audit(
+                    conn, actor_party_id=actor_party_id, action="payment.add",
+                    entity_type="payment", entity_id=payment_id,
+                    detail={"trade_id": trade_id, "utr": h["utr"],
+                            "amount_inr": h["amount_inr"],
+                            "placed_by": "Bridge chose the order; the account "
+                                         "is shared and the slip could not say"},
+                )
+                return True, f"{h['utr']} recorded against {ref}."
+
     async def other_open_trades_for_pairing(
         self, *, supplier_id: int, client_id: int, exclude_trade_id: int,
     ) -> list[asyncpg.Record]:
