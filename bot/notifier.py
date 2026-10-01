@@ -186,14 +186,53 @@ class Notifier:
         # rather than left to be spotted inside a summary (11 September 2026:
         # a trade expecting ₹212,000 took ₹414,400 and closed quietly).
         if expected is not None and total > expected:
-            await self.to_bridge(
-                f"OVERPAID — {trade['reference']}\n\n"
-                f"Expected ₹{fmt_inr(expected)}\n"
-                f"Received ₹{fmt_inr(total)}\n"
-                f"Over by ₹{fmt_inr(total - expected)}\n\n"
-                "The trade is closed. The difference needs resolving with the "
-                "client."
+            # Say where the surplus probably belongs, not just that it exists.
+            #
+            # 1 October 2026: SUPA38 closed ₹180,439 over and BRAV9 ₹329,561
+            # over. Both notices said the difference needed resolving with the
+            # client. Neither did — the money belonged to the next order,
+            # already open and collecting into the same account. The Bridge
+            # found it two days later by reconciling every payment by hand.
+            #
+            # A trade still short taking the next payment is correct, and the
+            # ordinary case is a client finishing one order before starting
+            # the next. What was wrong was this message ending the
+            # conversation at "chase the client".
+            others = await self.repo.other_open_trades_for_pairing(
+                supplier_id=trade["supplier_id"],
+                client_id=trade["client_id"],
+                exclude_trade_id=trade["id"],
             )
+            lines = [
+                f"OVERPAID — {trade['reference']}",
+                "",
+                f"Expected ₹{fmt_inr(expected)}",
+                f"Received ₹{fmt_inr(total)}",
+                f"Over by ₹{fmt_inr(total - expected)}",
+                "",
+            ]
+            if others:
+                lines.append(
+                    "This vendor has another order open, so the surplus may "
+                    "belong there rather than being money owed back:"
+                )
+                lines.append("")
+                for o in others:
+                    lines.append(
+                        f"  {o['reference']}   ₹{fmt_inr(o['outstanding'])} "
+                        "outstanding"
+                    )
+                lines += [
+                    "",
+                    "Check the last payment on this trade before treating it "
+                    "as an overpayment.",
+                ]
+            else:
+                lines.append(
+                    "The trade is closed and nothing else is open for this "
+                    "vendor, so the difference needs resolving with the client."
+                )
+            await self.to_bridge("\n".join(lines))
         await self.to_party(
             trade["supplier_id"],
             render_supplier_summary(payments, expected_inr=trade["inr_expected"] or None),

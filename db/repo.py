@@ -2387,6 +2387,52 @@ class Repo:
                 trade_id,
             )
 
+    async def other_open_trades_for_pairing(
+        self, *, supplier_id: int, client_id: int, exclude_trade_id: int,
+    ) -> list[asyncpg.Record]:
+        """
+        Other live trades on the same pairing, for the overpaid notice.
+
+        WHY (Bridge audit, 1 October 2026)
+
+        SUPA38 closed ₹180,439 over and BRAV9 ₹329,561 over, and both were
+        reported as overpayments needing "resolving with the client". Neither
+        was. The money belonged to the next order — which was already open,
+        instructed, and collecting into the same account.
+
+        The Bridge found it two days later by reconciling by hand:
+
+            The allocation logic must prevent a payment for a newly opened
+            trade being consumed by the previous open trade merely because
+            the beneficiary account is the same.
+
+        The allocation itself is defensible — a trade still short should take
+        the next payment — and changing it would break the ordinary case
+        where a client finishes one order before starting the next. What was
+        missing is that the overpaid notice ended the conversation. It said
+        "chase the client" when the far likelier answer was sitting one trade
+        away.
+
+        So the notice now names the other open trades. Nothing moves on its
+        own; the Bridge is simply told where to look.
+        """
+        async with self.pool.acquire() as conn:
+            return await conn.fetch(
+                """
+                SELECT t.id, t.reference, t.inr_expected,
+                       t.inr_expected
+                         - COALESCE((SELECT sum(p.amount_inr) FROM payments p
+                                     WHERE p.trade_id = t.id), 0) AS outstanding,
+                       t.instructed_at
+                FROM trades t
+                WHERE t.supplier_id = $1 AND t.client_id = $2
+                  AND t.id <> $3
+                  AND t.status IN ('open', 'awaiting_payment')
+                ORDER BY t.opened_at
+                """,
+                supplier_id, client_id, exclude_trade_id,
+            )
+
     async def pairing_for_deposit(self, deposit_id: int) -> Optional[asyncpg.Record]:
         """
         Which pairing a deposit landed on.
