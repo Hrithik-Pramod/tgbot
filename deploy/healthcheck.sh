@@ -227,11 +227,59 @@ else
     bad "BRIDGE_CHANNEL_ID=${BRIDGE_CHANNEL_ID:-unset} but the Bridge party is $BRIDGE_DB — alerts go to the wrong place"
 fi
 
-UNMON="$(q 'SELECT count(*) FROM wallets WHERE NOT is_monitored')"
-if [ "${UNMON:-0}" -eq 0 ]; then
-    ok "every wallet is monitored"
+# Amended 1 October 2026.
+#
+# This counted every unmonitored wallet and called it a failure. Three of the
+# four it was shouting about were switched off ON PURPOSE — "clear all except
+# BIG BOSS, IndoLondon and Uncle", 25 September, audited, with the command to
+# reverse it recorded on each row — and a fourth was retired. So the line had
+# read FAIL for six days while describing a decision, which is how a check
+# stops being read at all. The file already says as much about adoption: a
+# check that cries wolf teaches you to skim past it.
+#
+# Switched off and retired are deliberate; the condition worth failing on is a
+# wallet that is not being watched while a trade on it is still live, because
+# then a supplier can send against an open order and nobody sees it.
+RETIRED_W="$(q 'SELECT count(*) FROM wallets WHERE retired_at IS NOT NULL')"
+OFF_W="$(q 'SELECT count(*) FROM wallets
+            WHERE NOT is_monitored AND retired_at IS NULL')"
+OFF_LIVE="$(q "SELECT count(DISTINCT w.id) FROM wallets w
+               JOIN trades t ON t.wallet_id = w.id
+               WHERE NOT w.is_monitored AND w.retired_at IS NULL
+                 AND t.status IN ('open', 'awaiting_payment')")"
+if [ "${OFF_LIVE:-0}" -gt 0 ]; then
+    bad "$OFF_LIVE wallet(s) switched off while a trade on them is still live — a deposit there would be invisible"
+elif [ "${OFF_W:-0}" -gt 0 ]; then
+    warn "$OFF_W wallet(s) switched off deliberately (and $RETIRED_W retired) — nothing is watched there, as intended"
+    q "SELECT '      off: ' || coalesce(s.label,'?') || ' -> ' ||
+              coalesce(c.label,'?') || '  (wallet ' || w.id || ')'
+       FROM wallets w
+       LEFT JOIN parties s ON s.id = w.supplier_id
+       LEFT JOIN parties c ON c.id = w.client_id
+       WHERE NOT w.is_monitored AND w.retired_at IS NULL
+       ORDER BY w.id"
 else
-    bad "$UNMON wallet(s) not monitored — deposits there are invisible"
+    ok "every wallet is monitored ($RETIRED_W retired)"
+fi
+
+# A switched-off wallet that still holds a monitor cursor is a trap.
+#
+# Turning one back on with a bare UPDATE leaves the old cursor in place, so the
+# next poll asks the provider for everything since the day it was switched off,
+# collapses the lot into ONE trade inside the merge window, and prices it at
+# TODAY'S rate. Worse, TronScan returns newest-first capped at 50, so with a
+# long enough gap the oldest transfers are never returned and the cursor is
+# advanced past them for good.
+#
+# retire_wallet and update_wallet_address both delete the cursor for exactly
+# this reason. Switching off by hand is the one route that does not.
+STALECUR="$(q 'SELECT count(*) FROM monitor_state m
+               JOIN wallets w ON w.id = m.wallet_id
+               WHERE NOT w.is_monitored')"
+if [ "${STALECUR:-0}" -eq 0 ]; then
+    ok "no switched-off wallet is holding a stale monitor cursor"
+else
+    warn "$STALECUR switched-off wallet(s) still hold a monitor cursor — switching one back on would back-date deposits at today's rate; DELETE FROM monitor_state WHERE wallet_id = <id> in the same transaction"
 fi
 
 # An internal wallet with no rate detects deposits but opens no trade.
@@ -283,8 +331,14 @@ fi
 # ---------------------------------------------------------------- monitor
 head_ "Monitor"
 
-TOTAL_W="$(q 'SELECT count(*) FROM wallets WHERE is_monitored')"
-ADOPTED="$(q 'SELECT count(*) FROM monitor_state WHERE adopted_at_ms IS NOT NULL')"
+# Both sides scoped to the wallets actually being polled. Counting every
+# monitor_state row read "8 of 6 wallet(s) adopted" on 1 October — more adopted
+# than exist — because two switched-off wallets had left their rows behind.
+TOTAL_W="$(q 'SELECT count(*) FROM wallets WHERE is_monitored AND retired_at IS NULL')"
+ADOPTED="$(q 'SELECT count(*) FROM monitor_state m
+              JOIN wallets w ON w.id = m.wallet_id
+              WHERE w.is_monitored AND w.retired_at IS NULL
+                AND m.adopted_at_ms IS NOT NULL')"
 
 # How long the bot has been up. Adoption is staggered across the poll interval
 # — roughly a few seconds per wallet — so immediately after a restart most
@@ -309,8 +363,12 @@ else
     bad "$ADOPTED of $TOTAL_W wallet(s) adopted — the rest are not being watched"
 fi
 
-STALEPOLL="$(q "SELECT count(*) FROM monitor_state
-                WHERE last_polled_at < now() - interval '2 minutes'")"
+# Only wallets being polled can be late. A switched-off one is reported by the
+# stale-cursor check above, where it belongs.
+STALEPOLL="$(q "SELECT count(*) FROM monitor_state m
+                JOIN wallets w ON w.id = m.wallet_id
+                WHERE w.is_monitored AND w.retired_at IS NULL
+                  AND m.last_polled_at < now() - interval '2 minutes'")"
 if [ "${STALEPOLL:-0}" -eq 0 ]; then
     ok "every wallet polled within the last 2 minutes"
 else
