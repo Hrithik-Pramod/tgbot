@@ -54,6 +54,32 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
 from bot import bridge_trade, client_bot, notifier as notifier_mod  # noqa: E402
+
+
+def _code_only(src: str) -> str:
+    """
+    A function's source with its docstring and comments stripped, leaving
+    what executes.
+
+    The disclosure check below reads the function looking for words that must
+    never reach the client. Read against the raw source it also reads the
+    prose, so on 2 October a comment explaining a bug fix — which mentioned
+    the supplier — failed it. A comment cannot leak anything to anyone.
+
+    What it still catches is the thing worth catching: a field like
+    t["supplier_label"] or t["reference"] being read in code on its way into
+    the client's line.
+    """
+    import ast
+    import re
+    import textwrap
+
+    src = textwrap.dedent(src)
+    fn = ast.parse(src).body[0]
+    body = fn.body[1:] if ast.get_docstring(fn) is not None else fn.body
+    start = min(n.lineno for n in body) - 1
+    return "\n".join(re.sub(r"#.*$", "", line)
+                     for line in src.splitlines()[start:])
 from core.parse import (choose_established_path,  # noqa: E402
                         match_beneficiary, shared_account_for)
 from db.repo import Repo  # noqa: E402
@@ -331,7 +357,7 @@ class TestEverythingElseIsUntouched:
         account and nothing else.
         """
         src = inspect.getsource(client_bot._place_on_shared_account)
-        body = src.split('"""')[2]
+        body = _code_only(src)
         for leak in ("reference", "vendor", "supplier", "opened_at",
                      "outstanding"):
             assert leak not in body, f"{leak!r} could reach the client"

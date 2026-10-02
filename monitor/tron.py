@@ -444,6 +444,45 @@ class DepositMonitor:
         await self._report_unmatched_sends()
         await self._release_held_announcements()
         await self._chase_held_payments()
+        await self._close_covered_trades()
+
+    async def _close_covered_trades(self) -> None:
+        """
+        A trade that is fully paid and still open is a trade nobody has been
+        told about.
+
+        Closing is claimed by whoever records the payment that covers the
+        total. That has been true of every payment path — until a new one is
+        added and the claim is forgotten, which is exactly what happened on
+        1 October: the shared-account branch wrote payments quietly and never
+        asked. SUPA43 was covered to the rupee on 2 October and sat open,
+        no closing summary to the Bridge, no release to the supplier, and
+        still holding the "one order at a time" slot so the next payment into
+        that account would have been attributed to a finished order.
+
+        So the claim stops depending on every author remembering. The sweep
+        asks the same question of every open trade, once a cycle, and
+        check_completion is already atomic — it closes a trade exactly once
+        and returns nothing on one already closed, so a sweep running
+        alongside the normal path cannot double-announce.
+
+        This is a net, not a replacement. The payment paths still claim
+        immediately, because a summary that arrives a cycle late is worse
+        than one that arrives at once.
+
+        Swallowed like every other sweep step. A missed close must never stop
+        the polling that detects deposits.
+        """
+        try:
+            for trade_id in await self.repo.covered_but_open_trades():
+                if await self.notifier.check_completion(trade_id):
+                    log.warning(
+                        "trade %s was fully paid but still open — closed by "
+                        "the sweep, so some payment path did not claim it",
+                        trade_id,
+                    )
+        except Exception:
+            log.exception("could not close covered trades")
 
     async def _chase_held_payments(self) -> None:
         """

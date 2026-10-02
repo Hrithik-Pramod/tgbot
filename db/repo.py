@@ -2387,6 +2387,31 @@ class Repo:
                 trade_id,
             )
 
+    async def covered_but_open_trades(self) -> list[int]:
+        """
+        Trades whose payments already cover what was expected, yet which are
+        still open. On a healthy system this is always empty.
+
+        It is not empty when a payment path records money without claiming
+        completion. The condition mirrors claim_completion's own WHERE clause
+        exactly, so the sweep never offers it a trade it would refuse, and
+        the claim remains the single place that decides.
+        """
+        async with self.pool.acquire() as conn:
+            rows = await conn.fetch(
+                """
+                SELECT t.id
+                FROM trades t
+                WHERE t.status = 'awaiting_payment'
+                  AND t.inr_expected IS NOT NULL
+                  AND t.inr_expected > 0
+                  AND COALESCE((SELECT sum(p.amount_inr) FROM payments p
+                                WHERE p.trade_id = t.id), 0) >= t.inr_expected
+                ORDER BY t.opened_at
+                """
+            )
+            return [r["id"] for r in rows]
+
     async def split_parts(self, trade_id: int) -> list[asyncpg.Record]:
         """
         The second halves carved out of this trade. Empty for every trade

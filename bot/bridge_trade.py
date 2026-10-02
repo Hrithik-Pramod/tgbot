@@ -1448,9 +1448,12 @@ async def place_held_payment(call: CallbackQuery, party, repo, notifier) -> None
     )
     await call.answer()
 
-    # A payment landing can be the one that finishes the trade.
+    # A payment landing can be the one that finishes the trade — or the one
+    # that brings it close enough for the supplier to start the next batch.
+    # Both, in the same order as every other payment path.
     if ok and notifier is not None:
-        await notifier.check_completion(chosen["id"])
+        if not await notifier.check_completion(chosen["id"]):
+            await notifier.check_near_completion(chosen["id"])
 
 
 @router.message(Command("correct"))

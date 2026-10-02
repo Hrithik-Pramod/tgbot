@@ -175,6 +175,25 @@ async def _place_on_shared_account(message, p, matchable, party, repo, notifier)
             # A duplicate, almost certainly. Let the ordinary path report it
             # properly rather than inventing a second way of saying so.
             return None
+
+        # A payment that is recorded is a payment that can finish the trade.
+        #
+        # This was missed when the branch was written on 1 October, and
+        # SUPA43 paid for it the next day: ₹5,644,500 against ₹5,644,500 and
+        # the trade still sitting open. Nobody saw a closing summary, the
+        # supplier was never released to their next batch, and — the part
+        # that costs money — a completed order kept holding the "one order at
+        # a time" slot, so the NEXT payment into that account would have
+        # landed on it instead of the order it belonged to. That is the
+        # SUPA38/BRAV9 misattribution this whole branch exists to prevent,
+        # reintroduced by the branch itself.
+        #
+        # Every other path that writes a payment does this. This one is not
+        # special for being quiet.
+        if notifier is not None:
+            if not await notifier.check_completion(chosen["id"]):
+                await notifier.check_near_completion(chosen["id"])
+
         name = next((a["account_name"] for a in matchable
                      if str(a["account_number"]) == account_number), None)
         return f"to {name}" if name else "recorded"
