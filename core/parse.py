@@ -452,6 +452,68 @@ def match_account(name: Optional[str], accounts) -> Optional[int]:
     return None
 
 
+def _name_candidates(name: Optional[str], accounts) -> list:
+    """
+    Every account a typed name could plausibly mean — the same cascade
+    match_account uses, but returning the whole tier instead of insisting on
+    one winner.
+
+    match_account answers "which account is this?" and must refuse when more
+    than one fits. This answers a different question: "which accounts were in
+    contention?" — and the interesting case is precisely the one where
+    several were.
+
+    Deliberately a separate function rather than a refactor of match_account.
+    That matcher decides where money is attributed, it has been tuned against
+    live mistakes since 11 September, and its tiers do not all behave the same
+    way on multiplicity. Sharing code between the two would be tidier and
+    would put the whole of attribution at risk to improve a question. So this
+    duplicates the tiers on purpose; test_account_matching.py and
+    test_shared_beneficiary.py hold both to the same spellings.
+    """
+    if not name:
+        return []
+
+    def norm(s: str) -> str:
+        return re.sub(r"[^a-z0-9]", "", s.lower())
+
+    target = norm(name)
+    if not target:
+        return []
+
+    exact = [a for a in accounts if norm(a["account_name"]) == target]
+    if exact:
+        return exact
+
+    partial = [
+        a for a in accounts
+        if (len(target) >= 3 and target in norm(a["account_name"]))
+        or norm(a["account_name"]) in target
+    ]
+    if partial:
+        return partial
+
+    def first_word(s: str) -> str:
+        for token in re.split(r"[^A-Za-z0-9]+", s.lower()):
+            if token:
+                return token
+        return ""
+
+    head = first_word(name)
+    if len(head) >= 3:
+        by_head = [a for a in accounts if first_word(a["account_name"]) == head]
+        if by_head:
+            return by_head
+
+    if len(target) >= 5:
+        by_prefix = [a for a in accounts
+                     if norm(a["account_name"])[:5] == target[:5]]
+        if by_prefix:
+            return by_prefix
+
+    return []
+
+
 def _has_live_trade(account) -> bool:
     try:
         return account["trade_id"] is not None
@@ -488,22 +550,37 @@ def shared_account_for(name: Optional[str], accounts) -> Optional[tuple]:
 
     Only the second is the Bridge's to answer, so only the second is
     detected here. Everything else is left exactly as it was.
+
+    WHY PARTIAL NAMES COUNT (amended 4 October 2026)
+
+    The first version matched the typed name exactly or not at all, reasoning
+    that a guess about which account, on top of a guess about which order, is
+    two guesses deep.
+
+    That reasoning was wrong, and it cost a night. SUPER TRADING COMPANY (STC)
+    is one bank account registered under IndoLondon, BIG BOSS and Uncle. The
+    Bridge typed "SUPER TRADING COMPANY" and later "SUPER TRAD" — the forms
+    people actually type, and both things match_account recognises happily.
+    Neither equalled the registered name, so this returned None, and ₹234,000
+    and ₹250,000 went to the CLIENT to choose between three vendors they do
+    not know exist. The second sat unrecorded for two hours.
+
+        can you fix the cause of this ( the 2 vendors 1 wallet )
+        — Bridge, 4 October 2026, 11:12pm
+
+    There is no second guess. The candidates are gathered as loosely as the
+    matcher gathers them, and then the only thing that decides is whether they
+    are all the SAME account number and IFSC — a fact, not a judgement. If
+    they are, no choice about "which account" was ever required: there is one,
+    and the only open question is which order, which is the Bridge's. If they
+    are not, this still returns None and the client is asked, because two
+    banks under one holder's name is a question they can answer.
+
+    So loosening this can only ever move a question from the client to the
+    Bridge, and only when the account is provably singular.
     """
-    if not name:
-        return None
-
-    def norm(s: str) -> str:
-        return re.sub(r"[^a-z0-9]", "", s.lower())
-
-    target = norm(name)
-    if not target:
-        return None
-
-    hits = [a for a in accounts if norm(a["account_name"]) == target]
+    hits = _name_candidates(name, accounts)
     if len(hits) < 2:
-        # Partial matches are deliberately not considered. A guess about
-        # which account was meant, combined with a guess about which order,
-        # is two guesses deep — and the second one moves money.
         return None
 
     keys = {(str(a["account_number"]), str(a["ifsc"])) for a in hits}

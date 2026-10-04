@@ -1440,7 +1440,22 @@ class Repo:
         async with self.pool.acquire() as conn:
             return await conn.fetch(
                 """
-                SELECT
+                SELECT * FROM (
+                -- One line per PAIRING, not per wallet row.
+                --
+                -- 4 October 2026: /progress printed Uncle twice, identically,
+                -- and added him twice — ₹8,320,770 across the book where the
+                -- truth was ₹6,822,885. He had two internal wallet rows for
+                -- that client: one retired on 28 September and its live
+                -- replacement. Every figure below is a subquery keyed on
+                -- supplier_id and client_id, never on w.id, so both rows came
+                -- out byte-identical and the Bridge was reading a number
+                -- ₹1,497,885 too high off his own book.
+                --
+                -- DISTINCT ON names the key rather than relying on the whole
+                -- row being equal, because the day someone selects w.address
+                -- here a plain DISTINCT would quietly stop working.
+                SELECT DISTINCT ON (w.supplier_id, w.client_id)
                   s.label AS supplier_label,
                   c.label AS client_label,
                   (SELECT count(*) FROM trades t
@@ -1490,7 +1505,17 @@ class Repo:
                 -- invoiced, and hiding that line is how ₹995,495 went
                 -- unnoticed twice. Tidiness is not worth a blind spot.
                 WHERE w.is_internal AND s.is_active AND c.is_active
-                ORDER BY s.label, c.label
+                -- Required by DISTINCT ON, and it decides which of the
+                -- duplicate rows survives. They are identical, so it does not
+                -- matter which — but the live wallet is the honest one to
+                -- keep, so retired rows sort last.
+                ORDER BY w.supplier_id, w.client_id,
+                         (w.retired_at IS NOT NULL), w.id
+                ) x
+                -- The Bridge reads this top to bottom; alphabetical is how it
+                -- has always been presented and the de-duplication must not
+                -- change that.
+                ORDER BY supplier_label, client_label
                 """
             )
 

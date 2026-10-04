@@ -126,14 +126,55 @@ class TestItTriggersOnlyOnAGenuinelySharedAccount:
                  _acct("Barkaati Textile", "222222222233")]
         assert shared_account_for("Ekta Traders", among) is None
 
-    def test_a_partial_match_is_never_treated_as_shared(self):
+    def test_a_partial_match_IS_this_case_when_the_account_is_one_account(self):
         """
-        A guess about which account, plus a guess about which order, is two
-        guesses deep — and the second one moves money.
+        REVERSED 4 October 2026. This test previously asserted the opposite,
+        on the reasoning that a guess about which account plus a guess about
+        which order is two guesses deep.
+
+        There is no second guess. SUPER TRADING COMPANY (STC) is ONE bank
+        account registered under IndoLondon, BIG BOSS and Uncle. Whichever of
+        those three rows the typed name reaches, the account number is the
+        same number — so "which account" was never in question and nothing is
+        being guessed. Only "which order" remains, and that is the Bridge's.
+
+        The old reasoning cost a night. The Bridge typed "SUPER TRADING
+        COMPANY" and then "SUPER TRAD" — forms match_account recognises
+        happily — neither equalled the registered name, and ₹234,000 and
+        ₹250,000 went to the CLIENT to choose between three vendors they have
+        never been told exist. The second sat unrecorded for two hours.
         """
         among = [_acct("SUPER TRADING COMPANY (STC)", "500000000000003", _id=2),
                  _acct("SUPER TRADING COMPANY (STC)", "500000000000003", _id=26)]
-        assert shared_account_for("SUPER TRAD", among) is None
+        assert shared_account_for("SUPER TRAD", among) == (
+            "500000000000003", "HDFC0005183")
+
+    def test_the_forms_he_actually_typed_all_reach_the_bridge(self):
+        """
+        Taken from the audit rows of 4 October. Each of these produced
+        "account not recognised" and a question to the client.
+        """
+        among = [_acct("SUPER TRADING COMPANY (STC)", "500000000000003", _id=2),
+                 _acct("SUPER TRADING COMPANY (STC)", "500000000000003", _id=26),
+                 _acct("SUPER TRADING COMPANY (STC)", "500000000000003", _id=33),
+                 _acct("ROYAL TRADING COMPANY", "999999999999", _id=28)]
+        for typed in ("SUPER TRADING COMPANY", "SUPER TRAD", "Super Trading",
+                      "super trading company (stc)", "SUPER"):
+            assert shared_account_for(typed, among) == (
+                "500000000000003", "HDFC0005183"), typed
+
+    def test_a_loose_name_reaching_two_DIFFERENT_accounts_still_asks_the_client(self):
+        """
+        The guard that makes loosening safe. Partial matching widens who is in
+        contention; it is the account number — a fact, not a judgement — that
+        decides. Two banks under one holder's name is still the client's
+        question, because the last four digits answer it for them.
+        """
+        among = [_acct("Girish Kumar Ahirwar Traders", "111111111122",
+                       "HDFC0000003"),
+                 _acct("Girish Kumar Ahirwar Exports", "222222222233",
+                       "UTIB0001240")]
+        assert shared_account_for("Girish Kumar Ahirwar", among) is None
 
     def test_nothing_typed_is_not_this_case(self):
         assert shared_account_for(None, []) is None
