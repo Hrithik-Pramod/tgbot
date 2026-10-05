@@ -524,4 +524,35 @@ CREATE TABLE held_payments (
 CREATE INDEX held_payments_waiting_idx
     ON held_payments (asked_at) WHERE resolved_at IS NULL;
 
+
+-- ---------------------------------------------------------- payout sources
+-- The addresses this desk settles from.
+--
+-- USDT arriving at a counterparty's own wallet used to be announced to them
+-- as "Funds received", because the bot sees an arrival at an address it
+-- watches and cannot see who sent it. On 5 October 2026 a client was told
+-- this desk had paid them 100 USDT; it was their own counterparty moving
+-- funds internally, and they replied "This was not me".
+--
+-- Nothing was mis-recorded — no trade, no figure. But it is a statement about
+-- money, made to someone who may reconcile against it.
+--
+-- Matching the AMOUNT against an outstanding payout would be a guess, and one
+-- that is right most of the time is the kind that gets trusted when it is
+-- wrong. The sender is a fact on the chain, so the sender is what decides.
+--
+-- The desk's own wallets are not listed here; they are recognised from the
+-- wallets table at the time of the check. This table is for the hot wallets
+-- that are not otherwise known, and a new one is confirmed by the Bridge the
+-- first time it settles.
+CREATE TABLE payout_sources (
+    address         TEXT PRIMARY KEY,
+
+    -- NULL on rows inferred from the desk's own traffic rather than
+    -- confirmed by a person, so the two can be told apart later.
+    added_by        BIGINT REFERENCES parties(id),
+    added_at        TIMESTAMPTZ NOT NULL DEFAULT now(),
+    note            TEXT
+);
+
 COMMIT;

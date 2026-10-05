@@ -828,6 +828,51 @@ class DepositMonitor:
             owner_label = await self.repo.party_label(owner) if owner else None
             whose = f"{owner_label}'s" if owner_label else "a counterparty's"
 
+            # Did this come from the desk at all?
+            #
+            # The bot sees an arrival at an address it watches and nothing
+            # else, so until 5 October 2026 it told the counterparty "Funds
+            # received" for everything — including money that had nothing to
+            # do with this desk. A client was told they had been paid 100 USDT
+            # and answered "This was not me"; it was their own internal
+            # movement.
+            #
+            # Nothing was mis-recorded, and that is rather the point: the
+            # ledger was right and the MESSAGE was wrong, to the party least
+            # able to tell. A counterparty may reconcile against it.
+            #
+            # The sender decides, because the sender is a fact. Matching the
+            # amount against an outstanding payout would be a guess, and a
+            # guess that is usually right is the kind that gets believed when
+            # it is not.
+            ours = await self.repo.is_known_payout_source(
+                transfer.get("from_address")
+            )
+
+            if not ours:
+                from aiogram.types import (
+                    InlineKeyboardButton, InlineKeyboardMarkup,
+                )
+                await self.notifier.to_bridge(
+                    f"{transfer['amount']} USDT reached {whose} wallet from an "
+                    f"address I do not recognise.\n"
+                    f"Hash {tx_link(transfer['tx_hash'], html=True)}\n\n"
+                    f"They have NOT been told anything. If this was your "
+                    f"settlement, confirm it below and they will be notified — "
+                    f"and the address is remembered, so the next one goes "
+                    f"straight through.\n\n"
+                    f"If it is not yours, ignore this. It is most likely their "
+                    f"own funds moving.",
+                    html=True,
+                    reply_markup=InlineKeyboardMarkup(inline_keyboard=[[
+                        InlineKeyboardButton(
+                            text="Yes, that was my settlement",
+                            callback_data=f"ps:{deposit_id}",
+                        )
+                    ]]),
+                )
+                return
+
             await self.notifier.to_bridge(
                 f"Onward payout confirmed on chain\n"
                 f"{transfer['amount']} USDT reached {whose} wallet\n"

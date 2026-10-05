@@ -228,18 +228,64 @@ class TestOnboardingAVendorUsesTheSameRule:
         assert "retired_at IS NULL" in check
 
 
+# Lookups that ask a DIFFERENT question, with the reason each one is exempt.
+#
+# The rule being guarded is about availability: "is this address already in
+# use, so that adding it again would clash?" Retirement is the whole point
+# there — a retired address is free.
+#
+# A lookup asking whether an address was EVER the desk's is not that question,
+# and filtering retirement would make it answer wrongly: a wallet taken out of
+# service is still an address this desk has settled from, and its past
+# settlements do not stop being ours because it was retired afterwards.
+NOT_AVAILABILITY_CHECKS = {
+    "is_known_payout_source":
+        "asks whether an address is the desk's at all, not whether it is "
+        "free. A retired wallet that once sent a settlement is still ours, "
+        "and filtering it would tell a counterparty nothing arrived.",
+}
+
+
 class TestNoWalletCheckIsBlindToRetirementAgain:
     def test_every_address_lookup_filters(self):
         """
         The regression guard. The fault was not one query — it was every
         place that asked "is this address taken?" without saying what taken
         means.
+
+        Scanned per method rather than over the whole file, so an offender
+        can be named and a genuine exception can be recorded with its reason
+        instead of the guard being loosened for everyone.
         """
+        import inspect
         import re
-        src = _flat((ROOT / "db" / "repo.py").read_text())
-        found = re.findall(r"SELECT [^\"]{0,80}?FROM wallets WHERE address[^\"]{0,80}", src)
-        assert found, "the scan matched no address lookups at all — it is not looking"
-        offenders = [q for q in found if "retired_at IS NULL" not in q]
+
+        scanned = 0
+        offenders = []
+        for name, fn in inspect.getmembers(Repo, predicate=inspect.isfunction):
+            if name in NOT_AVAILABILITY_CHECKS:
+                continue
+            src = _flat(inspect.getsource(fn))
+            for q in re.findall(
+                r"SELECT [^\"]{0,80}?FROM wallets WHERE address[^\"]{0,80}", src
+            ):
+                scanned += 1
+                if "retired_at IS NULL" not in q:
+                    offenders.append(f"{name}: {q}")
+
+        assert scanned, "the scan matched no address lookups at all — it is not looking"
         assert not offenders, (
             "address lookups blind to retirement:\n" + "\n".join(offenders)
+            + "\n\nIf this one genuinely asks a different question, add it to "
+              "NOT_AVAILABILITY_CHECKS with the reason."
         )
+
+    def test_every_exemption_still_exists(self):
+        """
+        An allowlist that outlives what it allows is how a guard quietly
+        stops guarding.
+        """
+        for name in NOT_AVAILABILITY_CHECKS:
+            assert hasattr(Repo, name), (
+                f"{name} is exempted but no longer exists — drop the entry"
+            )

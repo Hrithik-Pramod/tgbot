@@ -2957,6 +2957,72 @@ class Repo:
                 )
                 return True, held_id
 
+    async def is_known_payout_source(self, address: Optional[str]) -> bool:
+        """
+        Did this USDT come from the desk?
+
+        Two ways an address counts: it is on the confirmed list, or it is one
+        of the desk's own wallets — a vendor's receiving wallet used to
+        forward a settlement is the desk's money moving, and listing those
+        separately would mean maintaining the same fact twice.
+
+        An unknown sender is not an error. It is somebody else's business
+        arriving in somebody else's wallet, and the only wrong answer is to
+        tell a counterparty the desk paid them when it did not.
+        """
+        if not address:
+            return False
+        async with self.pool.acquire() as conn:
+            return bool(await conn.fetchval(
+                """
+                SELECT 1 WHERE EXISTS (
+                    SELECT 1 FROM payout_sources WHERE address = $1
+                ) OR EXISTS (
+                    SELECT 1 FROM wallets WHERE address = $1
+                )
+                """,
+                address,
+            ))
+
+    async def add_payout_source(
+        self, *, address: str, actor_party_id: int, note: Optional[str] = None,
+    ) -> bool:
+        """
+        Remember an address as the desk's own. Returns False if already known.
+        """
+        async with self.pool.acquire() as conn:
+            async with conn.transaction():
+                added = await conn.fetchval(
+                    """
+                    INSERT INTO payout_sources (address, added_by, note)
+                    VALUES ($1, $2, $3)
+                    ON CONFLICT (address) DO NOTHING
+                    RETURNING address
+                    """,
+                    address, actor_party_id, note,
+                )
+                if added is None:
+                    return False
+                await self.audit(
+                    conn, actor_party_id=actor_party_id,
+                    action="payout_source.added", entity_type="payout_source",
+                    entity_id=None, detail={"address": address, "note": note},
+                )
+                return True
+
+    async def deposit_detail(self, deposit_id: int) -> Optional[asyncpg.Record]:
+        """A deposit with the wallet it landed on and who owns that wallet."""
+        async with self.pool.acquire() as conn:
+            return await conn.fetchrow(
+                """
+                SELECT d.id, d.amount_usdt, d.tx_hash, d.from_address,
+                       d.detected_at, w.is_internal, w.owner_party_id
+                FROM deposits d JOIN wallets w ON w.id = d.wallet_id
+                WHERE d.id = $1
+                """,
+                deposit_id,
+            )
+
     async def placeable_trades_for_client(
         self, client_id: int
     ) -> list[asyncpg.Record]:

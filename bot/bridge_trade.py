@@ -1479,6 +1479,68 @@ async def place_held_payment(call: CallbackQuery, party, repo, notifier) -> None
 # written at ten past midnight against a live ledger. That is the thing being
 # removed here, not the four symptoms.
 
+@router.callback_query(F.data.startswith("ps:"))
+async def confirm_payout_source(
+    call: CallbackQuery, party, repo, notifier
+) -> None:
+    """
+    "Yes, that was my settlement" — so tell the counterparty, and remember
+    the address.
+
+    Not state-gated. The question can sit unanswered for hours and survive a
+    restart in between; a button that dies would leave the counterparty never
+    told about a settlement that was genuinely theirs.
+
+    Idempotent: add_payout_source refuses an address already known, and the
+    notice is only sent on the call that actually added it, so two taps
+    produce one message.
+    """
+    from core.summary import render_payout_notice
+
+    deposit_id = int(call.data.split(":", 1)[1])
+    d = await repo.deposit_detail(deposit_id)
+    if d is None:
+        await call.message.answer("That deposit is no longer on record.")
+        await call.answer()
+        return
+
+    if not d["from_address"]:
+        await call.message.answer(
+            "That transfer has no sender recorded, so there is no address to "
+            "remember. Nothing was changed."
+        )
+        await call.answer()
+        return
+
+    added = await repo.add_payout_source(
+        address=d["from_address"], actor_party_id=party["id"],
+        note="confirmed by the Bridge after an unrecognised settlement",
+    )
+    if not added:
+        await call.message.answer(
+            "That address was already known — nothing to do, and they have "
+            "been told."
+        )
+        await call.answer()
+        return
+
+    if d["owner_party_id"]:
+        await notifier.to_party(
+            d["owner_party_id"],
+            render_payout_notice(
+                amount=d["amount_usdt"], tx_hash=d["tx_hash"], html=True,
+            ),
+            html=True,
+        )
+
+    await call.message.answer(
+        f"Noted. {fmt_usdt_plain(d['amount_usdt'])} USDT confirmed as yours, "
+        "they have been told, and settlements from that address will go "
+        "straight through from now on."
+    )
+    await call.answer()
+
+
 @router.message(Command("correct"))
 async def cmd_correct(message: Message, state: FSMContext, repo) -> None:
     trades = await repo.correctable_trades(15)
