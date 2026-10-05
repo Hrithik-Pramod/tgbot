@@ -132,19 +132,28 @@ async def _place_on_shared_account(message, p, matchable, party, repo, notifier)
     """
     One account, two vendors. Decide without asking the client.
 
-    Returns the line to show them, or None when this is not that case — in
-    which case the caller carries on exactly as before. Every other kind of
+    Returns (outcome, line), or None when this is not that case — in which
+    case the caller carries on exactly as before. Every other kind of
     unmatched name still goes to the client, including two vendors at two
     different banks under one holder's name, which they can answer.
 
     THREE OUTCOMES
 
       not this case          None, and nothing has happened
-      a path is set          recorded against the order already collecting,
-                             silently, because that is what the client is
-                             working through (Bridge: "the flow of the
-                             original is not interupted")
-      no path                held in the database and the Bridge is asked
+      "recorded"             booked against the order already collecting,
+                             because that is what the client is working
+                             through (Bridge: "the flow of the original is
+                             not interupted")
+      "held"                 written to the database and the Bridge is asked
+
+    The outcome is returned, not just a line, because the two mean opposite
+    things to the client. Money that is RECORDED gets the same thumbs up as
+    any other payment; money that is WAITING has to be said in words. Until
+    5 October both produced a block of text, so every payment into a shared
+    account read back as though something needed attention:
+
+        Instead of thumbs up it's not sending the every time
+        — Bridge, 5 October 2026
 
     The client is never told there are two orders. They do not know the
     orders exist and it is not theirs to know (11 September disclosure).
@@ -196,7 +205,7 @@ async def _place_on_shared_account(message, p, matchable, party, repo, notifier)
 
         name = next((a["account_name"] for a in matchable
                      if str(a["account_number"]) == account_number), None)
-        return f"to {name}" if name else "recorded"
+        return "recorded", (f"to {name}" if name else "recorded")
 
     held, held_id = await repo.hold_payment(
         client_id=party["id"], utr=p.utr, amount_inr=p.amount_inr,
@@ -211,7 +220,7 @@ async def _place_on_shared_account(message, p, matchable, party, repo, notifier)
                                        amount_inr=p.amount_inr,
                                        account_number=account_number,
                                        trades=trades)
-    return "held — being confirmed, nothing further needed from you"
+    return "held", "held — being confirmed, nothing further needed from you"
 
 
 def _render_accounts(accounts) -> list[str]:
@@ -510,7 +519,8 @@ async def on_pasted_payment(message: Message, state: FSMContext, party, repo,
     by_id = {a["id"]: a for a in matchable}
 
     staged, lines = [], ["Read this as:", ""]
-    held_any = False
+    pending_any = False     # written down, waiting on the Bridge
+    recorded_any = False    # already on the ledger, nothing owed to anyone
     for p in result.payments:
         account_id = match_beneficiary(p.beneficiary, matchable)
         row = by_id.get(account_id)
@@ -531,10 +541,14 @@ async def on_pasted_payment(message: Message, state: FSMContext, party, repo,
                 message, p, matchable, party, repo, notifier
             )
             if placed is not None:
-                held_any = True
+                outcome, line = placed
+                if outcome == "held":
+                    pending_any = True
+                else:
+                    recorded_any = True
                 lines.append(p.utr)
                 lines.append(fmt_inr_plain(p.amount_inr))
-                lines.append(placed)
+                lines.append(line)
                 lines.append("")   # same spacing as every other entry
                 continue
 
@@ -598,11 +612,21 @@ async def on_pasted_payment(message: Message, state: FSMContext, party, repo,
             )
         lines.append("")
 
-    # Everything in this message was placed or held on the Bridge's side.
-    # There is nothing left for the client to confirm or be asked.
-    if held_any and not staged:
+    # Everything in this message was settled on the Bridge's side. Nothing is
+    # left for the client to confirm or be asked — but WHAT they are told
+    # depends on whether their money is on the books or waiting.
+    if (pending_any or recorded_any) and not staged:
         await state.clear()
-        await message.reply("\n".join(lines))
+        if pending_any:
+            # Something is genuinely waiting. That needs saying in words.
+            await message.reply("\n".join(lines))
+        else:
+            # All of it is recorded. This is an ordinary paid payment and it
+            # gets the ordinary acknowledgement — the same thumbs up as every
+            # other one. A block of text here reads as though the bot wants
+            # something, and on a shared collection account that was every
+            # single payment (Bridge, 5 October 2026).
+            await _acknowledge(message)
         return
 
     # Matched an account, but that supplier has nothing open to record it
