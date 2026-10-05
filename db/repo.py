@@ -2011,6 +2011,197 @@ class Repo:
                 limit,
             )
 
+    async def correctable_trades(self, limit: int = 15) -> list[asyncpg.Record]:
+        """
+        Trades a correction can reach: the live ones AND the recently closed.
+
+        /correct offered only completed trades until 5 October 2026, on the
+        reasoning that a live trade can be fixed by carrying on. It cannot. A
+        payment recorded against the wrong OPEN order is wrong now, and the
+        Bridge had no way to touch it:
+
+            Supa44 not on list
+            also on /correct, it only shows list of completed
+            not live
+            — Bridge, 5 October 2026, 12:07am
+
+        ₹255,000 had landed on the wrong vendor's order and the only way out
+        was hand-written SQL at midnight. Live trades come first because a
+        live mistake is the urgent one.
+        """
+        async with self.pool.acquire() as conn:
+            return await conn.fetch(
+                """
+                SELECT t.id, t.reference, t.status::text AS status,
+                       t.completed_at, t.inr_expected,
+                       COALESCE(t.supplier_label_at_trade, s.label)
+                           AS supplier_label,
+                       c.label AS client_label,
+                       COALESCE((SELECT sum(p.amount_inr) FROM payments p
+                                 WHERE p.trade_id = t.id), 0) AS paid_inr
+                FROM trades t
+                JOIN parties s ON s.id = t.supplier_id
+                JOIN parties c ON c.id = t.client_id
+                WHERE t.status IN ('open', 'awaiting_payment', 'completed')
+                ORDER BY (t.status = 'completed'),
+                         COALESCE(t.completed_at, t.opened_at) DESC
+                LIMIT $1
+                """,
+                limit,
+            )
+
+    async def _reopen_if_short(self, conn, trade_id: int) -> Optional[str]:
+        """
+        A completed trade that is no longer covered goes back to open.
+
+        Taking money off a trade and leaving it marked completed is how an
+        order comes to claim it was paid when it was not — and unlike a
+        missing message, nothing on screen says so. 4 October 2026: ₹255,000
+        bounced, was removed from BRAV14, and the trade sat `completed` and
+        ₹255,000 short until it was reopened by hand. The Bridge found it:
+
+            actually no it doesnt, can we ensure that it does in future?
+
+        So reopening stops being a second step the operator has to remember.
+        Returns the reference if it reopened, None if nothing needed doing.
+
+        Deliberately one-way. A trade that is still covered is left alone:
+        closing one is claim_completion's job, and two things deciding a
+        trade is finished is two things that can disagree.
+        """
+        t = await conn.fetchrow(
+            """
+            SELECT t.reference, t.status::text AS status, t.inr_expected,
+                   COALESCE((SELECT sum(p.amount_inr) FROM payments p
+                             WHERE p.trade_id = t.id), 0) AS paid
+            FROM trades t WHERE t.id = $1
+            """,
+            trade_id,
+        )
+        if t is None or t["status"] != "completed":
+            return None
+        if t["paid"] >= t["inr_expected"]:
+            return None
+
+        await conn.execute(
+            "UPDATE trades SET status = 'awaiting_payment', completed_at = NULL "
+            "WHERE id = $1",
+            trade_id,
+        )
+        await self.audit(
+            conn, actor_party_id=None, action="trade.reopened_when_short",
+            entity_type="trade", entity_id=trade_id,
+            detail={"reference": t["reference"], "paid": t["paid"],
+                    "expected": t["inr_expected"]},
+        )
+        return t["reference"]
+
+    async def move_payment(
+        self, *, payment_id: int, to_trade_id: int, actor_party_id: int,
+        reason: str,
+    ) -> tuple[bool, str]:
+        """
+        Re-attribute a payment to the order it actually belongs to.
+
+        Promised to the Bridge on 1 October as the backstop for when the bot
+        puts money on the wrong order, and not built. On 4 October it was
+        needed: a ₹255,000 replacement landed on IndoLondon's order because
+        Uncle's was still wrongly marked complete, and the only route back was
+        SQL written by hand at ten past midnight.
+
+        Removing and re-pasting is not the same thing. UTRs are globally
+        unique, so the client has to be asked to send a slip again for money
+        they already sent — and the trail of what actually happened is lost.
+
+        The beneficiary account moves with it where it can: the destination
+        vendor's registration of the SAME physical account. That is the whole
+        shape of this problem — one account, several vendors — so the account
+        number stays true and only the vendor changes. If the destination has
+        no such registration the original is kept, because a payment pointing
+        at the account it was genuinely paid into is better than one pointing
+        at the right vendor's wrong account.
+
+        Both ends are then checked: the source may no longer be covered, and
+        the destination may now be. The first is put right here; the second is
+        left to claim_completion, so the closing summaries go out the way they
+        always do.
+        """
+        async with self.pool.acquire() as conn:
+            async with conn.transaction():
+                p = await conn.fetchrow(
+                    """
+                    SELECT p.id, p.utr, p.amount_inr, p.trade_id,
+                           p.beneficiary_account_id,
+                           b.account_number, b.ifsc,
+                           t.reference AS from_reference
+                    FROM payments p
+                    LEFT JOIN bank_accounts b ON b.id = p.beneficiary_account_id
+                    JOIN trades t ON t.id = p.trade_id
+                    WHERE p.id = $1
+                    FOR UPDATE OF p
+                    """,
+                    payment_id,
+                )
+                if p is None:
+                    return False, "That payment no longer exists."
+                if p["trade_id"] == to_trade_id:
+                    return False, (
+                        f"{p['utr']} is already on {p['from_reference']}."
+                    )
+
+                dest = await conn.fetchrow(
+                    "SELECT id, reference, supplier_id, status::text AS status "
+                    "FROM trades WHERE id = $1 FOR UPDATE",
+                    to_trade_id,
+                )
+                if dest is None:
+                    return False, "That order no longer exists."
+                if dest["status"] == "cancelled":
+                    return False, (
+                        f"{dest['reference']} is cancelled. Money cannot be "
+                        "moved onto a trade that was abandoned."
+                    )
+
+                # The destination vendor's registration of the same physical
+                # account, if they have one.
+                new_account = p["beneficiary_account_id"]
+                if p["account_number"] is not None:
+                    same = await conn.fetchval(
+                        """
+                        SELECT id FROM bank_accounts
+                        WHERE party_id = $1 AND account_number = $2
+                          AND ifsc = $3 AND is_active
+                        LIMIT 1
+                        """,
+                        dest["supplier_id"], p["account_number"], p["ifsc"],
+                    )
+                    if same is not None:
+                        new_account = same
+
+                await conn.execute(
+                    "UPDATE payments SET trade_id = $2, beneficiary_account_id = $3 "
+                    "WHERE id = $1",
+                    payment_id, to_trade_id, new_account,
+                )
+
+                detail = {
+                    "utr": p["utr"], "amount_inr": p["amount_inr"],
+                    "from_trade": p["from_reference"],
+                    "to_trade": dest["reference"], "reason": reason,
+                }
+                await self.audit(
+                    conn, actor_party_id=actor_party_id, action="payment.moved",
+                    entity_type="payment", entity_id=payment_id, detail=detail,
+                )
+
+                reopened = await self._reopen_if_short(conn, p["trade_id"])
+
+                msg = (f"Moved {p['utr']} (₹{p['amount_inr']:,.0f}) from "
+                       f"{p['from_reference']} to {dest['reference']}.")
+                if reopened:
+                    msg += f"\n\n{reopened} is no longer covered, so it is open again."
+                return True, msg
+
     async def nominate_account(
         self, *, supplier_id: int, account_id: int, actor_party_id: int,
     ) -> Optional[str]:
@@ -2704,7 +2895,8 @@ class Repo:
 
     async def hold_payment(
         self, *, client_id: int, utr: str, amount_inr: Decimal,
-        account_number: str, ifsc: str,
+        account_number: Optional[str] = None, ifsc: Optional[str] = None,
+        typed_beneficiary: Optional[str] = None, why: Optional[str] = None,
         chat_id: Optional[int] = None, message_id: Optional[int] = None,
     ) -> tuple[bool, Optional[int]]:
         """
@@ -2713,6 +2905,23 @@ class Repo:
         Returns (held, id). `held` is False when this UTR is already waiting
         or already recorded — a client re-pasting an unanswered slip must not
         queue it twice, or answering once would record it twice.
+
+        TWO KINDS OF HELD PAYMENT, ONE TABLE (amended 5 October 2026)
+
+          account known, name ambiguous
+                Two vendors collect into it and neither order has started.
+                The Bridge is asked which order. This is what the table was
+                built for on 1 October and it has not lost a rupee since.
+
+          name known, account not recognised
+                The client is asked which account, because they can answer
+                that. Until 5 October this case was held in MEMORY and
+                nothing else — no row, no reminder, nothing to find after a
+                restart. ₹902,460 went that way on 11 September and ₹250,000
+                on 4 October.
+
+        Who gets asked still differs. Whether the money is written down does
+        not, because that was never the part either case disagreed about.
         """
         async with self.pool.acquire() as conn:
             async with conn.transaction():
@@ -2725,12 +2934,12 @@ class Repo:
                         """
                         INSERT INTO held_payments
                             (client_id, utr, amount_inr, account_number, ifsc,
-                             chat_id, message_id)
-                        VALUES ($1,$2,$3,$4,$5,$6,$7)
+                             typed_beneficiary, chat_id, message_id)
+                        VALUES ($1,$2,$3,$4,$5,$6,$7,$8)
                         RETURNING id
                         """,
                         client_id, utr, amount_inr, account_number, ifsc,
-                        chat_id, message_id,
+                        typed_beneficiary, chat_id, message_id,
                     )
                 except asyncpg.UniqueViolationError:
                     return False, None
@@ -2740,11 +2949,91 @@ class Repo:
                     entity_type="held_payment", entity_id=held_id,
                     detail={"utr": utr, "amount_inr": amount_inr,
                             "account_number": account_number,
-                            "why": "two vendors have a live order on this "
-                                   "account and neither has started "
-                                   "collecting; asking the Bridge"},
+                            "typed_beneficiary": typed_beneficiary,
+                            "why": why or (
+                                "two vendors have a live order on this "
+                                "account and neither has started "
+                                "collecting; asking the Bridge")},
                 )
                 return True, held_id
+
+    async def placeable_trades_for_client(
+        self, client_id: int
+    ) -> list[asyncpg.Record]:
+        """
+        Every open order of this client's, with an account to book a payment
+        against — for a held payment whose beneficiary matched nothing.
+
+        live_trades_on_account answers the other case, where the account IS
+        known and the only question is which of two vendors. Here the account
+        is what failed, so the question has to be put the other way round: the
+        Bridge picks the ORDER, and the account follows from it.
+
+        beneficiary_account_id is NOT NULL on payments, so an account has to
+        be produced for every row offered. In order of how well it reflects
+        what the client was actually told:
+
+          the account on an issued instruction   what they were asked to pay
+          the vendor's nominated account         what the vendor asked for
+          the vendor's first active account      better than refusing
+
+        An order whose vendor has no active account at all is left out
+        entirely rather than offered as a button that cannot work.
+        """
+        async with self.pool.acquire() as conn:
+            return await conn.fetch(
+                """
+                SELECT t.id, t.reference, t.opened_at,
+                       COALESCE(t.supplier_label_at_trade, s.label) AS vendor,
+                       round(t.inr_expected, 2)
+                         - COALESCE((SELECT sum(p.amount_inr) FROM payments p
+                                     WHERE p.trade_id = t.id), 0) AS outstanding,
+                       COALESCE(
+                         (SELECT ps.bank_account_id FROM payment_slots ps
+                          WHERE ps.trade_id = t.id ORDER BY ps.id LIMIT 1),
+                         t.nominated_account_id,
+                         (SELECT b.id FROM bank_accounts b
+                          WHERE b.party_id = t.supplier_id AND b.is_active
+                          ORDER BY b.id LIMIT 1)
+                       ) AS account_id
+                FROM trades t
+                JOIN parties s ON s.id = t.supplier_id
+                WHERE t.client_id = $1
+                  AND t.status IN ('open', 'awaiting_payment')
+                ORDER BY t.opened_at
+                """,
+                client_id,
+            )
+
+    async def release_held_payments(self, utrs: list[str]) -> int:
+        """
+        Close the holds for payments that have since been recorded.
+
+        The hold is a safety net, not a second ledger. When the client answers
+        the question in their own chat the payment lands by the ordinary path,
+        and the row that was watching it has to stop watching — otherwise the
+        Bridge is chased about money that is already on the books, and a
+        chaser nobody believes is worse than no chaser.
+
+        Matched on the UTR because that is the one thing both halves share and
+        it is globally unique.
+        """
+        if not utrs:
+            return 0
+        async with self.pool.acquire() as conn:
+            return len(await conn.fetch(
+                """
+                UPDATE held_payments h
+                SET resolved_at = now(),
+                    resolved_trade_id = p.trade_id
+                FROM payments p
+                WHERE p.utr = h.utr
+                  AND h.utr = ANY($1::text[])
+                  AND h.resolved_at IS NULL
+                RETURNING h.id
+                """,
+                utrs,
+            ))
 
     async def held_payment(self, held_id: int) -> Optional[asyncpg.Record]:
         async with self.pool.acquire() as conn:
@@ -3322,13 +3611,36 @@ class Repo:
 
     async def void_payment(
         self, *, payment_id: int, actor_party_id: int, reason: str,
+        returned: bool = False,
     ) -> tuple[bool, str]:
         """
-        Remove a mis-entered payment.
+        Remove a mis-entered payment, or one the bank sent back.
 
         The row is deleted so the UTR can be re-entered correctly, but the full
         detail is written to the audit log first. The record survives even
         though the row does not.
+
+        `returned` separates two different events that were one button until
+        5 October 2026. A mis-entered payment is a bookkeeping error: the
+        money is where it always was. A RETURNED payment is a fact about the
+        world — the money went back, and the order is not paid:
+
+            Also - One returned ( bounced back) ... so how do we deal with
+            something like this.
+            — Bridge, 4 October 2026
+
+        They differ in the record, not the mechanics, and the audit log is
+        where that difference has to survive: an export showing a trade short
+        by ₹255,000 means nothing without knowing whether someone typed it
+        wrong or the bank rejected it.
+
+        AND THE TRADE IS REOPENED IF IT IS NO LONGER COVERED
+
+        This used to delete the payment and leave the trade exactly as it was,
+        so a completed order could sit claiming it was paid while being
+        ₹255,000 short — which is what BRAV14 did on 4 October until it was
+        reopened by hand. Nothing on screen contradicted it. See
+        _reopen_if_short.
         """
         async with self.pool.acquire() as conn:
             async with conn.transaction():
@@ -3344,17 +3656,28 @@ class Repo:
                     return False, "That payment no longer exists."
 
                 await self.audit(
-                    conn, actor_party_id=actor_party_id, action="payment.void",
+                    conn, actor_party_id=actor_party_id,
+                    action="payment.returned" if returned else "payment.void",
                     entity_type="payment", entity_id=payment_id,
                     detail={
                         "trade_reference": row["reference"],
                         "utr": row["utr"],
                         "amount_inr": row["amount_inr"],
                         "reason": reason,
+                        "returned_by_bank": returned,
                     },
                 )
                 await conn.execute("DELETE FROM payments WHERE id = $1", payment_id)
-                return True, f"Removed {row['utr']} (₹{row['amount_inr']:,.0f}) from {row['reference']}."
+
+                reopened = await self._reopen_if_short(conn, row["trade_id"])
+
+                verb = "Returned" if returned else "Removed"
+                msg = (f"{verb} {row['utr']} (₹{row['amount_inr']:,.0f}) from "
+                       f"{row['reference']}.")
+                if reopened:
+                    msg += (f"\n\n{reopened} is no longer covered, so it is open "
+                            "again and will close itself when the balance lands.")
+                return True, msg
 
     async def claim_near_completion(
         self, trade_id: int, threshold_inr: Decimal
@@ -3402,7 +3725,11 @@ class Repo:
                 """
                 SELECT p.id, p.utr, p.amount_inr, b.account_name
                 FROM payments p
-                JOIN bank_accounts b ON b.id = p.beneficiary_account_id
+                -- LEFT, so a payment with no beneficiary recorded is still
+                -- correctable. An inner join hid exactly the payments most
+                -- likely to need correcting: the ones the bot could not
+                -- attribute to an account in the first place.
+                LEFT JOIN bank_accounts b ON b.id = p.beneficiary_account_id
                 WHERE p.trade_id = $1
                 ORDER BY p.sequence_no
                 """,

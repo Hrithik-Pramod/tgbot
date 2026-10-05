@@ -488,8 +488,18 @@ CREATE TABLE held_payments (
     -- The PHYSICAL account named on the slip, not an account row. Several
     -- rows share these two values, which is the whole reason this payment is
     -- waiting; naming one of them would be the guess being avoided.
-    account_number  TEXT        NOT NULL,
-    ifsc            TEXT        NOT NULL,
+    --
+    -- NULL on the other kind of hold (5 October 2026): a payment whose
+    -- beneficiary matched no registered account at all. There the account is
+    -- the thing that failed, so inventing one would be exactly the guess this
+    -- table exists to avoid, and what is known instead is the typed name.
+    account_number  TEXT,
+    ifsc            TEXT,
+
+    -- The beneficiary exactly as the client wrote it — "SUPER TRAD", "royal
+    -- trading". Kept unprocessed, because the point of showing it to the
+    -- Bridge is to show what the bot was given, not what it made of it.
+    typed_beneficiary TEXT,
 
     chat_id         BIGINT,
     message_id      BIGINT,
@@ -503,7 +513,12 @@ CREATE TABLE held_payments (
     -- payments.utr is unique because one transfer is one payment. The same
     -- must hold while it waits, or a client re-pasting an unanswered slip
     -- would queue it twice and record it twice when the Bridge answers.
-    CONSTRAINT held_payments_utr_unique UNIQUE (utr)
+    CONSTRAINT held_payments_utr_unique UNIQUE (utr),
+
+    -- One of the two must be known, or the row says nothing about where the
+    -- money went and there is no question to put to anybody.
+    CONSTRAINT held_payments_knows_something
+        CHECK (account_number IS NOT NULL OR typed_beneficiary IS NOT NULL)
 );
 
 CREATE INDEX held_payments_waiting_idx

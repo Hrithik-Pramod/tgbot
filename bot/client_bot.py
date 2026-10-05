@@ -541,6 +541,10 @@ async def on_pasted_payment(message: Message, state: FSMContext, party, repo,
         staged.append({
             "utr": p.utr, "amount": str(p.amount_inr), "account_id": account_id,
             "trade_id": row["trade_id"] if row else None,
+            # Carried so that a payment held for the Bridge can show him what
+            # the client actually typed. The bot's own reading of it is the
+            # thing that failed, so his question is "what did they write?"
+            "beneficiary": p.beneficiary,
         })
         lines.append(p.utr)
         lines.append(fmt_inr_plain(p.amount_inr))
@@ -676,17 +680,29 @@ async def on_pasted_payment(message: Message, state: FSMContext, party, repo,
         lines.append("Which account did these go to?")
         await message.answer("\n".join(lines), reply_markup=kb)
 
+        # Write the wait down before anyone is asked anything.
+        #
+        # Until someone taps one of those buttons the payment is NOT recorded,
+        # and the client often does not tap — they edit the message instead,
+        # or simply move on. Until 5 October 2026 that wait lived only in
+        # memory, so a restart discarded it without trace: ₹902,460 on
+        # 11 September, ₹250,000 on 4 October, and six slips from late
+        # September still unaccounted for.
+        #
+        # A row survives a restart, a redeploy and a crash, and the sweep
+        # chases it until it is answered. The client's buttons still work
+        # exactly as before; this is underneath them.
+        for s in unmatched:
+            await repo.hold_payment(
+                client_id=party["id"], utr=s["utr"],
+                amount_inr=to_decimal(s["amount"]),
+                typed_beneficiary=s.get("beneficiary"),
+                why="the beneficiary name matched no registered account; "
+                    "the client has been asked which one it was",
+                chat_id=message.chat.id, message_id=message.message_id,
+            )
+
         # Tell the Bridge that money is in limbo.
-        #
-        # Until someone taps one of those buttons the payment is NOT recorded.
-        # The client often does not tap — they correct the message by editing
-        # it instead, or simply move on — and the pending conversation lives in
-        # memory, so a restart discards it without trace. On 11 September 2026
-        # four payments totalling ₹902,460 were lost exactly this way, and the
-        # first anyone knew was the client asking why their completed trade had
-        # not closed.
-        #
-        # The Bridge can see it and chase. Silence here is the expensive option.
         if notifier is not None:
             await notifier.to_bridge(
                 "A payment could not be matched to an account and is NOT "
@@ -884,6 +900,14 @@ async def _record(message, staged, party, repo, *, acknowledge: bool,
         (added if ok else rejected).append(msg)
         if ok and s["trade_id"] not in touched:
             touched.append(s["trade_id"])
+
+    # Anything that was being watched is now on the books, so stop watching
+    # it. A payment held when the name could not be matched is released the
+    # moment it lands by any route — including this one, the client answering
+    # the question in their own chat. Leaving the hold open would have the
+    # Bridge chased about money already recorded, and a chaser that cries
+    # wolf is one he stops reading.
+    await repo.release_held_payments([s["utr"] for s in staged])
 
     if rejected:
         # A duplicate UTR is never acknowledged silently — the client must know

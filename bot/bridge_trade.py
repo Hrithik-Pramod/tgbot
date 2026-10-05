@@ -74,6 +74,7 @@ class Correct(StatesGroup):
     pick_trade = State()
     action = State()
     pick_payment = State()
+    pick_target = State()
     reason = State()
 
 
@@ -1421,10 +1422,16 @@ async def place_held_payment(call: CallbackQuery, party, repo, notifier) -> None
         await call.answer()
         return
 
-    trades = await repo.live_trades_on_account(
-        client_id=held["client_id"],
-        account_number=held["account_number"], ifsc=held["ifsc"],
-    )
+    # Two kinds of hold, two ways of finding the order again. When the account
+    # is known the question was "which of these two vendors"; when it is not,
+    # the beneficiary matched nothing and every open order is a candidate.
+    if held["account_number"] is None:
+        trades = await repo.placeable_trades_for_client(held["client_id"])
+    else:
+        trades = await repo.live_trades_on_account(
+            client_id=held["client_id"],
+            account_number=held["account_number"], ifsc=held["ifsc"],
+        )
     chosen = next((t for t in trades if t["id"] == int(trade_id)), None)
     if chosen is None:
         await call.message.answer(
@@ -1456,35 +1463,81 @@ async def place_held_payment(call: CallbackQuery, party, repo, notifier) -> None
             await notifier.check_near_completion(chosen["id"])
 
 
+# /correct, rebuilt 5 October 2026.
+#
+# The recording side of this bot is solid. The fixing side was not, and one
+# night of ordinary trading found four ways through it: a payment on the wrong
+# OPEN order could not be reached at all, there was no way to move one, taking
+# one off left the order claiming it was paid, and a bounced payment had no
+# name of its own.
+#
+#     Supa44 not on list ... it only shows list of completed, not live
+#     can we fix this so never happens again?
+#     — Bridge, 4-5 October 2026
+#
+# All four were worked around by hand that night, the last of them with SQL
+# written at ten past midnight against a live ledger. That is the thing being
+# removed here, not the four symptoms.
+
 @router.message(Command("correct"))
 async def cmd_correct(message: Message, state: FSMContext, repo) -> None:
-    trades = await repo.recent_completed_trades(10)
+    trades = await repo.correctable_trades(15)
     if not trades:
-        await message.answer("There are no completed trades to correct.")
+        await message.answer("There are no trades to correct.")
         return
 
     await state.set_state(Correct.pick_trade)
-    kb = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(
-            text=f"{t['reference']} — {t['client_label']}",
+    rows = []
+    for t in trades:
+        shortfall = round_inr(t["inr_expected"] or Decimal(0)) - round_inr(
+            t["paid_inr"] or Decimal(0))
+        if t["status"] == "completed":
+            mark = "✓"
+        elif shortfall > 0:
+            mark = f"₹{fmt_inr(shortfall)} left"
+        else:
+            mark = "open"
+        rows.append([InlineKeyboardButton(
+            text=f"{t['reference']} — {t['supplier_label']} — {mark}",
             callback_data=f"co:{t['id']}",
-        )]
-        for t in trades
-    ])
-    await message.answer("Which completed trade?", reply_markup=kb)
+        )])
+
+    await message.answer(
+        "Which order? Live ones first, then recently closed.",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=rows),
+    )
 
 
 @router.callback_query(Correct.pick_trade, F.data.startswith("co:"))
 async def correct_pick(call: CallbackQuery, state: FSMContext, repo) -> None:
     trade_id = int(call.data.split(":", 1)[1])
+    trade = await repo.trade_detail(trade_id)
+    if trade is None:
+        await call.answer("That trade no longer exists.", show_alert=True)
+        return
+
     await state.update_data(trade_id=trade_id)
     await state.set_state(Correct.action)
 
-    kb = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="Reopen the trade", callback_data="cor")],
-        [InlineKeyboardButton(text="Remove a wrong payment", callback_data="cop")],
-    ])
-    await call.message.edit_text("What needs correcting?", reply_markup=kb)
+    rows = []
+    # Reopening is only meaningful on a closed trade, and since a removal now
+    # reopens by itself this is for the other reason: a trade closed that
+    # should not have been.
+    if trade["status"] == "completed":
+        rows.append([InlineKeyboardButton(
+            text="Reopen the order", callback_data="cor")])
+    rows += [
+        [InlineKeyboardButton(text="A payment was returned by the bank",
+                              callback_data="cob")],
+        [InlineKeyboardButton(text="Move a payment to another order",
+                              callback_data="com")],
+        [InlineKeyboardButton(text="Remove a payment entered by mistake",
+                              callback_data="cop")],
+    ]
+    await call.message.edit_text(
+        f"{trade['reference']} — what needs correcting?",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=rows),
+    )
     await call.answer()
 
 
@@ -1496,16 +1549,20 @@ async def correct_reopen(call: CallbackQuery, state: FSMContext) -> None:
     await call.answer()
 
 
-@router.callback_query(Correct.action, F.data == "cop")
-async def correct_payment_list(call: CallbackQuery, state: FSMContext, repo) -> None:
+async def _payment_picker(call, state, repo, *, mode: str, prompt: str) -> None:
+    """
+    The three payment-level corrections differ in what happens at the end,
+    not in choosing which payment. One picker, so they cannot drift apart.
+    """
     data = await state.get_data()
     rows = await repo.trade_payment_rows(data["trade_id"])
     if not rows:
-        await call.message.edit_text("That trade has no payments recorded.")
+        await call.message.edit_text("That order has no payments recorded.")
         await state.clear()
         await call.answer()
         return
 
+    await state.update_data(mode=mode)
     await state.set_state(Correct.pick_payment)
     kb = InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(
@@ -1514,37 +1571,114 @@ async def correct_payment_list(call: CallbackQuery, state: FSMContext, repo) -> 
         )]
         for r in rows
     ])
-    await call.message.edit_text("Which payment is wrong?", reply_markup=kb)
+    await call.message.edit_text(prompt, reply_markup=kb)
     await call.answer()
 
 
+@router.callback_query(Correct.action, F.data == "cop")
+async def correct_payment_list(call: CallbackQuery, state: FSMContext, repo) -> None:
+    await _payment_picker(call, state, repo, mode="void",
+                          prompt="Which payment was entered by mistake?")
+
+
+@router.callback_query(Correct.action, F.data == "cob")
+async def correct_returned_list(call: CallbackQuery, state: FSMContext, repo) -> None:
+    await _payment_picker(call, state, repo, mode="returned",
+                          prompt="Which payment came back?")
+
+
+@router.callback_query(Correct.action, F.data == "com")
+async def correct_move_list(call: CallbackQuery, state: FSMContext, repo) -> None:
+    await _payment_picker(call, state, repo, mode="move",
+                          prompt="Which payment is on the wrong order?")
+
+
 @router.callback_query(Correct.pick_payment, F.data.startswith("cop:"))
-async def correct_payment_pick(call: CallbackQuery, state: FSMContext) -> None:
-    await state.update_data(mode="void", payment_id=int(call.data.split(":", 1)[1]))
+async def correct_payment_pick(
+    call: CallbackQuery, state: FSMContext, repo
+) -> None:
+    payment_id = int(call.data.split(":", 1)[1])
+    data = await state.get_data()
+    await state.update_data(payment_id=payment_id)
+
+    if data["mode"] != "move":
+        await state.set_state(Correct.reason)
+        asked = ("Why did it come back? (this goes in the audit log)"
+                 if data["mode"] == "returned"
+                 else "Why is it being removed? (this goes in the audit log)")
+        await call.message.edit_text(asked)
+        await call.answer()
+        return
+
+    trades = [t for t in await repo.correctable_trades(15)
+              if t["id"] != data["trade_id"]]
+    if not trades:
+        await call.message.edit_text("There is no other order to move it to.")
+        await state.clear()
+        await call.answer()
+        return
+
+    await state.set_state(Correct.pick_target)
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(
+            text=f"{t['reference']} — {t['supplier_label']}",
+            callback_data=f"cot:{t['id']}",
+        )]
+        for t in trades
+    ])
+    await call.message.edit_text("Which order should it be on?", reply_markup=kb)
+    await call.answer()
+
+
+@router.callback_query(Correct.pick_target, F.data.startswith("cot:"))
+async def correct_move_target(call: CallbackQuery, state: FSMContext) -> None:
+    await state.update_data(target_trade_id=int(call.data.split(":", 1)[1]))
     await state.set_state(Correct.reason)
-    await call.message.edit_text("Why is it being removed? (this goes in the audit log)")
+    await call.message.edit_text(
+        "Why is it being moved? (this goes in the audit log)")
     await call.answer()
 
 
 @router.message(Correct.reason)
-async def correct_reason(message: Message, state: FSMContext, party, repo) -> None:
+async def correct_reason(
+    message: Message, state: FSMContext, party, repo, notifier=None
+) -> None:
     reason = (message.text or "").strip()
     if not reason:
         await message.answer("Give a short reason so the record makes sense later.")
         return
 
     data = await state.get_data()
-    if data["mode"] == "reopen":
+    mode = data["mode"]
+
+    if mode == "reopen":
         ok, msg = await repo.reopen_trade(
             trade_id=data["trade_id"], actor_party_id=party["id"], reason=reason
         )
+    elif mode == "move":
+        ok, msg = await repo.move_payment(
+            payment_id=data["payment_id"],
+            to_trade_id=data["target_trade_id"],
+            actor_party_id=party["id"], reason=reason,
+        )
     else:
         ok, msg = await repo.void_payment(
-            payment_id=data["payment_id"], actor_party_id=party["id"], reason=reason
+            payment_id=data["payment_id"], actor_party_id=party["id"],
+            reason=reason, returned=(mode == "returned"),
         )
 
     await state.clear()
     await message.answer(msg)
+
+    # Moving money onto an order can be the thing that finishes it. Every
+    # other path that touches a payment asks; this one was the last that did
+    # not, and the sweep would have caught it a cycle later anyway — but a
+    # closing summary that arrives at once is worth more than one that
+    # arrives eventually.
+    if ok and mode == "move" and notifier is not None:
+        target = data.get("target_trade_id")
+        if target is not None and not await notifier.check_completion(target):
+            await notifier.check_near_completion(target)
 
 
 # ======================================================================

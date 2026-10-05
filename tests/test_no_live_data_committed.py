@@ -198,7 +198,11 @@ class TestNoRealIdentifiersAreCommitted:
         assert not hits, (
             "digit runs that look like real account numbers:\n"
             + _report(hits)
-            + "\n\nUse an obvious placeholder: 50200100000000."
+            # The suggestion has to satisfy the rule it is suggested for.
+            # It read 50200100000000 until 5 October 2026 — four distinct
+            # digits, which this very test rejects — so following the advice
+            # failed the check that gave it.
+            + "\n\nUse an obvious placeholder: 50200000000000."
         )
 
 

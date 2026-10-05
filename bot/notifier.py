@@ -108,19 +108,58 @@ class Notifier:
         Once each, not on every sweep: a notice that repeats is a notice
         nobody reads, and this one has to be read.
         """
+        from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup
+
         waiting = await self.repo.waiting_held_payments(
             older_than_minutes=older_than_minutes
         )
         for h in waiting:
-            await self.to_bridge(
+            head = (
                 "STILL WAITING — a payment is not recorded.\n\n"
                 f"₹{fmt_inr(h['amount_inr'])}   UTR {h['utr']}\n"
-                f"Account ...{h['account_number'][-4:]}\n"
-                f"Asked {h['asked_at']:%d %b %H:%M}\n\n"
-                "Two vendors share this account and I will not guess between "
-                "their orders. Until you pick one, this money is not on "
-                "anyone's books."
             )
+            markup = None
+
+            if h["account_number"] is not None:
+                body = (
+                    f"Account ...{h['account_number'][-4:]}\n"
+                    f"Asked {h['asked_at']:%d %b %H:%M}\n\n"
+                    "Two vendors share this account and I will not guess "
+                    "between their orders. Until you pick one, this money is "
+                    "not on anyone's books."
+                )
+            else:
+                # The client was asked which account and has not answered.
+                #
+                # Chasing him to chase them is a message that moves nothing.
+                # He can place it himself and usually knows better than they
+                # do — they are picking from a list of names, he knows which
+                # order is live. So the reminder carries the orders.
+                trades = await self.repo.placeable_trades_for_client(
+                    h["client_id"]
+                )
+                typed = h["typed_beneficiary"] or "nothing readable"
+                body = (
+                    f"Written as \"{typed}\", which matches no registered "
+                    "account.\n"
+                    f"Asked {h['asked_at']:%d %b %H:%M}\n\n"
+                )
+                if trades:
+                    body += "The client has not answered. Place it yourself:"
+                    markup = InlineKeyboardMarkup(inline_keyboard=[[
+                        InlineKeyboardButton(
+                            text=(f"{t['reference']} · {t['vendor']} · "
+                                  f"₹{fmt_inr(t['outstanding'])} left"),
+                            callback_data=f"hp:{h['id']}:{t['id']}",
+                        )] for t in trades
+                        if t["account_id"] is not None])
+                else:
+                    body += (
+                        "There is no open order to put it against. Check the "
+                        "account is registered and a trade is open."
+                    )
+
+            await self.to_bridge(head + body, reply_markup=markup)
             await self.repo.mark_held_chased(h["id"])
         return len(waiting)
 
