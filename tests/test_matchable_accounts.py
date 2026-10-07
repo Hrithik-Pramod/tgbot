@@ -143,8 +143,16 @@ class TestTheClientStillSeesOnlyWhatTheyShould:
         InlineKeyboardMarkup that is actually sent.
         """
         src = _code(client_bot.on_pasted_payment)
-        kb = src.split("InlineKeyboardMarkup(inline_keyboard=[")[1] \
-                .split("])")[0]
+        # The ACCOUNT keyboard, found by the callback it carries. The handler
+        # builds more than one keyboard — the confirmation screen has its own
+        # — and taking "the first one" silently started reading the wrong
+        # block when the clean-message path moved to the top on 7 October.
+        blocks = [b for b in src.split("InlineKeyboardMarkup(inline_keyboard=[")[1:]
+                  if "pacct:" in b.split("])")[0]]
+        assert len(blocks) == 1, (
+            f"expected exactly one account keyboard, found {len(blocks)}"
+        )
+        kb = blocks[0].split("])")[0]
         assert "for a in accounts" in kb
         assert "matchable" not in kb, (
             "the client would be shown every vendor's accounts — the "
@@ -159,13 +167,35 @@ class TestTheClientStillSeesOnlyWhatTheyShould:
 
 class TestAPaymentWithNowhereToGoIsReported:
     def test_a_matched_account_with_no_open_trade_is_caught(self):
+        import re
         src = _code(client_bot.on_pasted_payment)
-        assert 'homeless = [s for s in staged if s["account_id"] and not s["trade_id"]]' in src
+        assert re.search(
+            r'homeless\s*=\s*\[s for s in staged '
+            r'if s\["account_id"\] and not s\["trade_id"\]\]', src
+        ), "the no-open-trade case is no longer identified"
 
     def test_the_client_is_told_it_was_not_recorded(self):
+        """
+        Reworded 7 October 2026. The branch no longer ends the message — a
+        mixed paste records what it can first — so it says how many were not
+        recorded rather than speaking for the whole message.
+        """
         src = _code(client_bot.on_pasted_payment)
-        branch = src.split("if homeless:")[1].split("return")[0]
-        assert "NOT been recorded" in branch
+        branch = src.split("if homeless:")[1].split("if unmatched")[0]
+        assert "NOT recorded" in branch
+        assert "no open trade" in branch
+
+    def test_the_rest_of_the_message_is_still_recorded(self):
+        """
+        The 7 October fault. One payment to an account with nothing open used
+        to discard every other payment in the message with it.
+        """
+        src = _code(client_bot.on_pasted_payment)
+        homeless_branch = src.split("if homeless:")[1].split("if unmatched")[0]
+        assert "return" not in homeless_branch, (
+            "a payment with no open trade still ends the whole message, so "
+            "the readable ones in it are thrown away"
+        )
 
     def test_the_bridge_alert_names_the_supplier(self):
         """

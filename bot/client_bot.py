@@ -629,26 +629,6 @@ async def on_pasted_payment(message: Message, state: FSMContext, party, repo,
             await _acknowledge(message)
         return
 
-    # Matched an account, but that supplier has nothing open to record it
-    # against. The account is real and the client paid it — this is the
-    # Bridge's to resolve, and it must never be silent.
-    homeless = [s for s in staged if s["account_id"] and not s["trade_id"]]
-    if homeless:
-        await state.clear()
-        await message.reply(
-            "This has NOT been recorded — there is no open trade for that "
-            "account right now.\n\n"
-            "The Bridge has been notified."
-        )
-        if notifier is not None:
-            # The rows go over; the notifier reads the supplier's name off
-            # them. A supplier name must not appear in a client-facing
-            # handler at all — see Notifier.alert_no_open_trade.
-            await notifier.alert_no_open_trade(
-                [(s, by_id[s["account_id"]]) for s in homeless]
-            )
-        return
-
     if len(staged) > 1:
         total = sum(to_decimal(s["amount"]) for s in staged)
         lines.append(f"{len(staged)} payments, total ₹{fmt_inr(total)}")
@@ -657,21 +637,125 @@ async def on_pasted_payment(message: Message, state: FSMContext, party, repo,
     for problem in result.problems:
         lines.append(f"Note: {problem}")
 
-    await state.update_data(staged=staged)
-
+    # ------------------------------------------------------------------
+    # EVERY PAYMENT STANDS ON ITS OWN.
+    #
+    # Everything below this line used to be all-or-nothing. One slip the bot
+    # could not place — a name it did not recognise, or an account whose
+    # trade had closed — and the WHOLE message was discarded, including the
+    # slips that read perfectly. The handler simply returned.
+    #
+    # 7 October 2026, after a client pasted a batch:
+    #
+    #     This stopped it then all the rest were not read
+    #     It's missing lots and lots now
+    #     i need to find out why this keeps happening mate
+    #     — Bridge
+    #
+    # He thought adding an account had broken something. It had not. The
+    # fault was there from the first day and only bites on a MIXED message,
+    # so it got steadily more likely as the number of accounts grew and more
+    # names became ambiguous.
+    #
+    # The rule now: what can be recorded is recorded, immediately. Only what
+    # genuinely cannot be placed waits, and only that is asked about.
+    # ------------------------------------------------------------------
+    ready     = [s for s in staged if s["account_id"] and s["trade_id"]]
+    homeless  = [s for s in staged if s["account_id"] and not s["trade_id"]]
     unmatched = [s for s in staged if s["account_id"] is None]
+
+    if not homeless and not unmatched:
+        # Everything placed. Unchanged from before, including the
+        # confirmation settings, which have only ever applied to a message
+        # the bot could read end to end.
+        await state.update_data(staged=staged)
+
+        if result.problems:
+            # Something was only partly readable. Never silently drop it.
+            await state.set_state(PastedPayment.confirm)
+            kb = InlineKeyboardMarkup(inline_keyboard=[[
+                InlineKeyboardButton(text="Confirm", callback_data="pyes"),
+                InlineKeyboardButton(text="Cancel", callback_data="pno"),
+            ]])
+            lines.append("Correct?")
+            await message.answer("\n".join(lines), reply_markup=kb)
+            return
+
+        if REQUIRE_PASTE_CONFIRMATION:
+            await state.set_state(PastedPayment.confirm)
+            kb = InlineKeyboardMarkup(inline_keyboard=[[
+                InlineKeyboardButton(text="Confirm", callback_data="pyes"),
+                InlineKeyboardButton(text="Cancel", callback_data="pno"),
+            ]])
+            lines.append("Correct?")
+            await message.answer("\n".join(lines), reply_markup=kb)
+            return
+
+        # Everything read cleanly and every account matched: record it and
+        # acknowledge, no tap required (client decision, 8 Sep 2026).
+        await state.clear()
+        await _record(message, staged, party, repo, acknowledge=True,
+                      notifier=notifier)
+        return
+
+    # --------------------------------------------------- the mixed message
+    #
+    # Banked first, before anything is asked. A payment the bot can place is
+    # not made more doubtful by another line it cannot, and holding it back
+    # is how a batch of eight loses all eight.
+    #
+    # Deliberately not gated on result.problems: those are lines that could
+    # not be PARSED at all, reported as notes below. They say nothing about
+    # the payments that were parsed, and waiting on them is the fault being
+    # fixed here.
+    if ready:
+        await _record(message, ready, party, repo, acknowledge=False,
+                      notifier=notifier)
+        lines.append(f"Recorded: {len(ready)} of {len(staged)}")
+
+    # Matched an account, but that supplier has nothing open to record it
+    # against. The account is real and the client paid it — this is the
+    # Bridge's to resolve, and it must never be silent.
+    if homeless:
+        lines.append(
+            f"NOT recorded ({len(homeless)}): there is no open trade for that "
+            "account right now. The Bridge has been told."
+        )
+        if notifier is not None:
+            # The rows go over; the notifier reads the supplier's name off
+            # them. A supplier name must not appear in a client-facing
+            # handler at all — see Notifier.alert_no_open_trade.
+            await notifier.alert_no_open_trade(
+                [(s, by_id[s["account_id"]]) for s in homeless]
+            )
 
     if unmatched and not accounts:
         # Nothing to offer. The buttons come from instructed trades only, so
         # asking "which account?" with an empty keyboard is a dead end — and
         # it is the exact state the client was left in on 16 September, when
         # both new vendors' trades had been cancelled.
+        #
+        # Held anyway, so it survives. Before 7 October this branch wrote
+        # nothing down at all: the client was told it had not been recorded,
+        # the Bridge was told once, and from then on the only trace was two
+        # chat messages. The chase has nothing to offer him either, and says
+        # so — but the money is on a list that outlives the conversation.
         await state.clear()
-        await message.reply(
-            "This has NOT been recorded — I could not match that account and "
-            "there is no open instruction to check it against.\n\n"
-            "The Bridge has been notified."
+        for s in unmatched:
+            await repo.hold_payment(
+                client_id=party["id"], utr=s["utr"],
+                amount_inr=to_decimal(s["amount"]),
+                typed_beneficiary=s.get("beneficiary"),
+                why="the beneficiary matched nothing and there was no "
+                    "instructed trade to offer the client",
+                chat_id=message.chat.id, message_id=message.message_id,
+            )
+        lines.append(
+            f"NOT recorded ({len(unmatched)}): I could not match that account "
+            "and there is no open instruction to check it against. The Bridge "
+            "has been told."
         )
+        await message.reply("\n".join(lines))
         if notifier is not None:
             await notifier.to_bridge(
                 "A payment could not be matched, and there is no instructed "
@@ -685,11 +769,24 @@ async def on_pasted_payment(message: Message, state: FSMContext, party, repo,
             )
         return
 
+    if not unmatched:
+        # Only homeless ones left over, and they have been reported. Nothing
+        # for the client to answer.
+        await state.clear()
+        await message.reply("\n".join(lines))
+        return
+
     if unmatched:
         # Never guess an account. A wrong one attributes money to the wrong
         # place — and now to the wrong trade as well — and the client is right
         # here to be asked. This is the one case that still stops and waits,
         # whatever the confirmation setting.
+        #
+        # ONLY the unmatched ones are carried forward. The account the client
+        # taps is applied to everything still waiting, so anything already
+        # recorded must not be in that list — it would be offered up a second
+        # time and attributed to whichever account they happened to pick.
+        await state.update_data(staged=unmatched)
         await state.set_state(PastedPayment.account)
         # Account names only — never the supplier. This list went out to the
         # client on 11 September 2026 reading "Supplier A — …" and
@@ -726,46 +823,25 @@ async def on_pasted_payment(message: Message, state: FSMContext, party, repo,
                 chat_id=message.chat.id, message_id=message.message_id,
             )
 
-        # Tell the Bridge that money is in limbo.
+        # Tell the Bridge that money is in limbo — and only about the money
+        # that is. Reporting the whole message here told him payments were
+        # unrecorded that were already safely on the ledger.
         if notifier is not None:
             await notifier.to_bridge(
                 "A payment could not be matched to an account and is NOT "
                 "recorded yet.\n\n"
                 + "\n".join(
                     f"  {s['utr']}  ₹{fmt_inr(to_decimal(s['amount']))}"
-                    for s in staged
+                    for s in unmatched
                 )
                 + "\n\nThe client has been asked which account it went to. "
                   "Nothing is logged until they answer."
             )
         return
 
-    if result.problems:
-        # Something was only partly readable. Never silently drop it.
-        await state.set_state(PastedPayment.confirm)
-        kb = InlineKeyboardMarkup(inline_keyboard=[[
-            InlineKeyboardButton(text="Confirm", callback_data="pyes"),
-            InlineKeyboardButton(text="Cancel", callback_data="pno"),
-        ]])
-        lines.append("Correct?")
-        await message.answer("\n".join(lines), reply_markup=kb)
-        return
-
-    if REQUIRE_PASTE_CONFIRMATION:
-        await state.set_state(PastedPayment.confirm)
-        kb = InlineKeyboardMarkup(inline_keyboard=[[
-            InlineKeyboardButton(text="Confirm", callback_data="pyes"),
-            InlineKeyboardButton(text="Cancel", callback_data="pno"),
-        ]])
-        lines.append("Correct?")
-        await message.answer("\n".join(lines), reply_markup=kb)
-        return
-
-    # Everything read cleanly and every account matched: record it and
-    # acknowledge, no tap required (client decision, 8 Sep 2026).
-    await state.clear()
-    await _record(message, staged, party, repo, acknowledge=True,
-                  notifier=notifier)
+    # Every branch above returns. The clean-message path — including both
+    # confirmation settings — lives at the top, where it can be read as the
+    # ordinary case rather than as what is left over after the exceptions.
 
 
 # ------------------------------------------------------- edited payments
