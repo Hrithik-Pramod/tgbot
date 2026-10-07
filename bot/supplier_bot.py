@@ -98,7 +98,42 @@ async def account_ifsc(message: Message, state: FSMContext, party, repo, notifie
     await message.answer(f"Stored.\n\n{detail}")
 
     # The brief requires the Bridge to be notified of every account change.
-    await notifier.to_bridge(f"New account registered by {party['label']}\n\n{detail}")
+    note = ""
+
+    # And if another vendor already collects into this account, say so.
+    #
+    # One account under several vendors is the single thing that makes a
+    # beneficiary name unanswerable — every slip reads the same, so nothing
+    # but a person can say whose order a payment is for. Super Trading
+    # reached four vendors and Kisan Traders two, each addition quietly
+    # making every payment to them ambiguous. The first anyone noticed was a
+    # client being shown eight buttons with two identical pairs on it.
+    #
+    #     why and also im seeing duplicate on accounts, Kisan traers is not
+    #     in use — Bridge, 7 October 2026
+    #
+    # It is allowed, and the bot handles it by asking him. It should be
+    # something he decides, not something he finds out.
+    shared = await repo.others_sharing_account(
+        party_id=party["id"],
+        account_number=data["account_number"], ifsc=ifsc,
+    )
+    if shared:
+        who = ", ".join(
+            f"{r['vendor']}{' (trading now)' if r['has_live_order'] else ''}"
+            for r in shared
+        )
+        note = (
+            f"\n\n⚠ This account is ALREADY registered to: {who}\n\n"
+            "A name on a payment slip cannot say which vendor's order it "
+            "belongs to, so every payment here will come to you to place. "
+            "If one of them no longer uses it, take it off with "
+            "/account_remove in their group."
+        )
+
+    await notifier.to_bridge(
+        f"New account registered by {party['label']}\n\n{detail}{note}"
+    )
 
 
 # ---------------------------------------------------------------- /progress

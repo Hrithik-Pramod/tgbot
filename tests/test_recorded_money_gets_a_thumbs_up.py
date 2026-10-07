@@ -145,13 +145,45 @@ class TestTheOutcomeIsReportedNotJustALine:
         assert notifier.asked, "the Bridge should have been asked"
 
     @pytest.mark.asyncio
-    async def test_not_this_case_is_still_nothing(self):
-        """One live order only — the ordinary matcher covers that."""
-        repo = _Repo([_trade(14, D("1000000"))])
+    async def test_nothing_live_on_the_account_is_still_nothing(self):
+        """
+        No order to place it against, so there is nothing to decide and
+        nobody to ask.
+
+        Until 7 October this also covered ONE live order, on the grounds
+        that the ordinary matcher would have picked it. It did not always,
+        and the question then went to the client — see
+        test_shared_account_asks_the_bridge.py.
+        """
+        repo = _Repo([])
         out = await client_bot._place_on_shared_account(
             _Message(), _P(), ACCOUNTS, {"id": 9}, repo, _Notifier(),
         )
         assert out is None
+
+    @pytest.mark.asyncio
+    async def test_one_live_order_already_collecting_is_recorded(self):
+        """
+        The established path still books it silently, so widening the rule
+        costs an extra question only where there is a genuine doubt.
+        """
+        repo = _Repo([_trade(14, D("1000000"))])
+        out = await client_bot._place_on_shared_account(
+            _Message(), _P(), ACCOUNTS, {"id": 9}, repo, _Notifier(),
+        )
+        assert out is not None
+        assert out[0] == "recorded"
+
+    @pytest.mark.asyncio
+    async def test_one_live_order_not_yet_collecting_asks_the_bridge(self):
+        """Not the client. They cannot know whose order it is."""
+        repo = _Repo([_trade(14, D(0))])
+        notifier = _Notifier()
+        out = await client_bot._place_on_shared_account(
+            _Message(), _P(), ACCOUNTS, {"id": 9}, repo, notifier,
+        )
+        assert out is not None and out[0] == "held"
+        assert notifier.asked
 
 
 class TestTheClientIsToldTheRightThing:

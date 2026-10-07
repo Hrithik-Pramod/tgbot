@@ -380,6 +380,44 @@ class Repo:
                 )
                 return account_id
 
+    async def others_sharing_account(
+        self, *, party_id: int, account_number: str, ifsc: str,
+    ) -> list[asyncpg.Record]:
+        """
+        Which OTHER vendors already collect into this same bank account.
+
+        One account under several vendors is the single thing that makes a
+        beneficiary name unanswerable: the name is identical on every slip,
+        so nothing but a human can say which vendor's order a payment is
+        for. Super Trading ended up registered under four vendors and Kisan
+        Traders under two, and each addition made every payment to them
+        ambiguous — without anyone being told it had happened.
+
+            why and also im seeing duplicate on accounts, Kisan traers is
+            not in use
+            — Bridge, 7 October 2026
+
+        It is not an error. Vendors do genuinely share a collection account,
+        and the bot handles that by asking the Bridge. But it should be a
+        decision he makes knowingly rather than a state he discovers.
+        """
+        async with self.pool.acquire() as conn:
+            return await conn.fetch(
+                """
+                SELECT b.id, b.account_name, p.label AS vendor,
+                       EXISTS (SELECT 1 FROM trades t
+                               WHERE t.supplier_id = b.party_id
+                                 AND t.status IN ('open','awaiting_payment'))
+                           AS has_live_order
+                FROM bank_accounts b
+                JOIN parties p ON p.id = b.party_id
+                WHERE b.account_number = $2 AND b.ifsc = $3
+                  AND b.party_id <> $1 AND b.is_active
+                ORDER BY p.label
+                """,
+                party_id, account_number, ifsc,
+            )
+
     async def remove_bank_account(self, *, account_id: int, party_id: int) -> bool:
         """
         Soft delete. A hard delete would orphan the payments that reference this

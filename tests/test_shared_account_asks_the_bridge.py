@@ -381,15 +381,56 @@ class TestEverythingElseIsUntouched:
         assert "if account_id is None:" in src
         assert "_place_on_shared_account" in src
 
-    def test_it_falls_through_when_fewer_than_two_orders_are_live(self):
+    def test_it_falls_through_only_when_nothing_is_live_on_the_account(self):
         """
-        Names clashed but only one order is open — match_beneficiary's own
-        tiebreak covers that, and two ways of doing one thing is how they
-        drift apart.
+        WIDENED 7 October 2026. This asserted "fewer than two live orders",
+        on the reasoning that with one order match_beneficiary's tiebreak
+        would already have picked it, so there was nothing to decide.
+
+        That holds until the tiebreak declines for some other reason — and
+        then the question fell through to the CLIENT, who is the one person
+        who cannot answer it. At 06:36 that day "SUPER TRADING COMPANY", one
+        account registered to three vendors, was put to the client with eight
+        buttons including two identical pairs.
+
+        The trigger was never the number of orders. It is whether the account
+        is shared across vendors, which is the Bridge's own rule. So it falls
+        through only when there is no live order at all — nothing to place it
+        against and nothing for anyone to choose between.
         """
         src = inspect.getsource(client_bot._place_on_shared_account)
-        assert "len(trades) < 2" in src
-        assert "return None" in src
+        assert "if not trades:" in src
+        assert "len(trades) < 2" not in src, (
+            "the old count rule is back, and with it the client being asked "
+            "a question only the Bridge can answer"
+        )
+
+    def test_a_shared_account_is_still_the_only_trigger(self):
+        """
+        The widening must not become "ask the Bridge about everything". The
+        gate is still one physical account under several vendors.
+
+            yes, do it, but only when 2 vendors are using 1 account, thats
+            the trigger, not for all trading — Bridge, 1 October 2026
+        """
+        src = inspect.getsource(client_bot._place_on_shared_account)
+        gate = src[:src.index("live_trades_on_account")]
+        assert "shared_account_for" in gate
+        assert "if key is None:" in gate
+        assert "return None" in gate
+
+    def test_every_refusal_is_written_down(self):
+        """
+        On 7 October a payment went to the client instead of the Bridge and
+        the audit row could not say which of four reasons applied. A day was
+        spent reconstructing it from chat screenshots.
+        """
+        src = inspect.getsource(client_bot._place_on_shared_account)
+        branches = src.count("return None")
+        logged = src.count("_log_shared_decision")
+        assert logged >= branches, (
+            f"{branches} ways to decline, only {logged} of them recorded"
+        )
 
     def test_the_client_is_never_told_there_are_two_orders(self):
         """

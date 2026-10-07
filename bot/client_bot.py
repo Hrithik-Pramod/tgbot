@@ -128,6 +128,46 @@ def _account_button(account, among) -> str:
     return f"{tail} — ₹{fmt_inr(outstanding)} left"
 
 
+async def _log_shared_decision(repo, party, p, matchable, *,
+                               account_number=None, reason: str) -> None:
+    """
+    Write down WHY a payment did not go to the Bridge.
+
+    The unmatched audit row already records every candidate account and
+    whether each had an open trade. What it never recorded was the decision
+    this branch made — and on 7 October that cost a day. A payment named
+    "SUPER TRADING COMPANY" went to the client, when one account registered
+    under three vendors should have gone to the Bridge, and the row could not
+    say which of four possible reasons applied.
+
+    Four questions, and afterwards the answer is in the row rather than in
+    somebody's reconstruction of it.
+    """
+    try:
+        await repo.audit_standalone(
+            actor_party_id=party["id"],
+            action="payment.shared_account_declined",
+            entity_type="payment", entity_id=None,
+            detail={
+                "utr": p.utr,
+                "typed": p.beneficiary,
+                "amount_inr": str(p.amount_inr),
+                "reason": reason,
+                "account_number_last4": (account_number or "")[-4:] or None,
+                "candidates_with_same_number": [
+                    {"id": a["id"], "name": a["account_name"],
+                     "has_open_trade": a["trade_id"] is not None}
+                    for a in matchable
+                    if account_number
+                    and str(a["account_number"]) == account_number
+                ],
+            },
+        )
+    except Exception:
+        # Diagnostics must never be the reason a payment is not handled.
+        log.exception("could not record the shared-account decision")
+
+
 async def _place_on_shared_account(message, p, matchable, party, repo, notifier):
     """
     One account, two vendors. Decide without asking the client.
@@ -160,17 +200,49 @@ async def _place_on_shared_account(message, p, matchable, party, repo, notifier)
     """
     key = shared_account_for(p.beneficiary, matchable)
     if key is None:
+        await _log_shared_decision(repo, party, p, matchable,
+                                   reason="the name did not resolve to a "
+                                          "single shared account")
         return None
     account_number, ifsc = key
 
     trades = await repo.live_trades_on_account(
         client_id=party["id"], account_number=account_number, ifsc=ifsc,
     )
-    if len(trades) < 2:
-        # The names clashed but only one order is live, so there is nothing
-        # to decide. match_beneficiary's own tiebreak already covers this;
-        # falling through keeps one behaviour rather than two.
+    if not trades:
+        # Nothing live on it at all, so there is no order to put it against
+        # and nothing for anyone to choose between.
+        await _log_shared_decision(
+            repo, party, p, matchable, account_number=account_number,
+            reason="no live order on that account",
+        )
         return None
+
+    # Widened 7 October 2026, from "fewer than two live orders".
+    #
+    # The old rule reasoned that with one live order there is nothing to
+    # decide, because match_beneficiary's tiebreak would already have picked
+    # it. That holds right up until the tiebreak declines for some OTHER
+    # reason — and then the question fell through to the CLIENT, who is the
+    # one person who cannot answer it. They see one account and one payment;
+    # nothing on the slip distinguishes whose order it is.
+    #
+    # 7 October, 06:36: "SUPER TRADING COMPANY" — one account registered to
+    # three vendors, two of them with live orders — was put to the client,
+    # with eight buttons including two identical pairs:
+    #
+    #     This stopped it then all the rest were not read
+    #
+    # Whatever declined upstream, routing it here is the right answer. The
+    # account is shared across vendors, which is the Bridge's rule and the
+    # Bridge's call:
+    #
+    #     yes, do it, but only when 2 vendors are using 1 account, thats the
+    #     trigger — Bridge, 1 October 2026
+    #
+    # With one live order and collection started, choose_established_path
+    # still books it silently, so this costs an extra question only when
+    # there is a genuine doubt.
 
     path = choose_established_path(trades)
     if path is not None:
@@ -183,6 +255,11 @@ async def _place_on_shared_account(message, p, matchable, party, repo, notifier)
         if not ok:
             # A duplicate, almost certainly. Let the ordinary path report it
             # properly rather than inventing a second way of saying so.
+            await _log_shared_decision(
+                repo, party, p, matchable, account_number=account_number,
+                reason="the established order refused it, almost certainly a "
+                       "duplicate; the ordinary path will report it",
+            )
             return None
 
         # A payment that is recorded is a payment that can finish the trade.
@@ -213,7 +290,14 @@ async def _place_on_shared_account(message, p, matchable, party, repo, notifier)
         chat_id=message.chat.id, message_id=message.message_id,
     )
     if not held:
-        return None          # already recorded or already waiting
+        # Already recorded, or already waiting on an answer. Either way this
+        # is not a new question — but it IS a reason the Bridge was not
+        # asked, so it is written down with the others.
+        await _log_shared_decision(
+            repo, party, p, matchable, account_number=account_number,
+            reason="already recorded, or already waiting on an answer",
+        )
+        return None
 
     if notifier is not None:
         await notifier.ask_which_order(held_id=held_id, utr=p.utr,
