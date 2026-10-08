@@ -196,9 +196,9 @@ class TestTheClientIsToldTheRightThing:
     def test_recorded_money_is_acknowledged_not_narrated(self):
         src = inspect.getsource(client_bot.on_pasted_payment)
         assert "_acknowledge(message)" in src
-        branch = src[src.index("if (pending_any or recorded_any)"):]
-        head = branch[:900]
-        assert "if pending_any:" in head
+        branch = src[src.index("if (pending_any or recorded_any or duplicate_any)"):]
+        head = branch[:1200]
+        assert "if pending_any or duplicate_any:" in head
         assert "_acknowledge(message)" in head, (
             "a payment recorded on the established path still gets a block "
             "of text instead of a thumbs up"
@@ -206,7 +206,7 @@ class TestTheClientIsToldTheRightThing:
 
     def test_waiting_money_is_still_explained_in_words(self):
         src = inspect.getsource(client_bot.on_pasted_payment)
-        branch = src[src.index("if (pending_any or recorded_any)"):]
+        branch = src[src.index("if (pending_any or recorded_any or duplicate_any)"):]
         head = branch[:900]
         assert 'message.reply("\\n".join(lines))' in head, (
             "a payment waiting on the Bridge must be said in words — the "

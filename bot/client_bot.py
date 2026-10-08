@@ -253,14 +253,28 @@ async def _place_on_shared_account(message, p, matchable, party, repo, notifier)
             added_by=party["id"],
         )
         if not ok:
-            # A duplicate, almost certainly. Let the ordinary path report it
-            # properly rather than inventing a second way of saying so.
+            # Already on the ledger — the client has pasted it again.
+            #
+            # This used to return None, which dropped the payment back into
+            # the unmatched pile and asked the client WHICH ACCOUNT it went
+            # to, for money the bot had recorded hours earlier. The reply
+            # then read "account not recognised" directly above "already
+            # recorded", which is two contradictory statements about the
+            # same payment.
+            #
+            #     Again peter / From nowhere — Bridge, 8 October 2026
+            #
+            # PUNBR…8869 was banked on BRAV19 at 14:55 and asked about at
+            # 19:25 and again at 19:32. Nothing was wrong with the money. The
+            # bot was interrogating the client about its own bookkeeping.
+            #
+            # A duplicate is a complete answer, not a failure to find one.
             await _log_shared_decision(
                 repo, party, p, matchable, account_number=account_number,
-                reason="the established order refused it, almost certainly a "
-                       "duplicate; the ordinary path will report it",
+                reason="already recorded; reported as a duplicate rather than "
+                       "asked about again",
             )
-            return None
+            return "duplicate", "already recorded — not added again"
 
         # A payment that is recorded is a payment that can finish the trade.
         #
@@ -604,7 +618,8 @@ async def on_pasted_payment(message: Message, state: FSMContext, party, repo,
 
     staged, lines = [], ["Read this as:", ""]
     pending_any = False     # written down, waiting on the Bridge
-    recorded_any = False    # already on the ledger, nothing owed to anyone
+    recorded_any = False    # put on the ledger just now
+    duplicate_any = False   # was already on the ledger before this message
     for p in result.payments:
         account_id = match_beneficiary(p.beneficiary, matchable)
         row = by_id.get(account_id)
@@ -628,6 +643,8 @@ async def on_pasted_payment(message: Message, state: FSMContext, party, repo,
                 outcome, line = placed
                 if outcome == "held":
                     pending_any = True
+                elif outcome == "duplicate":
+                    duplicate_any = True
                 else:
                     recorded_any = True
                 lines.append(p.utr)
@@ -699,10 +716,17 @@ async def on_pasted_payment(message: Message, state: FSMContext, party, repo,
     # Everything in this message was settled on the Bridge's side. Nothing is
     # left for the client to confirm or be asked — but WHAT they are told
     # depends on whether their money is on the books or waiting.
-    if (pending_any or recorded_any) and not staged:
+    if (pending_any or recorded_any or duplicate_any) and not staged:
         await state.clear()
-        if pending_any:
-            # Something is genuinely waiting. That needs saying in words.
+        if pending_any or duplicate_any:
+            # Something is waiting, or something was already counted. Either
+            # way a thumbs up would be wrong: a duplicate is never
+            # acknowledged silently, because the client has to know that one
+            # did not go in a second time (E3).
+            if duplicate_any and not pending_any:
+                lines.append(
+                    "Already counted in the total below. No action needed."
+                )
             await message.reply("\n".join(lines))
         else:
             # All of it is recorded. This is an ordinary paid payment and it
@@ -1175,10 +1199,30 @@ async def pasted_pick_account(call: CallbackQuery, state: FSMContext, party, rep
     totals = []
     for tid in {s["trade_id"] for s in staged if s["trade_id"]}:
         totals.append(f"Running total: ₹{fmt_inr(await repo.trade_paid_total(tid))}")
-    await call.message.edit_text(
-        call.message.text.split("Which account")[0].rstrip()
-        + "\n\nRecorded. " + "  ".join(totals)
+
+    # Answer the question that was asked, in the message that asked it.
+    #
+    # Only the question was stripped, so the line that prompted it survived
+    # and the confirmed message read:
+    #
+    #     to ?  (account not recognised)
+    #     Recorded. Running total: ₹3,473,100
+    #
+    # Two contradictory statements about the same payment, the alarming one
+    # first. Noticed 4 October, still there on the 8th, and it makes a
+    # correctly recorded payment look like a silent mis-record every time.
+    #
+    # The client has now told us the account, so the line can say it.
+    chosen_name = next(
+        (a["account_name"] for a in await repo.open_trade_accounts_for_client(
+            party["id"]) if a["id"] == account_id),
+        None,
     )
+    body = call.message.text.split("Which account")[0].rstrip()
+    if chosen_name:
+        body = body.replace("to ?  (account not recognised)",
+                            f"to {chosen_name}")
+    await call.message.edit_text(body + "\n\nRecorded. " + "  ".join(totals))
     await call.answer()
 
 

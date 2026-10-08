@@ -242,6 +242,11 @@ class TestTheEstablishedPathClosesTheTrade:
         add_payment refused, so no money moved and there is nothing to close.
         Claiming here would announce a completion on the strength of a
         payment that was never recorded.
+
+        It now reports itself as a duplicate rather than returning None.
+        Returning None dropped it back into the unmatched pile and asked the
+        client which account it went to, for money the bot had banked hours
+        earlier — "Again peter / From nowhere", 8 October 2026.
         """
         trades = [_trade(43, D("5349500")), _trade(44, D(0))]
         notifier = _Notifier()
@@ -249,7 +254,7 @@ class TestTheEstablishedPathClosesTheTrade:
             _Message(), _P(), ACCOUNTS, {"id": 9},
             _Repo(trades, add_ok=False), notifier,
         )
-        assert out is None
+        assert out is not None and out[0] == "duplicate"
         assert notifier.completed == []
 
     @pytest.mark.asyncio
