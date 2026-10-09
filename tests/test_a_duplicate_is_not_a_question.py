@@ -121,7 +121,8 @@ class _Repo:
     async def open_trade_accounts_for_client(self, cid): return list(SHARED)
 
     async def live_trades_on_account(self, **kw):
-        return [{"id": 107, "account_id": 33, "collected": self.collected,
+        return [{"id": 107, "account_id": 33, "supplier_id": 30,
+                 "collected": self.collected,
                  "inr_expected": D("3012885"), "reference": "BRAV19",
                  "opened_at": None, "outstanding": D("2012885"),
                  "vendor": "A VENDOR"}]

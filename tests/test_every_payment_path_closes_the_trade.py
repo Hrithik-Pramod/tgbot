@@ -194,9 +194,9 @@ ACCOUNTS = [
 ]
 
 
-def _trade(tid, collected, expected=D("5644500")):
+def _trade(tid, collected, expected=D("5644500"), supplier_id=30):
     return {"id": tid, "account_id": 12, "collected": collected,
-            "inr_expected": expected}
+            "inr_expected": expected, "supplier_id": supplier_id}
 
 
 class TestTheEstablishedPathClosesTheTrade:

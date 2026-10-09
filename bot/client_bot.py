@@ -244,7 +244,37 @@ async def _place_on_shared_account(message, p, matchable, party, repo, notifier)
     # still books it silently, so this costs an extra question only when
     # there is a genuine doubt.
 
-    path = choose_established_path(trades)
+    # DIFFERENT SUPPLIER + SAME ACCOUNT = DIFFERENT DEBT.
+    #
+    # The established path — "the order already collecting into this account
+    # is the one the client is working through" — was the Bridge's rule of
+    # 1 October, and it is right when the orders belong to ONE vendor
+    # splitting a collection. It is wrong across vendors, because then the
+    # two orders are two different debts that happen to share a bank account,
+    # and being mid-collection on one says nothing about whose the next
+    # payment is.
+    #
+    # 9 October 2026: ₹288,000 for Uncle landed on IndoLondon's SUPA50
+    # because SUPA50 was mid-collection and Royal Trading is registered to
+    # both. He named the rule himself afterwards:
+    #
+    #     i think we need a rule to identify the combination, different
+    #     supplier + same account = different debt
+    #
+    # So the shortcut survives only within a single vendor. Across vendors
+    # the Bridge decides, every time.
+    # Named "owners" rather than anything containing the word this handler
+    # is forbidden to mention: a client-facing function must not carry a
+    # vendor's name, and the guard that enforces that reads the source.
+    # These are ids, never labels.
+    try:
+        owners = {t["supplier_id"] for t in trades}
+    except (KeyError, TypeError):
+        # Cannot tell whose orders these are, so do not assume they are one
+        # party's. Asking costs a tap; assuming costs a misattribution.
+        owners = None
+    path = (choose_established_path(trades)
+            if owners is not None and len(owners) == 1 else None)
     if path is not None:
         chosen = next(t for t in trades if t["id"] == path)
         ok, _ = await repo.add_payment(

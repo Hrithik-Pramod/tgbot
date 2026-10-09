@@ -108,9 +108,9 @@ class _Notifier:
         self.asked.append(kw)
 
 
-def _trade(tid, collected):
+def _trade(tid, collected, supplier_id=30):
     return {"id": tid, "account_id": 33, "collected": collected,
-            "inr_expected": D("3012885")}
+            "inr_expected": D("3012885"), "supplier_id": supplier_id}
 
 
 class TestTheOutcomeIsReportedNotJustALine:

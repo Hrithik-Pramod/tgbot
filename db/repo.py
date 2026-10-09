@@ -1345,6 +1345,36 @@ class Repo:
                        ON t.supplier_id = s.id
                       AND t.client_id = w.client_id
                       AND t.status IN ('open', 'awaiting_payment')
+                      -- AND the order was actually issued against THIS
+                      -- account.
+                      --
+                      -- A deal is a supplier AND an account, not a supplier
+                      -- (Bridge, 9 October 2026):
+                      --
+                      --     i think we need a rule to identify the
+                      --     combination, different supplier + same account
+                      --     = different debt
+                      --
+                      --     if a trade is happening, from supplier A to
+                      --     account A ... Acc B which was never allocated
+                      --     to this deal, should never break the expected
+                      --     outcome
+                      --
+                      -- Without this, an account resolved to ANY open order
+                      -- of its vendor. On 9 October ₹288,000 paid into
+                      -- royal trading company landed on SUPA50 — an order
+                      -- issued entirely against KISAN TRADERS — because
+                      -- both accounts belong to IndoLondon. The figure the
+                      -- client was working to and the figure the order
+                      -- claimed stopped being the same thing.
+                      --
+                      -- An account with no instruction behind it now
+                      -- resolves to no order, which routes it to the Bridge
+                      -- to place rather than attaching it to a deal it was
+                      -- never part of.
+                      AND EXISTS (SELECT 1 FROM payment_slots ps
+                                  WHERE ps.trade_id = t.id
+                                    AND ps.bank_account_id = b.id)
                 -- Retired pairings are DELIBERATELY still here. This is
                 -- the matcher: a slip for a vendor who has since been
                 -- retired must still read, or it is 16 September again —
@@ -2912,7 +2942,7 @@ class Repo:
                 """
                 SELECT DISTINCT ON (t.id)
                        t.id, t.reference, t.opened_at, t.instructed_at,
-                       t.inr_expected,
+                       t.supplier_id, t.inr_expected,
                        COALESCE((SELECT sum(p.amount_inr) FROM payments p
                                  WHERE p.trade_id = t.id), 0) AS collected,
                        t.inr_expected
@@ -2926,6 +2956,12 @@ class Repo:
                                     AND b.account_number = $2 AND b.ifsc = $3
                 WHERE t.client_id = $1
                   AND t.status IN ('open', 'awaiting_payment')
+                  -- Issued against this account, not merely belonging to a
+                  -- vendor who owns it. Same rule as the matcher: a deal is
+                  -- a supplier AND an account (Bridge, 9 October 2026).
+                  AND EXISTS (SELECT 1 FROM payment_slots ps
+                              WHERE ps.trade_id = t.id
+                                AND ps.bank_account_id = b.id)
                 ORDER BY t.id, b.is_active DESC, t.opened_at
                 """,
                 client_id, account_number, ifsc,
