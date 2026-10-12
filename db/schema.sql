@@ -525,6 +525,54 @@ CREATE INDEX held_payments_waiting_idx
     ON held_payments (asked_at) WHERE resolved_at IS NULL;
 
 
+-- ------------------------------------------------------- collection paths
+-- Which order a shared bank account is currently collecting for.
+--
+-- When several vendors collect into one account and more than one has a live
+-- order, no slip can say which order a payment belongs to. The bot asks the
+-- Bridge — and from 12 October 2026 it asks ONCE, not once per payment.
+--
+-- That day nineteen payments arrived on one account in three hours, nineteen
+-- identical questions went out, two were tapped onto the wrong order, and an
+-- order closed ₹44,090 over. The audit log recorded both as "Bridge chose the
+-- order", which is true and is exactly the point: the asking was the fault.
+--
+-- His answer is the path. The next payment follows it without a question —
+-- as it did before, but because he said so rather than because the bot
+-- inferred it from whichever order happened to be part-paid.
+--
+-- Cleared when the order closes, so the next order gets its own decision. A
+-- path is never inherited.
+CREATE TABLE collection_paths (
+    id              BIGSERIAL PRIMARY KEY,
+
+    client_id       BIGINT      NOT NULL REFERENCES parties(id),
+
+    -- The PHYSICAL account, not an account row: several rows share these two
+    -- values, which is the whole reason a path is needed.
+    account_number  TEXT        NOT NULL,
+    ifsc            TEXT        NOT NULL,
+
+    trade_id        BIGINT      NOT NULL REFERENCES trades(id),
+
+    set_by          BIGINT      REFERENCES parties(id),
+    set_at          TIMESTAMPTZ NOT NULL DEFAULT now(),
+
+    -- Kept rather than deleted, so who decided what survives the order.
+    cleared_at      TIMESTAMPTZ,
+    cleared_why     TEXT
+);
+
+-- One live path per account per client. Two would be two answers to one
+-- question, and the lookup would have to guess between them.
+CREATE UNIQUE INDEX collection_paths_live_unique
+    ON collection_paths (client_id, account_number, ifsc)
+    WHERE cleared_at IS NULL;
+
+CREATE INDEX collection_paths_trade_idx
+    ON collection_paths (trade_id) WHERE cleared_at IS NULL;
+
+
 -- ---------------------------------------------------------- payout sources
 -- The addresses this desk settles from.
 --

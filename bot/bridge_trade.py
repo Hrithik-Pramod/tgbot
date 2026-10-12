@@ -1445,6 +1445,24 @@ async def place_held_payment(call: CallbackQuery, party, repo, notifier) -> None
         held_id=int(held_id), trade_id=chosen["id"],
         account_id=chosen["account_id"], actor_party_id=party["id"],
     )
+
+    # Remember the answer, so he is not asked it again.
+    #
+    # On 12 October he was asked nineteen times in three hours about one
+    # shared account, and two of the nineteen were tapped onto the wrong
+    # order — the audit recorded both as "Bridge chose the order", which is
+    # true and is the whole point. Nineteen identical prompts is not a
+    # question, it is a reflex test.
+    #
+    # Only for the shared-ACCOUNT kind of hold. A payment held because the
+    # name matched nothing has no account to attach a path to, and the next
+    # unreadable name is a fresh question.
+    if ok and held["account_number"]:
+        await repo.set_collection_path(
+            client_id=held["client_id"],
+            account_number=held["account_number"], ifsc=held["ifsc"],
+            trade_id=chosen["id"], actor_party_id=party["id"],
+        )
     await call.message.answer(
         msg if not ok else
         f"{msg}\n\n"

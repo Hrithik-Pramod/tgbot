@@ -105,6 +105,45 @@ _NOISE_WORDS = {
 }
 
 
+# Things this bot says. Never a beneficiary, whatever else a line looks like.
+#
+# 12 October 2026: the bot read its own reply back as a payment. A message
+# carrying a UTR, an amount, and the line
+#
+#     held — being confirmed, nothing further needed from you
+#
+# produced an unmatched-beneficiary record with that sentence as the name —
+# audit log, 18:15. Clients quote the bot's replies back when they are
+# chasing something, and a screenshot of the chat contains both sides of it.
+#
+# Matched on a distinctive fragment rather than the whole line, because the
+# surrounding text differs by case and by what was quoted around it.
+_OUR_OWN_WORDS = (
+    "being confirmed, nothing further needed",
+    "account not recognised",
+    "already been recorded",
+    "already been placed",
+    "has not been recorded",
+    "running total",
+    "read this as",
+    "which account did these go to",
+    "nothing new to add",
+)
+
+
+def _is_our_own_words(line: str) -> bool:
+    """
+    True when this line is something the bot itself wrote.
+
+    Checked before anything else in classify, including the "to …" label.
+    That label is what caught it on 12 October: `to ?  (account not
+    recognised)` is the bot's own output, and the label matched before the
+    noise test ever ran, so the sentence became a beneficiary.
+    """
+    lowered = line.lower()
+    return any(phrase in lowered for phrase in _OUR_OWN_WORDS)
+
+
 def _is_noise(line: str) -> bool:
     """
     True when a line is screenshot furniture rather than payment data.
@@ -114,6 +153,8 @@ def _is_noise(line: str) -> bool:
     traders" is kept. Being conservative here matters: wrongly discarding a
     line loses a payment, while wrongly keeping one is caught at confirmation.
     """
+    if _is_our_own_words(line):
+        return True
     if _NOISE_TIME.match(line):
         return True
     words = re.findall(r"[A-Za-z]+", line)
@@ -173,6 +214,15 @@ def classify(line: str) -> tuple[str, str]:
     raw = line.strip()
     if not raw:
         return "noise", ""
+
+    # Before the labels, because one of the labels is what caught it.
+    #
+    # `to ?  (account not recognised)` is the bot's own output, and the "to"
+    # label matched it before the noise test ever ran — so on 12 October the
+    # bot read its own reply back and recorded a beneficiary called
+    # "held — being confirmed, nothing further needed from you".
+    if _is_our_own_words(raw):
+        return "noise", raw
 
     # The sender's side of the slip, before anything else looks at it.
     # Whatever follows "from" describes where the money left, not where it

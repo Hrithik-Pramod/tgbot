@@ -101,6 +101,10 @@ class _Repo:
 
     async def live_trades_on_account(self, **kw): return list(self.trades)
 
+    async def collection_path(self, **kw):
+        # No path set: the Bridge has not been asked yet.
+        return None
+
     async def add_payment(self, **kw):
         self.added.append(kw)
         return True, "Recorded."

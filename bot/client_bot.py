@@ -263,19 +263,47 @@ async def _place_on_shared_account(message, p, matchable, party, repo, notifier)
     #
     # So the shortcut survives only within a single vendor. Across vendors
     # the Bridge decides, every time.
-    # Named "owners" rather than anything containing the word this handler
-    # is forbidden to mention: a client-facing function must not carry a
-    # vendor's name, and the guard that enforces that reads the source.
-    # These are ids, never labels.
-    try:
-        owners = {t["supplier_id"] for t in trades}
-    except (KeyError, TypeError):
-        # Cannot tell whose orders these are, so do not assume they are one
-        # party's. Asking costs a tap; assuming costs a misattribution.
-        owners = None
-    path = (choose_established_path(trades)
-            if owners is not None and len(owners) == 1 else None)
-    if path is not None:
+    # HAS HE ALREADY SAID WHICH ORDER THIS ACCOUNT IS COLLECTING FOR?
+    #
+    # If so, that is the answer, and asking again is the fault being fixed.
+    # On 12 October nineteen payments landed on one shared account in three
+    # hours and he was asked nineteen times. Two were tapped onto the wrong
+    # order and it closed ₹44,090 over:
+    #
+    #     the bot is asking me everytime to choose ... we cant keep having
+    #     this happen mate — Bridge, 12 October 2026
+    #
+    # His answer is now remembered and followed until the order closes. It
+    # is checked against the orders live on THIS account, so a path whose
+    # order has moved on cannot route money to it.
+    chosen_id = None
+    said = await repo.collection_path(
+        client_id=party["id"], account_number=account_number, ifsc=ifsc,
+    )
+    if said is not None and any(t["id"] == said["trade_id"] for t in trades):
+        chosen_id = said["trade_id"]
+    else:
+        # Nobody has decided yet. Within ONE party's orders the established
+        # path still decides — that is one debt in two parts and was what
+        # the shortcut was written for. Across parties it is two debts
+        # sharing a bank account, and only he can say which.
+        #
+        # Named "owners" rather than anything containing the word this
+        # handler is forbidden to mention: a client-facing function must not
+        # carry a vendor's name, and the guard that enforces it reads the
+        # source. These are ids, never labels.
+        try:
+            owners = {t["supplier_id"] for t in trades}
+        except (KeyError, TypeError):
+            # Cannot tell whose orders these are, so do not assume they are
+            # one party's. Asking costs a tap; assuming costs a
+            # misattribution.
+            owners = None
+        if owners is not None and len(owners) == 1:
+            chosen_id = choose_established_path(trades)
+
+    if chosen_id is not None:
+        path = chosen_id
         chosen = next(t for t in trades if t["id"] == path)
         ok, _ = await repo.add_payment(
             trade_id=chosen["id"], utr=p.utr, amount_inr=p.amount_inr,

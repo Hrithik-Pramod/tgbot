@@ -127,6 +127,10 @@ class _Repo:
                  "opened_at": None, "outstanding": D("2012885"),
                  "vendor": "A VENDOR"}]
 
+    async def collection_path(self, **kw):
+        # No path set: the Bridge has not been asked yet.
+        return None
+
     async def add_payment(self, **kw):
         if self.already:
             return False, "UTR has already been recorded. Not added again."

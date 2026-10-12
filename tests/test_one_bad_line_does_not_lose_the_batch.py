@@ -127,6 +127,10 @@ class _Repo:
     async def open_trade_accounts_for_client(self, cid): return list(self._accounts)
     async def live_trades_on_account(self, **kw): return []
 
+
+    async def collection_path(self, **kw):
+        # No path set: the Bridge has not been asked yet.
+        return None
     async def add_payment(self, *, trade_id, utr, amount_inr, **kw):
         self.added.append({"trade_id": trade_id, "utr": utr,
                            "amount_inr": amount_inr})

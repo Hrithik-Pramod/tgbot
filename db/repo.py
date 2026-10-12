@@ -1470,6 +1470,22 @@ class Repo:
                     entity_type="trade", entity_id=trade_id,
                     detail={"trigger": "payments covered the expected total"},
                 )
+
+                # A finished order is not collecting for anything.
+                #
+                # The path the Bridge set on a shared account dies with the
+                # order it pointed at, so the next order gets its own
+                # decision. A path that outlived its order would quietly
+                # route the next vendor's money onto a closed trade, which
+                # is worse than asking.
+                await conn.execute(
+                    """
+                    UPDATE collection_paths
+                    SET cleared_at = now(), cleared_why = 'the order completed'
+                    WHERE trade_id = $1 AND cleared_at IS NULL
+                    """,
+                    trade_id,
+                )
                 return trade
 
     async def book_progress(self) -> list[asyncpg.Record]:
@@ -2650,6 +2666,17 @@ class Repo:
                 await conn.execute(
                     "UPDATE trades SET status = 'cancelled' WHERE id = $1", trade_id
                 )
+                # Same rule as completion: a dead order collects nothing, so
+                # the shared-account path pointing at it is closed and the
+                # next payment asks again.
+                await conn.execute(
+                    """
+                    UPDATE collection_paths
+                    SET cleared_at = now(), cleared_why = 'the order was cancelled'
+                    WHERE trade_id = $1 AND cleared_at IS NULL
+                    """,
+                    trade_id,
+                )
                 await self.audit(
                     conn, actor_party_id=actor_party_id, action="trade.cancel",
                     entity_type="trade", entity_id=trade_id,
@@ -2966,6 +2993,104 @@ class Repo:
                 """,
                 client_id, account_number, ifsc,
             )
+
+    async def collection_path(
+        self, *, client_id: int, account_number: str, ifsc: str,
+    ) -> Optional[asyncpg.Record]:
+        """
+        Which order this shared account is currently collecting for, if the
+        Bridge has said.
+
+        Returns None when nobody has decided yet, or when the order he chose
+        is no longer live — a path must never outlive its order, or money
+        lands on something closed.
+        """
+        async with self.pool.acquire() as conn:
+            return await conn.fetchrow(
+                """
+                SELECT cp.id, cp.trade_id, cp.set_at,
+                       t.reference, t.supplier_id,
+                       t.inr_expected,
+                       COALESCE((SELECT sum(p.amount_inr) FROM payments p
+                                 WHERE p.trade_id = t.id), 0) AS collected
+                FROM collection_paths cp
+                JOIN trades t ON t.id = cp.trade_id
+                WHERE cp.cleared_at IS NULL
+                  AND cp.client_id = $1
+                  AND cp.account_number = $2
+                  AND cp.ifsc = $3
+                  AND t.status IN ('open', 'awaiting_payment')
+                """,
+                client_id, account_number, ifsc,
+            )
+
+    async def set_collection_path(
+        self, *, client_id: int, account_number: str, ifsc: str,
+        trade_id: int, actor_party_id: Optional[int],
+    ) -> None:
+        """
+        Record the Bridge's answer so he is not asked it again.
+
+        Any previous live path for the account is closed first: one account
+        collects for one order at a time, and two live rows would be two
+        answers to the same question.
+        """
+        async with self.pool.acquire() as conn:
+            async with conn.transaction():
+                await conn.execute(
+                    """
+                    UPDATE collection_paths
+                    SET cleared_at = now(), cleared_why = 'replaced by a new choice'
+                    WHERE cleared_at IS NULL AND client_id = $1
+                      AND account_number = $2 AND ifsc = $3
+                      AND trade_id <> $4
+                    """,
+                    client_id, account_number, ifsc, trade_id,
+                )
+                path_id = await conn.fetchval(
+                    """
+                    INSERT INTO collection_paths
+                        (client_id, account_number, ifsc, trade_id, set_by)
+                    VALUES ($1,$2,$3,$4,$5)
+                    ON CONFLICT (client_id, account_number, ifsc)
+                        WHERE cleared_at IS NULL
+                    DO NOTHING
+                    RETURNING id
+                    """,
+                    client_id, account_number, ifsc, trade_id, actor_party_id,
+                )
+                if path_id is not None:
+                    await self.audit(
+                        conn, actor_party_id=actor_party_id,
+                        action="collection_path.set",
+                        entity_type="trade", entity_id=trade_id,
+                        detail={"account_number": account_number,
+                                "ifsc": ifsc,
+                                "why": "the Bridge chose which order this "
+                                       "shared account is collecting for"},
+                    )
+
+    async def clear_collection_paths_for_trade(
+        self, trade_id: int, *, why: str,
+    ) -> int:
+        """
+        An order that is no longer live cannot be collecting for anything.
+
+        Called whenever a trade closes or is cancelled. Without it the next
+        order's payments would follow a dead path, which is worse than
+        asking.
+        """
+        async with self.pool.acquire() as conn:
+            rows = await conn.fetch(
+                """
+                UPDATE collection_paths
+                SET cleared_at = now(), cleared_why = $2
+                WHERE trade_id = $1 AND cleared_at IS NULL
+                RETURNING id
+                """,
+                trade_id, why,
+            )
+            return len(rows)
 
     async def hold_payment(
         self, *, client_id: int, utr: str, amount_inr: Decimal,
