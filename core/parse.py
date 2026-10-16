@@ -131,6 +131,42 @@ _OUR_OWN_WORDS = (
 )
 
 
+# Headings that only ever appear on a block this bot wrote.
+#
+# 16 October 2026, 10:17:23 — twenty-two payments reported in the same
+# second, all "ROYAL TRADING COMPANY", one of them typed "TRADE COMPLETED".
+# Somebody had pasted the bot's own closing summary back into the group.
+#
+# That block CANNOT be filtered line by line. It renders each payment as
+# UTR / amount / "to NAME" — character for character what a real slip looks
+# like — so every line in it is indistinguishable from money. Only the
+# heading says what the block is, and the heading is the whole message's
+# business, not one line's.
+_OUR_OWN_BLOCKS = (
+    "trade completed",
+    "send next trade",
+    "payments received",
+    "collection progress",
+    "still waiting — a payment is not recorded",
+    "outstanding across the book",
+)
+
+
+def looks_like_our_own_summary(text: str) -> bool:
+    """
+    True when a whole message is a block this bot produced.
+
+    Used to leave it alone entirely rather than read the payments back out
+    of it. The ledger was never at risk — every UTR in such a block is
+    already recorded, and the duplicate guard refuses them — but the bot
+    reported twenty-two of them at once as though something were wrong, on
+    the day the Bridge was already asking why slips were not being picked
+    up.
+    """
+    lowered = text.lower()
+    return any(h in lowered for h in _OUR_OWN_BLOCKS)
+
+
 def _is_our_own_words(line: str) -> bool:
     """
     True when this line is something the bot itself wrote.

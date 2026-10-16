@@ -1403,6 +1403,60 @@ class Repo:
                 client_id,
             )
 
+    async def open_trades_for_supplier(
+        self, supplier_id: int,
+    ) -> list[asyncpg.Record]:
+        """
+        Every order this vendor has running, not just the one being
+        collected.
+
+            the vendors, can they have same function as me, where they can
+            see all their trades, and click a button to see statement on a
+            trade, as they sometimes have multiple
+            — Bridge, 17 October 2026
+
+        /progress answers "how is the current one going" and was right when
+        a vendor had one order at a time. With several open it answers about
+        one of them and says nothing about the rest, so the vendor asks the
+        Bridge — which is the question /progress was added to remove.
+
+        Carries no deal reference, no rates and no client name. A vendor is
+        owed the collection of their own INR and nothing else (decision D4),
+        so the orders are numbered for the buttons rather than named.
+        """
+        async with self.pool.acquire() as conn:
+            return await conn.fetch(
+                """
+                SELECT t.id, t.opened_at, t.instructed_at, t.inr_expected,
+                       COALESCE((SELECT sum(p.amount_inr) FROM payments p
+                                 WHERE p.trade_id = t.id), 0) AS paid_inr
+                FROM trades t
+                WHERE t.supplier_id = $1
+                  AND t.status IN ('open', 'awaiting_payment')
+                -- Same order as /progress: the one money is arriving on
+                -- first, then the rest. Newest-first would put the untouched
+                -- order at the top and bury the one they are waiting on.
+                ORDER BY (t.instructed_at IS NULL), t.instructed_at, t.opened_at
+                """,
+                supplier_id,
+            )
+
+    async def trade_belongs_to_supplier(
+        self, *, trade_id: int, supplier_id: int,
+    ) -> bool:
+        """
+        Whether this order is that vendor's.
+
+        Checked before any statement is sent, because the button carries a
+        trade id and a vendor must never be able to read another vendor's
+        collection by altering one.
+        """
+        async with self.pool.acquire() as conn:
+            return bool(await conn.fetchval(
+                "SELECT 1 FROM trades WHERE id = $1 AND supplier_id = $2",
+                trade_id, supplier_id,
+            ))
+
     async def open_trade_for_supplier(self, supplier_id: int) -> Optional[asyncpg.Record]:
         """
         Backs the supplier's own progress view (client request, 10 Sep 2026:
@@ -2992,6 +3046,105 @@ class Repo:
                 ORDER BY t.id, b.is_active DESC, t.opened_at
                 """,
                 client_id, account_number, ifsc,
+            )
+
+    async def dismiss_held_payment(
+        self, *, held_id: int, actor_party_id: int, reason: str,
+    ) -> tuple[bool, str]:
+        """
+        Close a held payment without recording it anywhere.
+
+        Some payments belong on no order of ours. 15 October 2026: ₹243,000
+        arrived named "INDURKAR TEXTILES PRIVATE LIMITED", an account nobody
+        has registered. There was nothing to place it against and no way to
+        say so, so it sat on the waiting list being chased:
+
+            they sent an incorrect trade to our channel, but now, how would
+            i remove this
+            i think an ignore button ... may be ideal
+            — Bridge, 15-16 October 2026
+
+        Until now a hold had exactly one ending: placed on an order. A
+        question with no acceptable answer is a question that never stops
+        being asked, and a chaser nobody can satisfy is one he learns to
+        ignore — which defeats the only job it has.
+
+        Nothing is deleted and no payment is created. The row records that he
+        looked at it and said it was not ours, with his reason, so a figure
+        that never reached the ledger can still be accounted for later.
+        """
+        async with self.pool.acquire() as conn:
+            async with conn.transaction():
+                h = await conn.fetchrow(
+                    "SELECT * FROM held_payments WHERE id = $1 FOR UPDATE",
+                    held_id,
+                )
+                if h is None:
+                    return False, "That payment is no longer waiting."
+                if h["resolved_at"] is not None:
+                    return False, (
+                        f"{h['utr']} has already been dealt with. Nothing "
+                        "changed."
+                    )
+
+                await conn.execute(
+                    """
+                    UPDATE held_payments
+                    SET resolved_at = now(), resolved_trade_id = NULL
+                    WHERE id = $1
+                    """,
+                    held_id,
+                )
+                await self.audit(
+                    conn, actor_party_id=actor_party_id,
+                    action="payment.dismissed",
+                    entity_type="held_payment", entity_id=held_id,
+                    detail={"utr": h["utr"], "amount_inr": h["amount_inr"],
+                            "typed_beneficiary": h["typed_beneficiary"],
+                            "reason": reason,
+                            "why": "the Bridge said this payment is not ours "
+                                   "to record"},
+                )
+                return True, (
+                    f"{h['utr']} (₹{h['amount_inr']:,.0f}) set aside. It is "
+                    "not on any order and you will not be asked about it "
+                    "again."
+                )
+
+    async def shared_accounts_with_live_orders(
+        self, client_id: int,
+    ) -> list[asyncpg.Record]:
+        """
+        Accounts this client could pay that more than one live order is
+        collecting into — the ones where "which order?" is a real question.
+
+        Backs the command that lets the Bridge set the answer BEFORE a
+        payment arrives, rather than only when one does:
+
+            can you move uncle 30 to the front of the line?
+            — Bridge, 16 October 2026
+        """
+        async with self.pool.acquire() as conn:
+            return await conn.fetch(
+                """
+                SELECT b.account_number, b.ifsc,
+                       min(b.account_name) AS account_name,
+                       count(DISTINCT t.id) AS live_orders,
+                       (SELECT cp.trade_id FROM collection_paths cp
+                        WHERE cp.cleared_at IS NULL
+                          AND cp.client_id = $1
+                          AND cp.account_number = b.account_number
+                          AND cp.ifsc = b.ifsc) AS current_trade_id
+                FROM trades t
+                JOIN payment_slots ps ON ps.trade_id = t.id
+                JOIN bank_accounts b ON b.id = ps.bank_account_id
+                WHERE t.client_id = $1
+                  AND t.status IN ('open', 'awaiting_payment')
+                GROUP BY b.account_number, b.ifsc
+                HAVING count(DISTINCT t.id) > 1
+                ORDER BY min(b.account_name)
+                """,
+                client_id,
             )
 
     async def collection_path(

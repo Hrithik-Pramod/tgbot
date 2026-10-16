@@ -82,6 +82,13 @@ class Notifier:
                   f"₹{fmt_inr(t['outstanding'])} left"),
             callback_data=f"hp:{held_id}:{t['id']}",
         )] for t in trades]
+        # A question with no acceptable answer never stops being asked.
+        # Some payments belong on no order of ours at all — 15 October, a
+        # client's ₹243,000 to an account nobody has registered — and
+        # without this the chaser pursues him for ever over money he cannot
+        # place (Bridge: "i think an ignore button ... may be ideal").
+        rows.append([InlineKeyboardButton(
+            text="Not ours — ignore it", callback_data=f"hpx:{held_id}")])
 
         await self.to_bridge(
             "WHICH ORDER?\n\n"
@@ -144,20 +151,27 @@ class Notifier:
                     "account.\n"
                     f"Asked {h['asked_at']:%d %b %H:%M}\n\n"
                 )
-                if trades:
+                rows = [[InlineKeyboardButton(
+                    text=(f"{t['reference']} · {t['vendor']} · "
+                          f"₹{fmt_inr(t['outstanding'])} left"),
+                    callback_data=f"hp:{h['id']}:{t['id']}",
+                )] for t in trades if t["account_id"] is not None]
+
+                if rows:
                     body += "The client has not answered. Place it yourself:"
-                    markup = InlineKeyboardMarkup(inline_keyboard=[[
-                        InlineKeyboardButton(
-                            text=(f"{t['reference']} · {t['vendor']} · "
-                                  f"₹{fmt_inr(t['outstanding'])} left"),
-                            callback_data=f"hp:{h['id']}:{t['id']}",
-                        )] for t in trades
-                        if t["account_id"] is not None])
                 else:
                     body += (
                         "There is no open order to put it against. Check the "
                         "account is registered and a trade is open."
                     )
+                # Offered either way, and especially when there is nothing to
+                # place it on: a name nobody has registered is usually a
+                # payment that is not ours, and this is the only way to stop
+                # being asked about it.
+                rows.append([InlineKeyboardButton(
+                    text="Not ours — ignore it",
+                    callback_data=f"hpx:{h['id']}")])
+                markup = InlineKeyboardMarkup(inline_keyboard=rows)
 
             await self.to_bridge(head + body, reply_markup=markup)
             await self.repo.mark_held_chased(h["id"])

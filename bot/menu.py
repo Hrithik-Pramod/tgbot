@@ -51,6 +51,7 @@ MENUS: dict[str, list[tuple[str, str]]] = {
         ("progress",     "every group's trading position on one screen"),
         ("summary",      "open trades for one supplier"),
         ("cancel",       "cancel a trade, or withdraw a supplier's claim"),
+        ("collect",      "choose which order a shared account fills next"),
         ("correct",      "reopen a completed trade or remove a payment"),
         ("addvendor",    "register a new vendor group"),
         ("wallet",       "show wallets and which pairing they serve"),

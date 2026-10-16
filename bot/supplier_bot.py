@@ -16,6 +16,7 @@ from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.types import CallbackQuery, InlineKeyboardButton, InlineKeyboardMarkup, Message
 
+from core.money import fmt_inr
 from core.summary import render_mini_statement, render_own_accounts
 
 log = logging.getLogger(__name__)
@@ -151,6 +152,37 @@ async def cmd_progress(message: Message, party, repo) -> None:
     Deliberately says nothing about rates, margin or the deal reference — the
     supplier sees the collection of their own INR and no more (decision D4).
     """
+    # With more than one order running, answer about all of them.
+    #
+    #     the vendors, can they have same function as me, where they can see
+    #     all their trades, and click a button to see statement on a trade,
+    #     as they sometimes have multiple — Bridge, 17 October 2026
+    #
+    # One order still answers straight away: a list of one is a worse
+    # version of the statement they came for.
+    open_trades = await repo.open_trades_for_supplier(party["id"])
+    if len(open_trades) > 1:
+        rows = []
+        lines = ["You have more than one trade running.", ""]
+        for n, t in enumerate(open_trades, 1):
+            if t["inr_expected"]:
+                lines.append(
+                    f"{n}.  ₹{fmt_inr(t['paid_inr'])} of "
+                    f"₹{fmt_inr(t['inr_expected'])} collected"
+                )
+            else:
+                lines.append(f"{n}.  awaiting payment instructions")
+            rows.append([InlineKeyboardButton(
+                text=f"Statement for trade {n}",
+                callback_data=f"sst:{t['id']}",
+            )])
+        lines += ["", "Pick one for its payments so far:"]
+        await message.answer(
+            "\n".join(lines),
+            reply_markup=InlineKeyboardMarkup(inline_keyboard=rows),
+        )
+        return
+
     trade = await repo.open_trade_for_supplier(party["id"])
     if trade is None:
         await message.answer("You have no trade in progress at the moment.")
@@ -180,6 +212,52 @@ async def cmd_progress(message: Message, party, repo) -> None:
         expected_inr=trade["inr_expected"],
         paid_inr=trade["paid_inr"],
     ))
+
+
+@router.callback_query(F.data.startswith("sst:"))
+async def supplier_statement(call: CallbackQuery, party, repo) -> None:
+    """
+    One of a vendor's trades, picked from the list.
+
+    Not state-gated: the list can be scrolled back to tomorrow, and a dead
+    button would send them to the Bridge with the question /progress exists
+    to answer.
+
+    The ownership check is the point. The button carries a trade id, and a
+    vendor editing one must not be able to read another vendor's collection
+    — so the trade is confirmed as theirs before a single figure is sent,
+    rather than trusting what came back on the callback.
+    """
+    trade_id = int(call.data.split(":", 1)[1])
+
+    if not await repo.trade_belongs_to_supplier(
+        trade_id=trade_id, supplier_id=party["id"]
+    ):
+        await call.answer("That trade is not one of yours.", show_alert=True)
+        log.warning("supplier %s asked for trade %s, which is not theirs",
+                    party["id"], trade_id)
+        return
+
+    trade = await repo.trade_detail(trade_id)
+    if trade is None:
+        await call.answer("That trade no longer exists.", show_alert=True)
+        return
+
+    if not trade["inr_expected"]:
+        await call.message.answer(
+            "Your deposit has been received. Payment instructions have not "
+            "been issued yet."
+        )
+        await call.answer()
+        return
+
+    payments = await repo.trade_payments(trade_id)
+    await call.message.answer(render_mini_statement(
+        payments=payments,
+        expected_inr=trade["inr_expected"],
+        paid_inr=trade["paid_inr"],
+    ))
+    await call.answer()
 
 
 # ---------------------------------------------------------- /account_remove

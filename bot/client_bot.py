@@ -29,8 +29,8 @@ from core.money import (
     MoneyError, fmt_inr, fmt_inr_plain, normalise_utr, round_inr, to_decimal,
 )
 from core.parse import (
-    choose_established_path, match_beneficiary, parse_payments,
-    shared_account_for,
+    choose_established_path, looks_like_our_own_summary, match_beneficiary,
+    parse_payments, shared_account_for,
 )
 from core.summary import (
     CLIENT_CLOSING_SUMMARY, Payment, render_completion_notice,
@@ -644,6 +644,21 @@ async def on_pasted_payment(message: Message, state: FSMContext, party, repo,
                     + "\n\nNothing has been logged. Open or re-issue the "
                       "trade, then ask the client to send these again."
                 )
+        return
+
+    # The bot's own summary, pasted back.
+    #
+    # Left entirely alone. Reading it produces one "payment" per line of a
+    # block whose every UTR is already on the ledger — on 16 October that
+    # was twenty-two of them in a single second, reported as problems, on
+    # the morning the Bridge was asking why slips were not being picked up.
+    #
+    # Nothing was ever at risk: the duplicate guard refuses them all. But a
+    # bot that cries wolf twenty-two times is one nobody can read, and he
+    # had to go through every line to find out none of it mattered.
+    if looks_like_our_own_summary(body):
+        log.info("ignoring a message that is this bot's own summary, "
+                 "pasted back in chat %s", message.chat.id)
         return
 
     result = parse_payments(body)

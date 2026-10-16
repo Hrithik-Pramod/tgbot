@@ -70,6 +70,12 @@ class Reprice(StatesGroup):
     confirm = State()
 
 
+class Collect(StatesGroup):
+    """Choosing which order a shared account is collecting for."""
+    pick_account = State()
+    pick_trade = State()
+
+
 class Correct(StatesGroup):
     pick_trade = State()
     action = State()
@@ -1497,6 +1503,29 @@ async def place_held_payment(call: CallbackQuery, party, repo, notifier) -> None
 # written at ten past midnight against a live ledger. That is the thing being
 # removed here, not the four symptoms.
 
+@router.callback_query(F.data.startswith("hpx:"))
+async def dismiss_held_payment(call: CallbackQuery, party, repo) -> None:
+    """
+    "Not ours — ignore it."
+
+    Not state-gated, for the same reason as placing one: the question can sit
+    for hours and survive a restart, and a button that dies would leave the
+    payment being chased for ever.
+
+    Idempotent — dismiss_held_payment refuses a hold already dealt with, so
+    two taps produce one outcome and never undo a placement.
+    """
+    held_id = int(call.data.split(":", 1)[1])
+    ok, msg = await repo.dismiss_held_payment(
+        held_id=held_id, actor_party_id=party["id"],
+        reason="dismissed from the prompt as not ours",
+    )
+    await call.message.answer(msg)
+    await call.answer()
+    if ok:
+        log.info("held payment %s dismissed by the Bridge", held_id)
+
+
 @router.callback_query(F.data.startswith("ps:"))
 async def confirm_payout_source(
     call: CallbackQuery, party, repo, notifier
@@ -1555,6 +1584,126 @@ async def confirm_payout_source(
         f"Noted. {fmt_usdt_plain(d['amount_usdt'])} USDT confirmed as yours, "
         "they have been told, and settlements from that address will go "
         "straight through from now on."
+    )
+    await call.answer()
+
+
+# ======================================================================
+# /collect — which order a shared account is filling
+# ======================================================================
+#
+#     can you move uncle 30 to the front of the line?
+#     i think an ignore button and the option to switch to different deal
+#     may be ideal
+#     — Bridge, 16 October 2026
+#
+# Until now the only way to set the path was to answer a question when a
+# payment happened to arrive. That is the wrong way round: he knows which
+# order he wants filled next before the money turns up, and waiting for a
+# payment to ask him means the first one of a batch goes wherever the last
+# decision pointed.
+
+@router.message(Command("collect"))
+async def cmd_collect(message: Message, state: FSMContext, repo, party) -> None:
+    accounts = await repo.shared_accounts_with_live_orders(
+        await _client_id(repo)
+    )
+    if not accounts:
+        await message.answer(
+            "No account has more than one order collecting into it right "
+            "now, so there is nothing to choose between.\n\n"
+            "Payments will go to the only order open on their account."
+        )
+        return
+
+    await state.set_state(Collect.pick_account)
+    rows = [[InlineKeyboardButton(
+        text=f"{a['account_name']} ···{str(a['account_number'])[-4:]}"
+             f"  ({a['live_orders']} orders)",
+        callback_data=f"cl:{a['account_number']}:{a['ifsc']}",
+    )] for a in accounts]
+    await message.answer(
+        "Which account?\n\n"
+        "These are the ones more than one order is collecting into, so a "
+        "payment to them cannot say which order it is for on its own.",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=rows),
+    )
+
+
+async def _client_id(repo) -> int:
+    """The client whose payments these are. One client, by construction."""
+    async with repo.pool.acquire() as conn:
+        return await conn.fetchval(
+            "SELECT id FROM parties WHERE role = 'client' AND is_active "
+            "ORDER BY id LIMIT 1"
+        )
+
+
+@router.callback_query(Collect.pick_account, F.data.startswith("cl:"))
+async def collect_pick_account(
+    call: CallbackQuery, state: FSMContext, repo
+) -> None:
+    _, account_number, ifsc = call.data.split(":", 2)
+    client_id = await _client_id(repo)
+
+    trades = await repo.live_trades_on_account(
+        client_id=client_id, account_number=account_number, ifsc=ifsc,
+    )
+    if not trades:
+        await call.message.edit_text(
+            "Nothing is collecting into that account any more."
+        )
+        await state.clear()
+        await call.answer()
+        return
+
+    said = await repo.collection_path(
+        client_id=client_id, account_number=account_number, ifsc=ifsc,
+    )
+    current = said["trade_id"] if said else None
+
+    await state.update_data(account_number=account_number, ifsc=ifsc,
+                            client_id=client_id)
+    await state.set_state(Collect.pick_trade)
+
+    rows = [[InlineKeyboardButton(
+        text=(f"{'✓ ' if t['id'] == current else ''}{t['reference']} · "
+              f"{t['vendor']} · ₹{fmt_inr(t['outstanding'])} left"),
+        callback_data=f"clt:{t['id']}",
+    )] for t in trades]
+
+    note = ("\n\nPayments are going to the one marked ✓."
+            if current else
+            "\n\nNo order is set yet, so the next payment will ask.")
+    await call.message.edit_text(
+        f"Which order should this account fill?{note}",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=rows),
+    )
+    await call.answer()
+
+
+@router.callback_query(Collect.pick_trade, F.data.startswith("clt:"))
+async def collect_pick_trade(
+    call: CallbackQuery, state: FSMContext, party, repo
+) -> None:
+    trade_id = int(call.data.split(":", 1)[1])
+    data = await state.get_data()
+
+    trade = await repo.trade_detail(trade_id)
+    if trade is None or trade["status"] not in ("open", "awaiting_payment"):
+        await call.answer("That order is no longer open.", show_alert=True)
+        return
+
+    await repo.set_collection_path(
+        client_id=data["client_id"],
+        account_number=data["account_number"], ifsc=data["ifsc"],
+        trade_id=trade_id, actor_party_id=party["id"],
+    )
+    await state.clear()
+    await call.message.edit_text(
+        f"{trade['reference']} is now first in line on that account.\n\n"
+        "Payments into it go there without asking, until it is full. Then "
+        "the next one asks again."
     )
     await call.answer()
 
