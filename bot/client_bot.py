@@ -61,6 +61,66 @@ class PastedPayment(StatesGroup):
     confirm = State()
 
 
+# A slip that named nobody still has to be written down.
+#
+# 22 October 2026, 18:28:09. A slip arrived carrying a UTR and an amount and
+# no beneficiary line at all. The account matched nothing, so both
+# account_number and typed_beneficiary went to hold_payment as NULL, and
+# held_payments_knows_something refused the row:
+#
+#     CheckViolationError: new row for relation "held_payments" violates
+#     check constraint "held_payments_knows_something"
+#
+# The constraint is right — a row that knows neither is a row with no question
+# in it. What was wrong is that the handler had something to say and said
+# None. The slip named no beneficiary; that IS the fact, and recording it is
+# more use to the Bridge than a null.
+#
+# The cost was not the crash. The buttons had already gone out, so the client
+# saw a normal-looking question; the exception then killed the rest of the
+# handler, which is where the Bridge gets told money is in limbo. Nothing was
+# held, nothing was recorded, and nobody was told. The payment only reached
+# the ledger because the client happened to paste it again four seconds later.
+#
+# That is "the bot is not picking up slips", exactly as reported, and it is
+# the failure mode held_payments was built on 5 October to end.
+NO_BENEFICIARY_ON_SLIP = "(the slip named no beneficiary)"
+
+
+def _typed_or_marker(staged) -> str:
+    """
+    What the client actually wrote, or an explicit note that they wrote
+    nothing. Never empty, never None — hold_payment is entitled to assume the
+    caller knows something, and on this path it does.
+    """
+    typed = (staged.get("beneficiary") or "").strip()
+    return typed or NO_BENEFICIARY_ON_SLIP
+
+
+async def _hold_or_shout(repo, notifier, **kw) -> None:
+    """
+    Hold one payment. If the row will not go in, say so loudly and carry on
+    with the rest — never take the batch down with it.
+
+    One unholdable slip used to abort every hold after it in the same message
+    AND the Bridge notification that follows them, which is the worst of both:
+    the money is not on the ledger and nobody knows. A hold that fails is a
+    serious fault, but it is a fault about ONE payment.
+    """
+    try:
+        await repo.hold_payment(**kw)
+    except Exception:
+        log.exception("could not hold payment %s — it is NOT recorded",
+                      kw.get("utr"))
+        if notifier is not None:
+            await notifier.to_bridge(
+                "A payment could not even be put on the waiting list, so it "
+                "is NOT recorded and the usual chase will not find it.\n\n"
+                f"  {kw.get('utr')}  ₹{fmt_inr(kw.get('amount_inr'))}\n\n"
+                "Add it by hand with /correct once its order is known."
+            )
+
+
 # --------------------------------------------------------------- /accounts
 
 def _account_button(account, among) -> str:
@@ -348,6 +408,19 @@ async def _place_on_shared_account(message, p, matchable, party, repo, notifier)
         #
         # Every other path that writes a payment does this. This one is not
         # special for being quiet.
+        #
+        # And the same goes for the hold. _record releases what it writes;
+        # this path wrote and did not, so a payment that had been held while
+        # the Bridge was asked stayed on the waiting list after it landed.
+        #
+        # 22 October 2026: held row 46 was still open at midnight for
+        # ₹390,300 that went on the ledger at 09:59 that morning — asked
+        # about at 01:10, recorded through this branch nine hours later,
+        # never released. The chase would have gone on asking him about money
+        # he had already banked, which is the 8 October fault one level down:
+        # the bot interrogating someone about its own bookkeeping.
+        await repo.release_held_payments([p.utr])
+
         if notifier is not None:
             if not await notifier.check_completion(chosen["id"]):
                 await notifier.check_near_completion(chosen["id"])
@@ -923,10 +996,11 @@ async def on_pasted_payment(message: Message, state: FSMContext, party, repo,
         # so — but the money is on a list that outlives the conversation.
         await state.clear()
         for s in unmatched:
-            await repo.hold_payment(
+            await _hold_or_shout(
+                repo, notifier,
                 client_id=party["id"], utr=s["utr"],
                 amount_inr=to_decimal(s["amount"]),
-                typed_beneficiary=s.get("beneficiary"),
+                typed_beneficiary=_typed_or_marker(s),
                 why="the beneficiary matched nothing and there was no "
                     "instructed trade to offer the client",
                 chat_id=message.chat.id, message_id=message.message_id,
@@ -995,10 +1069,11 @@ async def on_pasted_payment(message: Message, state: FSMContext, party, repo,
         # chases it until it is answered. The client's buttons still work
         # exactly as before; this is underneath them.
         for s in unmatched:
-            await repo.hold_payment(
+            await _hold_or_shout(
+                repo, notifier,
                 client_id=party["id"], utr=s["utr"],
                 amount_inr=to_decimal(s["amount"]),
-                typed_beneficiary=s.get("beneficiary"),
+                typed_beneficiary=_typed_or_marker(s),
                 why="the beneficiary name matched no registered account; "
                     "the client has been asked which one it was",
                 chat_id=message.chat.id, message_id=message.message_id,

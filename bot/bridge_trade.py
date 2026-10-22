@@ -1945,3 +1945,70 @@ async def cmd_export(message: Message, repo) -> None:
         BufferedInputFile(data, filename="settlement_export.csv"),
         caption=f"{len(rows)} rows, last 90 days.",
     )
+
+
+# ===========================================================================
+# A BUTTON THAT DOES NOTHING IS WORSE THAN A BUTTON THAT SAYS NO.
+#
+#     Now unable to forward a trade / Pressing button not working / Urgent
+#     — Bridge, 22 October 2026, 14:09
+#
+# He was tapping a screen the bot had sent at 12:38, with the unread marker
+# sitting below it — an old message scrolled back to, which is the ordinary
+# way to use Telegram.
+#
+# Every step of /issue, /cancel, /collect and /correct is gated on an FSM
+# state, and that state lives in MemoryStorage against one chat. It is gone
+# the moment the bot restarts, and it has MOVED the moment he starts anything
+# else — /progress, a second /issue, any other flow. The old screen's buttons
+# then match no handler at all. aiogram drops the update, Telegram spins for
+# a second and stops, and nothing is written anywhere. From his side the bot
+# is simply broken, and there is nothing to look at afterwards.
+#
+# This router is the last one in the Bridge dispatcher (see main.py, and
+# test_a_dead_button_says_so pins that), so a callback arriving here was
+# refused by every handler in both Bridge routers. There is exactly one
+# reason that happens in practice: the screen is out of date.
+#
+# It does not try to recover the flow. Rebuilding half-finished allocation
+# state from a button press is how money gets instructed against figures
+# nobody checked. It says what happened and names the command that starts
+# again, which is all he needed at 14:09.
+# ===========================================================================
+
+# Which flow the button belonged to, so the answer names the way back rather
+# than making him guess. Longest prefixes first — "cop:" before "co".
+_FLOW_BY_PREFIX: tuple[tuple[tuple[str, ...], str], ...] = (
+    (("cfa:", "cffull", "cfmore", "cfsend", "cfyes", "cfno", "sp:", "spno"),
+     "/issue"),
+    (("cwacct", "cwmore", "cwother"), "/cancel"),
+    (("clt:", "cl:"), "/collect"),
+    (("cop:", "cot:", "co:", "cor", "cob", "com", "cop"), "/correct"),
+    (("sr_", "mst:"), "/setrate"),
+    (("wa_", "wl", "wc", "wr"), "/wallet"),
+    (("av_",), "/addvendor"),
+)
+
+
+def _flow_for(data: str | None) -> str | None:
+    for prefixes, command in _FLOW_BY_PREFIX:
+        if data and data.startswith(prefixes):
+            return command
+    return None
+
+
+@router.callback_query()
+async def stale_screen(call: CallbackQuery, state: FSMContext) -> None:
+    current = await state.get_state()
+    log.info(
+        "dead button %r in chat %s (state=%s) — the screen is out of date",
+        call.data, call.message.chat.id if call.message else None, current,
+    )
+
+    flow = _flow_for(call.data)
+    again = f"Run {flow} again." if flow else "Start the command again."
+    await call.answer(
+        "That screen is out of date, so this button no longer does "
+        f"anything.\n\n{again}\n\nNothing was changed.",
+        show_alert=True,
+    )

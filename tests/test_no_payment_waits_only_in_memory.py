@@ -56,13 +56,23 @@ from db.repo import Repo  # noqa: E402
 
 
 class TestTheWaitIsWrittenDown:
+    # 22 October 2026: these two looked for the literal "hold_payment". The
+    # handler now holds through _hold_or_shout, which calls hold_payment but
+    # survives the row being refused — on 22 October a CHECK violation inside
+    # the hold unwound the whole handler, so nothing was held and the Bridge
+    # was never told. Calling the repo directly from here is now the fault
+    # rather than the fix, and test_a_nameless_slip_is_still_written_down
+    # forbids it. So the name they look for changed; what they are for did
+    # not.
+    HOLD = "_hold_or_shout"
+
     def test_the_unmatched_branch_holds_the_payment(self):
         """
         The branch that asks the client which account must write the money
         down first. Until 5 October it asked and wrote nothing.
         """
         src = inspect.getsource(client_bot.on_pasted_payment)
-        assert "hold_payment" in src, (
+        assert self.HOLD in src, (
             "an unmatched payment is still waiting only in memory — this is "
             "the ₹902,460 mechanism"
         )
@@ -76,9 +86,16 @@ class TestTheWaitIsWrittenDown:
         marker = 'lines.append("Which account did these go to?")'
         assert marker in src
         after = src[src.index(marker):]
-        hold = after.index("hold_payment")
+        hold = after.index(self.HOLD)
         ret = after.index("\n        return")
         assert hold < ret, "the hold is written after the branch returns"
+
+    def test_the_hold_still_reaches_the_table(self):
+        """
+        Guards the rename itself. _hold_or_shout could be anything; what
+        makes it a hold is that it writes to held_payments.
+        """
+        assert "hold_payment" in inspect.getsource(client_bot._hold_or_shout)
 
     def test_it_keeps_what_the_client_actually_typed(self):
         """

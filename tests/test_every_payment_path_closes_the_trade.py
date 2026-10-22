@@ -173,6 +173,11 @@ class _Repo:
         self.added.append(kw)
         return (self.add_ok, "recorded" if self.add_ok else "duplicate")
 
+    async def release_held_payments(self, utrs):
+        # Added 22 October 2026: the shared-account branch now lets go of the
+        # hold when it records, so every stub standing in for it needs this.
+        return 0
+
     async def hold_payment(self, **kw):
         return True, 1
 
