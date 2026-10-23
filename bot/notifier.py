@@ -112,8 +112,12 @@ class Notifier:
         unanswered prompt until a restart discarded them, and the first
         anyone knew was the client asking about a balance.
 
-        Once each, not on every sweep: a notice that repeats is a notice
-        nobody reads, and this one has to be read.
+        Once a cycle, not on every sweep and not once ever. Until
+        23 October 2026 this really was once ever — row 38 sat unanswered
+        for eight days after a single notice. See waiting_held_payments.
+
+        It now comes back every six hours until somebody decides: place it,
+        answer it, or say it is not ours. All three end the reminder.
         """
         from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup
 

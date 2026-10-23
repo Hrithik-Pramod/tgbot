@@ -3493,13 +3493,31 @@ class Repo:
             )
 
     async def waiting_held_payments(
-        self, *, older_than_minutes: int,
+        self, *, older_than_minutes: int, repeat_after_minutes: int = 360,
     ) -> list[asyncpg.Record]:
         """
         Held payments nobody has answered, for the chaser.
 
-        chased_at keeps the reminder to once a cycle. A notice repeated every
-        sweep is one nobody reads, and this one has to be read.
+        CHASED ONCE A CYCLE, NOT ONCE EVER.
+
+        This read `AND chased_at IS NULL`, which is not "once a cycle" — it
+        is once, permanently. One notice went out and the payment was never
+        mentioned again, however long it sat there.
+
+        23 October 2026: held row 38, ₹243,000, asked 15 October at 17:22.
+        Eight days. One notice on the first sweep, silence after that, and
+        nobody looked at it again until this table was read by hand.
+
+        That money turned out not to be ours — the orders around it were
+        square to the rupee. That was luck. The mechanism would have
+        swallowed money that WAS ours exactly as quietly, which is the
+        ₹902,460 failure this table was built on 5 October to end: not a
+        payment nobody was told about, a payment everybody forgot.
+
+        So it repeats, slowly. Every six hours is loud enough to outlast a
+        busy afternoon and quiet enough to stay readable — and it can always
+        be stopped, because stopping it is a decision: answer it, place it,
+        or tap "Not ours — ignore it", all of which set resolved_at.
         """
         async with self.pool.acquire() as conn:
             return await conn.fetch(
@@ -3507,10 +3525,14 @@ class Repo:
                 SELECT * FROM held_payments
                 WHERE resolved_at IS NULL
                   AND asked_at < now() - ($1::text || ' minutes')::interval
-                  AND chased_at IS NULL
+                  AND (chased_at IS NULL
+                       OR chased_at < now()
+                                      - ($2::text || ' minutes')::interval)
+                -- Oldest first: the one that has been ignored longest is the
+                -- one most likely to have been forgotten entirely.
                 ORDER BY asked_at
                 """,
-                str(older_than_minutes),
+                str(older_than_minutes), str(repeat_after_minutes),
             )
 
     async def mark_held_chased(self, held_id: int) -> None:
