@@ -1387,6 +1387,39 @@ class Repo:
                     b.id,
                     -- An account with a live trade beats one without.
                     (t.id IS NULL),
+                    -- THE BRIDGE'S OWN ANSWER OUTRANKS EVERY RULE BELOW.
+                    --
+                    --     Hello Peter, the Collect button does not work, set
+                    --     it and its still collecting on the other open trade
+                    --     — Bridge, 23 October 2026, 08:23
+                    --
+                    -- /collect wrote the path and this query never read it.
+                    -- collection_paths was only ever consulted in
+                    -- _place_on_shared_account, and that branch runs when an
+                    -- account resolves to SEVERAL candidate rows — which
+                    -- happens when several VENDORS share the account.
+                    --
+                    -- One vendor with two orders on one account is a
+                    -- different shape. DISTINCT ON (b.id) collapses it to a
+                    -- single row and this ORDER BY picks the trade, so the
+                    -- shared-account branch never runs and the path was
+                    -- never looked at. /collect answered a question nobody
+                    -- asked, and said "payments into it go there without
+                    -- asking, until it is full" while the rules below went
+                    -- on sending them to the older order.
+                    --
+                    -- Ordering FALSE first puts the order he named at the
+                    -- top. It is scoped to this exact account, so a path on
+                    -- one account cannot move another account's money, and
+                    -- collection_path's own guard still applies: the row is
+                    -- cleared when its trade closes, so a path can never
+                    -- outlive its order.
+                    (NOT EXISTS (SELECT 1 FROM collection_paths cp
+                                  WHERE cp.cleared_at IS NULL
+                                    AND cp.client_id = $1
+                                    AND cp.account_number = b.account_number
+                                    AND cp.ifsc = b.ifsc
+                                    AND cp.trade_id = t.id)),
                     -- One the client has actually been instructed to pay
                     -- beats one they have not been told about.
                     (t.instructed_at IS NULL),

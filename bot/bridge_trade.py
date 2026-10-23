@@ -1703,7 +1703,8 @@ async def collect_pick_trade(
     await call.message.edit_text(
         f"{trade['reference']} is now first in line on that account.\n\n"
         "Payments into it go there without asking, until it is full. Then "
-        "the next one asks again."
+        "this choice is cleared and the next order on that account takes "
+        "over — run /collect again if that is not the one you want."
     )
     await call.answer()
 
