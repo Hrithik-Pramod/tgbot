@@ -61,6 +61,46 @@ class PastedPayment(StatesGroup):
     confirm = State()
 
 
+# THE ONLY STATES THAT OWN A TYPED MESSAGE.
+#
+# /add asks two questions whose answer IS text: "how much?" and "what is the
+# UTR?". While one of those is on screen, a message is that answer and must
+# not be read as a fresh payment.
+#
+# Every other state in this bot is answered by tapping a button. A pasted
+# payment arriving while one of those is open does not mean the client is
+# answering it — it means they have moved on, which is what people do.
+#
+# 24 October 2026:
+#
+#     a trade gets this message, probably edited after by the client, and the
+#     rest has the geting a jump choice ... this then stops the bot from
+#     working ... because it is waiting for an answer that is not coming from
+#     the client
+#     — Bridge
+#
+#     Hi Peter, for your information also I'm having to copy and paste all
+#     trades at the moment as they're not getting picked up by the bot
+#     — Bridge, 23:47
+#
+# He was right, and he worked it out from the outside. on_pasted_payment
+# opened with `if await state.get_state() is not None: return` — so the
+# unanswered "Which account did these go to?" silenced EVERY later slip from
+# that person, in that group, indefinitely. No reply, no reaction, no log.
+# The client sees the one rule they were given — "no acknowledgement means it
+# was not picked up" — and the desk goes back to copying by hand.
+#
+# The question is not lost by letting the new message through: the money
+# behind it is on held_payments, the Bridge is chased about it, and the
+# buttons still work if anyone taps them.
+_STATES_THAT_OWN_TYPED_TEXT = (AddPayment.amount, AddPayment.utr)
+
+
+async def _is_answering_a_typed_question(state: FSMContext) -> bool:
+    current = await state.get_state()
+    return current in {s.state for s in _STATES_THAT_OWN_TYPED_TEXT}
+
+
 # A slip that named nobody still has to be written down.
 #
 # 22 October 2026, 18:28:09. A slip arrived carrying a UTR and an amount and
@@ -647,8 +687,19 @@ async def add_account(call: CallbackQuery, state: FSMContext, party, repo,
 )
 async def on_pasted_payment(message: Message, state: FSMContext, party, repo,
                             notifier) -> None:
+    if await _is_answering_a_typed_question(state):
+        return  # /add asked for this text; its own handler owns the message
+
+    # A button-answered question is still on screen and this is not an answer
+    # to it. Abandon it rather than ignoring the payment: the question's money
+    # is already held and chased, and a stale keyboard that nobody tapped must
+    # never cost the next slip. See _STATES_THAT_OWN_TYPED_TEXT.
     if await state.get_state() is not None:
-        return  # mid-conversation; the FSM handlers own this message
+        log.info(
+            "chat %s sent a new payment while a button question was open; "
+            "clearing it and reading the payment", message.chat.id,
+        )
+        await state.clear()
 
     # Clients send a screenshot of the bank confirmation with the details typed
     # underneath (client question, 10 September 2026). On a photo the details
@@ -1116,7 +1167,8 @@ async def on_pasted_payment(message: Message, state: FSMContext, party, repo,
 @router.edited_message(
     (F.text & ~F.text.startswith("/")) | (F.caption & ~F.caption.startswith("/"))
 )
-async def on_edited_payment(message: Message, party, repo, notifier) -> None:
+async def on_edited_payment(message: Message, state: FSMContext, party, repo,
+                            notifier) -> None:
     body = message.text or message.caption or ""
 
     # Matching, not display — the same distinction as the paste handler.
@@ -1210,6 +1262,19 @@ async def on_edited_payment(message: Message, party, repo, notifier) -> None:
             "utr": p.utr, "amount": str(p.amount_inr),
             "account_id": account_id, "trade_id": row["trade_id"],
         })
+
+    # The edit answered the question, so take the question down.
+    #
+    # 24 October 2026: the bot asked "Which account did these go to?", the
+    # client edited the original message to add "to ROYAL TRADING COMPANY",
+    # and this handler recorded it correctly — and left PastedPayment.account
+    # set. The paste handler bailed on that state, so the bot went deaf to
+    # that person from then on while looking, to them, like it was working.
+    #
+    # Editing the message IS how people answer; it just is not how the
+    # keyboard expected to be answered.
+    if await state.get_state() is not None:
+        await state.clear()
 
     await _record(message, staged, party, repo, acknowledge=True, notifier=notifier)
 
