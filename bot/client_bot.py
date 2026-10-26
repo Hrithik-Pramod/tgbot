@@ -127,6 +127,35 @@ async def _is_answering_a_typed_question(state: FSMContext) -> bool:
 NO_BENEFICIARY_ON_SLIP = "(the slip named no beneficiary)"
 
 
+def _resolved_account_for(staged, matchable) -> tuple:
+    """
+    The account the bot worked out, if it worked one out, for the hold to
+    keep. Returns (account_number, ifsc), or (None, None).
+
+    26 October 2026, 18:20. A client paid ₹200,000 into Royal Trading and
+    wrote "ROYALTRAD". The bot read that correctly — the audit shows it
+    resolving to account ...7492 — and then held the money like this:
+
+        payment.shared_account_declined   account_number_last4: "7492"
+        payment.held                      account_number: null
+
+    It knew the account and then forgot it on the way to the hold, because
+    the hold was written for the OTHER kind of failure, where the name
+    matched nothing at all.
+
+    The cost is not the lost field. It is that a payment tagged to an
+    account can be placed the moment an order opens on that account, and a
+    payment tagged to nothing can only ever be placed by hand. BRAV42
+    finished at 18:04 and this money arrived at 18:20 — sixteen minutes into
+    the gap between two orders, which is where a client who pays in a
+    continuous stream always lands.
+    """
+    key = shared_account_for(staged.get("beneficiary"), matchable)
+    if key is None:
+        return None, None
+    return key
+
+
 def _typed_or_marker(staged) -> str:
     """
     What the client actually wrote, or an explicit note that they wrote
@@ -1052,6 +1081,10 @@ async def on_pasted_payment(message: Message, state: FSMContext, party, repo,
                 client_id=party["id"], utr=s["utr"],
                 amount_inr=to_decimal(s["amount"]),
                 typed_beneficiary=_typed_or_marker(s),
+                # Keep the account when the bot worked one out, so the money
+                # can be placed as soon as an order opens on it.
+                **dict(zip(("account_number", "ifsc"),
+                           _resolved_account_for(s, matchable))),
                 why="the beneficiary matched nothing and there was no "
                     "instructed trade to offer the client",
                 chat_id=message.chat.id, message_id=message.message_id,
@@ -1125,6 +1158,10 @@ async def on_pasted_payment(message: Message, state: FSMContext, party, repo,
                 client_id=party["id"], utr=s["utr"],
                 amount_inr=to_decimal(s["amount"]),
                 typed_beneficiary=_typed_or_marker(s),
+                # Keep the account when the bot worked one out, so the money
+                # can be placed as soon as an order opens on it.
+                **dict(zip(("account_number", "ifsc"),
+                           _resolved_account_for(s, matchable))),
                 why="the beneficiary name matched no registered account; "
                     "the client has been asked which one it was",
                 chat_id=message.chat.id, message_id=message.message_id,

@@ -1474,6 +1474,60 @@ class Repo:
                 supplier_id,
             )
 
+    async def recent_closed_trades_for_supplier(
+        self, supplier_id: int, *, days: int = 4, limit: int = 10,
+    ) -> list[asyncpg.Record]:
+        """
+        Deals this vendor has FINISHED recently, for calling one back up.
+
+            I need a feature for the vendors. I need them to be able to view
+            old trades over the last 3 to 4 days and show the summary with
+            UTRs. A completed progress
+            — Bridge, 23 October 2026
+
+            Also the statement thing i mentioned, so the vendor can call up
+            an old deal and see the related UTRs?
+            — Bridge, 26 October 2026
+
+        /progress only ever looked at open orders, so the moment a deal
+        completed the vendor lost every way of seeing what had been paid
+        against it — and asked the Bridge instead, which is the whole thing
+        /progress exists to prevent.
+
+        STILL NO REFERENCE, NO RATE, NO CLIENT.
+
+        Decision D4 and the 11 September disclosure apply unchanged: the
+        vendor is owed the collection of their own INR and nothing more. A
+        finished deal is identified by the day it closed and what was
+        collected, not by name. Showing SUPA61 would be a narrowing of that
+        rule, and it was considered and declined on 26 October — it is not
+        an accident of this query.
+
+        CANCELLED DEALS ARE NOT HERE.
+
+        Only 'completed'. A cancelled order has no collection to report and
+        listing it invites "what happened to this one", which is a
+        conversation for the Bridge, not a statement.
+        """
+        async with self.pool.acquire() as conn:
+            return await conn.fetch(
+                """
+                SELECT t.id, t.opened_at, t.completed_at, t.inr_expected,
+                       COALESCE((SELECT sum(p.amount_inr) FROM payments p
+                                 WHERE p.trade_id = t.id), 0) AS paid_inr
+                FROM trades t
+                WHERE t.supplier_id = $1
+                  AND t.status = 'completed'
+                  AND t.completed_at IS NOT NULL
+                  AND t.completed_at > now() - ($2::text || ' days')::interval
+                -- Most recently finished first: "the one I just did" is the
+                -- one they are nearly always asking about.
+                ORDER BY t.completed_at DESC
+                LIMIT $3
+                """,
+                supplier_id, str(days), limit,
+            )
+
     async def trade_belongs_to_supplier(
         self, *, trade_id: int, supplier_id: int,
     ) -> bool:

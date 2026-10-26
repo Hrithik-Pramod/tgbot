@@ -68,6 +68,7 @@ MENUS: dict[str, list[tuple[str, str]]] = {
         ("account",        "register a bank account"),
         ("account_remove", "remove a bank account"),
         ("progress",       "how much of your INR has arrived"),
+        ("history",        "deals you finished in the last few days"),
     ],
     "client": [
         ("accounts", "the accounts you can pay for this trade"),

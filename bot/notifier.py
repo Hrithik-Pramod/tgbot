@@ -132,13 +132,61 @@ class Notifier:
             markup = None
 
             if h["account_number"] is not None:
+                # Asked NOW, not when the money arrived.
+                #
+                # A hold on a known account used to print one fixed sentence
+                # — "two vendors share this account" — which was true at the
+                # moment it was written and said nothing about the world
+                # since. The common case is that it has changed: money lands
+                # in the gap between one order finishing and the next being
+                # issued, and the next order shows up minutes later.
+                #
+                # 26 October 2026: BRAV42 filled at 18:04 and ₹200,000 for
+                # Royal Trading arrived at 18:20. A client paying in a
+                # continuous stream lands in that gap constantly.
+                #
+                # So the reminder re-reads the account every time it goes
+                # out. The moment an order opens on it, this becomes a
+                # one-tap placement instead of a standing complaint — and
+                # since it repeats every six hours, the money places itself
+                # without anybody hunting for it.
+                on_account = await self.repo.live_trades_on_account(
+                    client_id=h["client_id"],
+                    account_number=h["account_number"], ifsc=h["ifsc"],
+                )
                 body = (
                     f"Account ...{h['account_number'][-4:]}\n"
                     f"Asked {h['asked_at']:%d %b %H:%M}\n\n"
-                    "Two vendors share this account and I will not guess "
-                    "between their orders. Until you pick one, this money is "
-                    "not on anyone's books."
                 )
+                rows = [[InlineKeyboardButton(
+                    text=(f"{t['reference']} · {t['vendor']} · "
+                          f"₹{fmt_inr(t['outstanding'])} left"),
+                    callback_data=f"hp:{h['id']}:{t['id']}",
+                )] for t in on_account]
+
+                if len(on_account) > 1:
+                    body += (
+                        "More than one order is collecting into this "
+                        "account and I will not guess between them. Until "
+                        "you pick one, this money is not on anyone's books."
+                    )
+                elif on_account:
+                    body += (
+                        "An order is now collecting into this account. Put "
+                        "it on there:"
+                    )
+                else:
+                    body += (
+                        "Nothing is collecting into this account at the "
+                        "moment — the last order on it finished before this "
+                        "arrived. I will offer it again as soon as one "
+                        "opens."
+                    )
+
+                rows.append([InlineKeyboardButton(
+                    text="Not ours — ignore it",
+                    callback_data=f"hpx:{h['id']}")])
+                markup = InlineKeyboardMarkup(inline_keyboard=rows)
             else:
                 # The client was asked which account and has not answered.
                 #

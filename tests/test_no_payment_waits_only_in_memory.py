@@ -221,9 +221,27 @@ class TestTheOtherKindIsUntouched:
     here is worth regressing it for.
     """
 
-    def test_the_shared_account_wording_still_stands(self):
+    def test_it_still_refuses_to_guess_between_orders(self):
+        """
+        Was: assert "Two vendors share this account" in the source.
+
+        26 October 2026. That sentence was printed for every hold with a
+        known account, whatever was actually happening on it — and from this
+        date a hold can sit on an account with ONE live order or NONE, so
+        the sentence was often simply untrue. The chase now reads the
+        account when it sends, and says which of the three it is.
+
+        What must not change is the guarantee underneath it: with more than
+        one order collecting, the bot does not choose. That is what this
+        test is for, and it is asserted on the behaviour rather than on a
+        form of words that can legitimately be rewritten.
+        """
         src = inspect.getsource(notifier_mod.Notifier.chase_held_payments)
-        assert "Two vendors share this account" in src
+        assert "len(on_account) > 1" in src, "the many-orders case is gone"
+        branch = src[src.index("len(on_account) > 1"):]
+        assert "will not guess" in branch[:400], (
+            "it no longer refuses to choose between orders"
+        )
 
     def test_it_still_refuses_to_hold_a_utr_already_recorded(self):
         src = inspect.getsource(Repo.hold_payment)

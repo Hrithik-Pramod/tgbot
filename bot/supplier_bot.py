@@ -214,6 +214,51 @@ async def cmd_progress(message: Message, party, repo) -> None:
     ))
 
 
+@router.message(Command("history"))
+async def cmd_history(message: Message, party, repo) -> None:
+    """
+    Deals this vendor has finished recently, each with its statement.
+
+        I need a feature for the vendors. I need them to be able to view old
+        trades over the last 3 to 4 days and show the summary with UTRs. A
+        completed progress
+        — Bridge, 23 October 2026
+
+    /progress reports the order being collected. The moment a deal closed it
+    vanished from the vendor's view entirely, so the only way to check what
+    had been paid against it was to ask the Bridge — the exact question
+    /progress was added to remove, arriving one day later than before.
+
+    Nothing new is disclosed. The statement each button opens is the same one
+    /progress already sends, on the same ownership check, and it carries no
+    reference, no rate, no margin and no client (decision D4). A finished
+    deal is named by the day it closed and what was collected.
+    """
+    trades = await repo.recent_closed_trades_for_supplier(party["id"])
+    if not trades:
+        await message.answer(
+            "You have no completed deals in the last few days.\n\n"
+            "Use /progress for a deal still collecting."
+        )
+        return
+
+    lines = ["Deals you finished recently.", ""]
+    rows = []
+    for n, t in enumerate(trades, 1):
+        when = t["completed_at"].strftime("%d %b")
+        lines.append(f"{n}.  {when}  ₹{fmt_inr(t['paid_inr'])} collected")
+        rows.append([InlineKeyboardButton(
+            text=f"Statement — {when}, ₹{fmt_inr(t['paid_inr'])}",
+            callback_data=f"sst:{t['id']}",
+        )])
+    lines += ["", "Pick one for its payments and UTRs:"]
+
+    await message.answer(
+        "\n".join(lines),
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=rows),
+    )
+
+
 @router.callback_query(F.data.startswith("sst:"))
 async def supplier_statement(call: CallbackQuery, party, repo) -> None:
     """
