@@ -15,7 +15,8 @@ from aiogram import Bot, Dispatcher
 from aiogram.client.default import DefaultBotProperties
 from aiogram.fsm.storage.memory import MemoryStorage
 
-from bot import bridge_bot, bridge_trade, client_bot, membership, supplier_bot
+from bot import (bridge_bot, bridge_trade, client_bot, membership, sending,
+                 supplier_bot)
 from bot.auth import ChatRoleMiddleware
 from bot.escape import CommandEscapeMiddleware
 from bot.labels import run_label_sync
@@ -72,6 +73,12 @@ async def main() -> None:
     bridge = Bot(config.bridge_bot_token, default=default)
     supplier = Bot(config.supplier_bot_token, default=default)
     client = Bot(config.client_bot_token, default=default)
+
+    # Before anything can send. Telegram refuses bursts and asks you to come
+    # back in N seconds; until 3 November 2026 nothing did, the refusal came
+    # back as an unhandled exception, and the bot recorded every payment
+    # correctly while being unable to say so. See bot/sending.py.
+    sending.install(bridge, supplier, client)
 
     notifier = Notifier(
         bridge_bot=bridge, supplier_bot=supplier, client_bot=client,

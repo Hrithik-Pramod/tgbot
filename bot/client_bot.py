@@ -1331,9 +1331,29 @@ async def _acknowledge(message: Message) -> None:
     """
     try:
         await message.react([ReactionTypeEmoji(emoji="👍")])
+        return
     except Exception:
-        log.info("reaction unavailable in chat %s, replying instead", message.chat.id)
+        log.info("reaction unavailable in chat %s, replying instead",
+                 message.chat.id)
+
+    # The fallback is also a send, so it can fail for the same reason the
+    # reaction did.
+    #
+    # 3 November 2026, under Telegram flood control: the reaction was
+    # refused, this reply was refused too, and the exception escaped into
+    # the handler and killed it — AFTER the money was on the ledger. The
+    # desk saw no acknowledgement and reported the bot as stopped.
+    #
+    # Pacing and retry (bot/sending.py) should mean neither is refused now.
+    # If one still is, the payment is recorded and losing the thumbs up is
+    # not a reason to abandon the rest of the handler.
+    try:
         await message.reply("Noted.")
+    except Exception:
+        log.exception(
+            "could not acknowledge in chat %s; the payment IS recorded",
+            message.chat.id,
+        )
 
 
 async def _record(message, staged, party, repo, *, acknowledge: bool,
