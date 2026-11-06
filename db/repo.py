@@ -1239,7 +1239,33 @@ class Repo:
                              AS outstanding
                     FROM trades t
                     JOIN payment_slots ps ON ps.trade_id = t.id
-                    JOIN bank_accounts b ON b.party_id = t.supplier_id AND b.is_active
+                    -- THE ACCOUNT ON THE INSTRUCTION, NOT THE VENDOR'S LIST.
+                    --
+                    -- This joined on b.party_id = t.supplier_id, so the
+                    -- payment_slots join above only proved the trade had
+                    -- been instructed AT ALL and then every active account
+                    -- that vendor holds was offered.
+                    --
+                    --     when i was correcting this morning, adding utrs
+                    --     that bot did not pick up, it showed this list of
+                    --     accounts to allocate to, its mirroring the
+                    --     accounts on the vendors login, regardless if it
+                    --     was used for this trade or not
+                    --     — Bridge, 6 November 2026
+                    --
+                    -- Eight buttons for a trade instructed against one
+                    -- account. Every extra button is a way to put money on
+                    -- an account that was never part of the deal, which is
+                    -- the 9 October fault (₹288,000 onto SUPA50) offered as
+                    -- a menu.
+                    --
+                    -- The same correction was made to
+                    -- matchable_accounts_for_client and
+                    -- live_trades_on_account that day. This query was
+                    -- missed, because the payment_slots join made it look
+                    -- as though it had already been done.
+                    JOIN bank_accounts b
+                      ON b.id = ps.bank_account_id AND b.is_active
                     WHERE t.client_id = $1
                       AND t.status IN ('open', 'awaiting_payment')
                     ORDER BY
