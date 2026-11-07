@@ -421,15 +421,64 @@ async def _place_on_shared_account(message, p, matchable, party, repo, notifier)
         # handler is forbidden to mention: a client-facing function must not
         # carry a vendor's name, and the guard that enforces it reads the
         # source. These are ids, never labels.
+        # A TRADE IN MOTION FINISHES. 7 November 2026.
+        #
+        #     so this is the issue, mid trade, another trade on the same
+        #     account comes in, and causes a question to be triggered
+        #
+        #     if neither has started, i would always wait to initiate the
+        #     start of one
+        #
+        #     but on ALL occassions, it has been a trade is midway, another
+        #     comes in, and the bot asks where the funds should go, so it
+        #     breaks the cycle. i dont want that to happen.
+        #
+        #     midflow trades complete, unless i trigger a switch on my bot
+        #     — Bridge
+        #
+        # This used to be gated on the two orders belonging to ONE vendor,
+        # which is the 9 October narrowing — made after ₹288,000 for Uncle
+        # landed on IndoLondon's SUPA50 while SUPA50 was mid-collection.
+        #
+        # THAT NARROWING IS NOW DOING A JOB SOMETHING ELSE ALREADY DOES.
+        #
+        # SUPA50 was instructed against KISAN TRADERS. Royal Trading was
+        # never part of that deal; it was reachable only because an account
+        # resolved to ANY open order of its vendor. Since 9 October every
+        # one of these queries requires a payment_slot on THIS account, so
+        # an order that was never instructed against it cannot be a
+        # candidate here at all. The failure that justified the gate is
+        # closed upstream.
+        #
+        # What the gate costs is what he is describing: a second order
+        # opening on an account mid-collection stops the first one dead and
+        # every payment becomes a question. Eleven in four hours on
+        # 6 November, waiting for him when he woke up.
+        #
+        # So the shortcut applies across vendors again — but only to an
+        # order actually in motion. choose_established_path still requires
+        # exactly ONE order that has taken money and is still short; two in
+        # flight, or none, and he is asked. "Unless i trigger a switch" is
+        # /collect, which outranks this and is checked above.
+        #
+        # The risk he has accepted, in writing and knowing the history: if
+        # the in-flow order is vendor A's and the money was vendor B's, it
+        # lands on A. The figures still differ on screen and /correct moves
+        # it. That is his call to make and he has made it.
+        #
+        # Wrapped because the shortcut now reads the FIGURES rather than the
+        # vendor ids, so an incomplete row fails here instead of at the
+        # `owners` check that used to guard this. The rule it inherits is
+        # unchanged: asking costs a tap, assuming costs a misattribution.
         try:
-            owners = {t["supplier_id"] for t in trades}
-        except (KeyError, TypeError):
-            # Cannot tell whose orders these are, so do not assume they are
-            # one party's. Asking costs a tap; assuming costs a
-            # misattribution.
-            owners = None
-        if owners is not None and len(owners) == 1:
             chosen_id = choose_established_path(trades)
+        except (KeyError, TypeError):
+            log.warning(
+                "could not read the collection figures for the orders on "
+                "account ...%s; asking rather than assuming",
+                str(account_number)[-4:],
+            )
+            chosen_id = None
 
     if chosen_id is not None:
         path = chosen_id
@@ -498,9 +547,21 @@ async def _place_on_shared_account(message, p, matchable, party, repo, notifier)
                      if str(a["account_number"]) == account_number), None)
         return "recorded", (f"to {name}" if name else "recorded")
 
+    # Say what was actually true, not what is usually true. The default this
+    # replaces asserted "neither has started collecting" on every hold of
+    # this kind, and on 7 November that sentence sent a diagnosis down the
+    # wrong road for a day.
+    in_flight = sum(
+        1 for t in trades
+        if (t.get("collected") or 0) > 0
+        and (t.get("collected") or 0) < (t.get("inr_expected") or 0)
+    )
     held, held_id = await repo.hold_payment(
         client_id=party["id"], utr=p.utr, amount_inr=p.amount_inr,
         account_number=account_number, ifsc=ifsc,
+        why=(f"{len(trades)} live orders on this account, {in_flight} "
+             f"part-collected; no single order in flow to follow, so the "
+             f"Bridge is asked"),
         chat_id=message.chat.id, message_id=message.message_id,
     )
     if not held:

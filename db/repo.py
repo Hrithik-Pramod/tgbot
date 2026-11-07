@@ -3415,10 +3415,31 @@ class Repo:
                     detail={"utr": utr, "amount_inr": amount_inr,
                             "account_number": account_number,
                             "typed_beneficiary": typed_beneficiary,
-                            "why": why or (
-                                "two vendors have a live order on this "
-                                "account and neither has started "
-                                "collecting; asking the Bridge")},
+                            # NO DEFAULT. The caller says why, or the row
+                            # says it does not know.
+                            #
+                            # This defaulted to "two vendors have a live
+                            # order on this account and neither has started
+                            # collecting", and the shared-account branch
+                            # passes no `why` — so EVERY hold of that kind
+                            # recorded that sentence whether or not it was
+                            # true. It was written on 1 October when it was
+                            # the only case; the 9 October gate added
+                            # another and nobody updated the string.
+                            #
+                            # 7 November 2026 it cost a diagnosis. Eleven
+                            # holds all read "neither has started
+                            # collecting", so the Bridge was told that was
+                            # the cause — while he was saying, correctly,
+                            # "on ALL occasions it has been a trade is
+                            # midway". He was right and the audit log was
+                            # not, and it nearly bought the wrong fix.
+                            #
+                            # A diagnostic that states an assumption as a
+                            # finding is worse than no diagnostic: it is
+                            # believed, and it is believed precisely when
+                            # somebody is trying to work out what happened.
+                            "why": why or "not recorded by the caller"},
                 )
                 return True, held_id
 

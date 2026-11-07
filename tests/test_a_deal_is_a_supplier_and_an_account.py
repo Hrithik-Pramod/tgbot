@@ -137,21 +137,57 @@ async def _place(repo, notifier=None):
 
 class TestAcrossVendorsTheBridgeAlwaysDecides:
     @pytest.mark.asyncio
-    async def test_the_collecting_order_no_longer_wins(self):
+    async def test_an_order_in_flow_now_wins_even_across_vendors(self):
         """
-        The 9 October case exactly: IndoLondon mid-collection, Uncle at
-        zero, and the payment was Uncle's.
+        REVERSED 7 November 2026, by the Bridge, knowing this history.
+
+        This asserted the opposite until today — that an order
+        mid-collection must NOT claim a payment when the other order on the
+        account belongs to a different vendor. That was his rule of
+        9 October, made after ₹288,000 for Uncle landed on IndoLondon's
+        SUPA50 while SUPA50 was mid-collection.
+
+        What it cost him:
+
+            mid trade, another trade on the same account comes in, and
+            causes a question to be triggered ... on ALL occassions, it has
+            been a trade is midway, another comes in, and the bot asks where
+            the funds should go, so it breaks the cycle. i dont want that to
+            happen. midflow trades complete, unless i trigger a switch on my
+            bot
+            — Bridge, 7 November 2026
+
+        Eleven payments held in four hours on 6 November, all waiting for
+        him when he woke up.
+
+        WHY THIS IS NOT SIMPLY REOPENING THE 9 OCTOBER HOLE
+
+        SUPA50 was instructed against KISAN TRADERS. Royal Trading was never
+        part of that deal — it was reachable only because an account
+        resolved to ANY open order of its vendor. Every query here now
+        requires a payment_slot on THIS account, so an order never
+        instructed against it is not a candidate at all. The 9 October
+        failure is closed upstream, by a different mechanism, and this gate
+        was guarding a door that is already locked.
+
+        WHAT IS STILL TRUE
+
+        Only an order actually in flow claims anything, only when it is the
+        only one in flow, and /collect still outranks it. The residual risk
+        — in-flow order is vendor A's, money was vendor B's — he has
+        accepted in writing, and the figures on screen plus /correct are the
+        way back.
         """
         repo = _Repo([_order(88, supplier_id=30, collected=D("3649400")),
                       _order(91, supplier_id=31, collected=D(0))])
         notifier = _Notifier()
         out = await _place(repo, notifier)
-        assert out is not None and out[0] == "held", (
-            "a payment was attributed across vendors on the strength of one "
-            "order being mid-collection"
+        assert out is not None and out[0] == "recorded", (
+            "an order in flow was interrupted by a second order opening on "
+            "the same account — the 7 November complaint"
         )
-        assert repo.added == [], "it was recorded without anyone being asked"
-        assert notifier.asked, "the Bridge was not asked"
+        assert [a["trade_id"] for a in repo.added] == [88]
+        assert not notifier.asked, "he was asked anyway"
 
     @pytest.mark.asyncio
     async def test_it_asks_even_when_both_are_collecting(self):
@@ -193,17 +229,39 @@ class TestWithinOneVendorTheShortcutSurvives:
 
 class TestAMissingVendorIsNeverAssumedAway:
     @pytest.mark.asyncio
-    async def test_rows_without_a_supplier_are_treated_as_unknown(self):
+    async def test_rows_without_the_collection_figures_are_treated_as_unknown(self):
         """
         Asking costs a tap. Assuming costs a misattribution, so an
         incomplete row must not fall through to the shortcut.
+
+        7 November 2026: this used to withhold a row missing supplier_id,
+        because the shortcut was gated on the vendors being the same. The
+        shortcut now reads the collection FIGURES instead, so supplier_id
+        is no longer consulted and a row missing it is no longer dangerous
+        — but a row missing `collected` or `inr_expected` is, and raises
+        where the old guard used to catch.
+
+        The rule did not change. The field that can be missing did.
+        """
+        repo = _Repo([{"id": 88, "account_id": 9, "supplier_id": 30,
+                       "reference": "REF88", "opened_at": None,
+                       "outstanding": D(0), "vendor": "A VENDOR"}])
+        out = await _place(repo)
+        assert out[0] == "held"
+
+    @pytest.mark.asyncio
+    async def test_a_row_without_a_vendor_is_now_harmless(self):
+        """
+        The other side of the same move: one order in flow on this account
+        is claimed on the strength of its figures, and whose it is does not
+        come into it.
         """
         repo = _Repo([{"id": 88, "account_id": 9, "collected": D("3649400"),
                        "inr_expected": D("5198490"), "reference": "REF88",
                        "opened_at": None, "outstanding": D(0),
                        "vendor": "A VENDOR"}])
         out = await _place(repo)
-        assert out[0] == "held"
+        assert out[0] == "recorded"
 
 
 # ----------------------------------------------------------------------
