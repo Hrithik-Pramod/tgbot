@@ -4401,6 +4401,20 @@ class Repo:
             return await conn.fetch(
                 """
                 SELECT t.reference, t.status, t.opened_at, t.completed_at,
+                       -- WHEN THE PAYMENT LANDED, not when the deal did.
+                       --
+                       --     they just need a full UTR and Value run for
+                       --     the account they are in. with dates
+                       --     — Bridge, 13 November 2026
+                       --
+                       -- A UTR run is reconciled against a bank statement
+                       -- one line at a time, and the date on that line is
+                       -- the payment's. Opened and completed belong to the
+                       -- deal and can be days either side of it, so a
+                       -- statement carrying only those is one the vendor
+                       -- cannot tie to their own book — which is the
+                       -- entire job of handing it over.
+                       p.created_at AS paid_at,
                        p.utr, p.amount_inr, b.account_name AS beneficiary
                 FROM trades t
                 LEFT JOIN payments p ON p.trade_id = t.id

@@ -1974,7 +1974,7 @@ async def cmd_export(message: Message, repo) -> None:
 
 VENDOR_STATEMENT_COLUMNS = [
     "Reference", "Status", "Opened", "Completed",
-    "UTR", "Payment INR", "Beneficiary",
+    "Paid", "UTR", "Payment INR", "Beneficiary",
 ]
 
 
@@ -1991,6 +1991,7 @@ def render_vendor_statement_csv(rows) -> bytes:
             r["reference"], r["status"],
             r["opened_at"].strftime("%Y-%m-%d %H:%M") if r["opened_at"] else "",
             r["completed_at"].strftime("%Y-%m-%d %H:%M") if r["completed_at"] else "",
+            r["paid_at"].strftime("%Y-%m-%d %H:%M") if r["paid_at"] else "",
             r["utr"] or "", r["amount_inr"] or "", r["beneficiary"] or "",
         ])
     return buf.getvalue().encode("utf-8-sig")

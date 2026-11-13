@@ -14,8 +14,12 @@ from aiogram import F, Router
 from aiogram.filters import Command
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
-from aiogram.types import CallbackQuery, InlineKeyboardButton, InlineKeyboardMarkup, Message
+from aiogram.types import (BufferedInputFile, CallbackQuery,
+                           InlineKeyboardButton, InlineKeyboardMarkup, Message)
 
+# The Bridge's preview and the vendor's own copy are the same file, written
+# by the same function. See cmd_statement.
+from bot.bridge_trade import render_vendor_statement_csv
 from core.money import fmt_inr
 from core.summary import render_mini_statement, render_own_accounts
 
@@ -256,6 +260,45 @@ async def cmd_history(message: Message, party, repo) -> None:
     await message.answer(
         "\n".join(lines),
         reply_markup=InlineKeyboardMarkup(inline_keyboard=rows),
+    )
+
+
+@router.message(Command("statement"))
+async def cmd_statement(message: Message, party, repo) -> None:
+    """
+    The vendor's own 90 days, as a file they can reconcile against.
+
+        do it, for vendors, they just need a full UTR and Value run for the
+        account they are in. with dates
+        — Bridge, 13 November 2026
+
+    /progress and /history answer "how is this deal going". This answers
+    "show me everything, so I can tick it off against my bank". Different
+    question, and a chat message is the wrong shape for 200 lines of it.
+
+    NOTHING HERE IS NEW INFORMATION.
+
+    Same query and same writer as the Bridge's own /vendorstatement — he
+    read one before this command existed, which is what "set up a test area
+    first" bought. Building the vendor's copy separately would mean the file
+    he approved and the file they receive are two different files that
+    merely look alike.
+
+    No rates, no USDT, no expected total, no margin, no client. Every line
+    is a payment into this vendor's own account, already on their own bank
+    statement.
+    """
+    rows = await repo.vendor_statement_rows(party["id"])
+    if not rows:
+        await message.answer(
+            "You have no trades in the last 90 days."
+        )
+        return
+
+    await message.answer_document(
+        BufferedInputFile(render_vendor_statement_csv(rows),
+                          filename="statement.csv"),
+        caption=f"{len(rows)} rows, last 90 days.",
     )
 
 

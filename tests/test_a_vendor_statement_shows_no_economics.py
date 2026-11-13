@@ -54,7 +54,7 @@ import pytest
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
-from bot import bridge_trade, menu  # noqa: E402
+from bot import bridge_trade, menu, supplier_bot  # noqa: E402
 from bot.bridge_trade import (  # noqa: E402
     VENDOR_STATEMENT_COLUMNS, render_vendor_statement_csv,
 )
@@ -97,10 +97,12 @@ ROWS = [
     {"reference": "REF1", "status": "completed",
      "opened_at": datetime(2026, 11, 1, 9, 30),
      "completed_at": datetime(2026, 11, 1, 18, 4),
+     "paid_at": datetime(2026, 11, 1, 14, 22),
      "utr": "BKIDR10000000000001", "amount_inr": D("200000"),
      "beneficiary": "EKTA TRADERS"},
     {"reference": "REF2", "status": "open",
      "opened_at": datetime(2026, 11, 2, 10, 0), "completed_at": None,
+     "paid_at": None,
      "utr": None, "amount_inr": None, "beneficiary": None},
 ]
 
@@ -122,8 +124,36 @@ class TestTheEconomicsAreNotThere:
         """
         assert VENDOR_STATEMENT_COLUMNS == [
             "Reference", "Status", "Opened", "Completed",
-            "UTR", "Payment INR", "Beneficiary",
+            "Paid", "UTR", "Payment INR", "Beneficiary",
         ]
+
+    def test_each_payment_carries_its_own_date(self):
+        """
+            they just need a full UTR and Value run for the account they
+            are in. with dates — Bridge, 13 November 2026
+
+        Opened and completed are the DEAL's dates and can be days either
+        side of a payment. A vendor ticking this off against their bank
+        needs the date on the bank's line, or the file cannot be
+        reconciled — which is the only reason to hand it over.
+        """
+        assert "Paid" in VENDOR_STATEMENT_COLUMNS
+        assert "p.created_at AS paid_at" in STATEMENT
+        rows = list(csv.reader(io.StringIO(
+            render_vendor_statement_csv(ROWS).decode("utf-8-sig"))))
+        assert rows[1][VENDOR_STATEMENT_COLUMNS.index("Paid")] == \
+            "2026-11-01 14:22"
+
+    def test_the_payment_date_is_not_the_trade_date(self):
+        """
+        Guards against it being wired to opened_at, which would look
+        plausible in every row and be wrong in most.
+        """
+        rows = list(csv.reader(io.StringIO(
+            render_vendor_statement_csv(ROWS).decode("utf-8-sig"))))
+        paid = rows[1][VENDOR_STATEMENT_COLUMNS.index("Paid")]
+        assert paid != rows[1][VENDOR_STATEMENT_COLUMNS.index("Opened")]
+        assert paid != rows[1][VENDOR_STATEMENT_COLUMNS.index("Completed")]
 
     def test_the_header_matches_the_row_width(self):
         """
@@ -204,18 +234,56 @@ class TestTheBridgeSeesItFirst:
         src = (ROOT / "bot" / "bridge_trade.py").read_text(encoding="utf-8")
         assert 'Command("vendorstatement")' in src
 
-    def test_no_vendor_can_run_it_yet(self):
+    def test_the_vendor_command_shipped_only_after_he_had_seen_one(self):
         """
-        The vendor-facing command is a second deploy, after he has read
-        one. Shipping both at once is not a test area.
+        This asserted the opposite for one deploy: that nothing on the
+        supplier bot could reach this query at all.
+
+            are you trying on test first? apologies, but this one is ultra
+            sensitive.
+            — Bridge, 13 November 2026, 20:03
+
+            do it, for vendors, they just need a full UTR and Value run for
+            the account they are in. with dates
+            — Bridge, 20:07
+
+        He read the real file from /vendorstatement, then released it. The
+        staging was the point and it worked; this now records that the
+        second stage happened, and on whose word.
         """
         src = (ROOT / "bot" / "supplier_bot.py").read_text(encoding="utf-8")
-        assert "vendor_statement_rows" not in src
-        assert "vendorstatement" not in src
+        assert 'Command("statement")' in src
+        assert "vendor_statement_rows" in src
+
+    def test_the_vendor_copy_is_the_same_file_he_approved(self):
+        """
+        The whole value of the preview. Two renderers that merely look
+        alike would mean he checked a different document from the one that
+        goes out.
+        """
+        # Inside the handler, not merely somewhere in the file — the import
+        # line carries the name too, so a file-wide search passes even when
+        # the handler has stopped calling it. A mutation proved exactly
+        # that.
+        src = inspect.getsource(supplier_bot.cmd_statement)
+        assert "render_vendor_statement_csv(rows)" in src
+        assert "csv.writer" not in src, (
+            "the vendor copy is being written by its own code"
+        )
+
+    def test_a_vendor_only_ever_gets_their_own(self):
+        """
+        The command takes no argument and no id from the message. The
+        party is resolved by the middleware from the chat the command came
+        from, so there is nothing to tamper with.
+        """
+        src = inspect.getsource(supplier_bot.cmd_statement)
+        assert 'repo.vendor_statement_rows(party["id"])' in src
 
     def test_it_is_in_the_bridge_menu_only(self):
         assert any(c == "vendorstatement" for c, _ in menu.MENUS["bridge"])
         assert not any(c == "vendorstatement" for c, _ in menu.MENUS["supplier"])
+        assert any(c == "statement" for c, _ in menu.MENUS["supplier"])
 
     def test_the_preview_uses_the_same_renderer(self):
         """
