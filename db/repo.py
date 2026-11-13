@@ -4338,6 +4338,80 @@ class Repo:
                 str(days),
             )
 
+    async def vendor_statement_rows(
+        self, supplier_id: int, days: int = 90,
+    ) -> list[asyncpg.Record]:
+        """
+        One vendor's own deals and payments, safe to hand to that vendor.
+
+            i need from you something also, the statement ability i have on
+            my end, i need an adjusted one for the vendor
+
+            no rates shown only the attached, for exporting the last 90 days
+
+            set up a test area first, so we can be sure no errors, as RATES
+            AND AMOUNTS MUST NOT BE SHOWN
+            — Bridge, 13 November 2026
+
+        A SEPARATE QUERY, NOT export_rows WITH COLUMNS DROPPED.
+
+        Filtering the wide export down at the caller would work until someone
+        adds a column to export_rows — which is a normal, correct thing to do
+        to the Bridge's own export — and it would appear here silently. The
+        forbidden fields are not selected at all, so the only way to leak one
+        is to come here and type it, and the test below reads this SELECT.
+
+        WHAT IS LEFT OUT, AND WHY EACH ONE
+
+          supply_rate, sell_rate        the margin, in two pieces. The whole
+          usdt_received, inr_expected   point of the request.
+          usdt_owed_client, margin_usdt
+
+          client                        A vendor must never learn who the
+                                        Bridge's counterparty is. His own
+                                        example file still carried this
+                                        column, because it was his own
+                                        export filtered to one vendor rather
+                                        than something built to be handed
+                                        over. 11 September 2026 is what that
+                                        costs: a list went out reading
+                                        "Supplier A — …" and told a
+                                        counterparty the shape of the book.
+
+          supplier                      Themselves. Harmless, and noise.
+
+        WHAT IS KEPT
+
+          reference                     Their own deal number. New to them —
+                                        /progress and /history deliberately
+                                        number the orders instead — but he
+                                        asked for it and it is the only
+                                        thing that lets him and a vendor
+                                        name the same deal on a phone call.
+
+          status, opened, completed     Which deals, and when.
+
+          utr, amount_inr, beneficiary  The collection. Every line is already
+                                        on that vendor's own bank statement.
+
+        Deals with no payments still appear, through the LEFT JOIN, so the
+        statement is a complete picture and not only the deals that got paid.
+        """
+        async with self.pool.acquire() as conn:
+            return await conn.fetch(
+                """
+                SELECT t.reference, t.status, t.opened_at, t.completed_at,
+                       p.utr, p.amount_inr, b.account_name AS beneficiary
+                FROM trades t
+                LEFT JOIN payments p ON p.trade_id = t.id
+                LEFT JOIN bank_accounts b ON b.id = p.beneficiary_account_id
+                WHERE t.supplier_id = $1
+                  AND t.opened_at > now() - ($2::text || ' days')::interval
+                ORDER BY t.opened_at, p.sequence_no
+                """,
+                supplier_id, str(days),
+            )
+
     # --------------------------------------------------------------- deposits
 
     async def confirm_deposit(

@@ -61,6 +61,7 @@ MENUS: dict[str, list[tuple[str, str]]] = {
         ("walletremove", "retire a wallet, keeping its history"),
         ("send",         "note a transfer you have made"),
         ("export",       "download the ledger as a CSV"),
+        ("vendorstatement", "a vendor's own statement, no rates or margin"),
     ],
     "supplier": [
         ("send",           "tell us you have sent, and to which account"),

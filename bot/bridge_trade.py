@@ -1948,6 +1948,91 @@ async def cmd_export(message: Message, repo) -> None:
     )
 
 
+# ------------------------------------------------------- vendor statement
+#
+#     i need from you something also, the statement ability i have on my
+#     end, i need an adjusted one for the vendor
+#
+#     no rates shown only the attached, for exporting the last 90 days
+#
+#     set up a test area first, so we can be sure no errors, as RATES AND
+#     AMOUNTS MUST NOT BE SHOWN
+#     — Bridge, 13 November 2026
+#
+# THIS IS THE TEST AREA, AND IT IS THE REAL OUTPUT.
+#
+# The command sits on the BRIDGE bot, not the vendor bot. He picks a vendor
+# and gets back the exact bytes that vendor would be sent — same query, same
+# writer, same file — against real history rather than seeded data. Nothing a
+# vendor can run exists yet.
+#
+# A separate UAT stack would have needed three more bot tokens, test groups
+# and seed data, and would have proved less: the thing he is checking is
+# whether real rows leak real figures, and seeded rows cannot answer that.
+#
+# The vendor-facing command is a second deploy, after he has read one.
+
+VENDOR_STATEMENT_COLUMNS = [
+    "Reference", "Status", "Opened", "Completed",
+    "UTR", "Payment INR", "Beneficiary",
+]
+
+
+def render_vendor_statement_csv(rows) -> bytes:
+    """
+    The CSV itself, written once so the preview and the vendor's own copy
+    can never drift into being different files.
+    """
+    buf = io.StringIO()
+    writer = csv.writer(buf)
+    writer.writerow(VENDOR_STATEMENT_COLUMNS)
+    for r in rows:
+        writer.writerow([
+            r["reference"], r["status"],
+            r["opened_at"].strftime("%Y-%m-%d %H:%M") if r["opened_at"] else "",
+            r["completed_at"].strftime("%Y-%m-%d %H:%M") if r["completed_at"] else "",
+            r["utr"] or "", r["amount_inr"] or "", r["beneficiary"] or "",
+        ])
+    return buf.getvalue().encode("utf-8-sig")
+
+
+@router.message(Command("vendorstatement"))
+async def cmd_vendor_statement(message: Message, repo) -> None:
+    suppliers = await repo.list_parties("supplier")
+    if not suppliers:
+        await message.answer("No vendors are registered.")
+        return
+    await message.answer(
+        "Whose statement? This is the file that vendor would be given.",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text=p["label"],
+                                  callback_data=f"vst:{p['id']}")]
+            for p in suppliers
+        ]),
+    )
+
+
+@router.callback_query(F.data.startswith("vst:"))
+async def vendor_statement_file(call: CallbackQuery, repo) -> None:
+    supplier_id = int(call.data.split(":", 1)[1])
+    rows = await repo.vendor_statement_rows(supplier_id)
+    if not rows:
+        await call.message.answer("Nothing for that vendor in the last 90 days.")
+        await call.answer()
+        return
+
+    await call.message.answer_document(
+        BufferedInputFile(render_vendor_statement_csv(rows),
+                          filename="vendor_statement.csv"),
+        caption=(
+            f"{len(rows)} rows, last 90 days.\n\n"
+            "No rates, no USDT, no expected totals, no margin, and no client "
+            "name. Check it before I turn this on for the vendors themselves."
+        ),
+    )
+    await call.answer()
+
+
 # ===========================================================================
 # A BUTTON THAT DOES NOTHING IS WORSE THAN A BUTTON THAT SAYS NO.
 #
