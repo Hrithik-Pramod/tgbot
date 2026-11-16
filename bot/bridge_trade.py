@@ -1796,6 +1796,17 @@ async def correct_pick(call: CallbackQuery, state: FSMContext, repo) -> None:
     if trade["status"] == "completed":
         rows.append([InlineKeyboardButton(
             text="Reopen the order", callback_data="cor")])
+    # Offered only when it applies, which is almost never — a split pair a
+    # few rupees apart with the pair itself exactly right. 16 November 2026
+    # cost an evening and a hand-written transaction; this is that, as a tap.
+    imbalance = await repo.split_pair_imbalance(trade_id)
+    if imbalance is not None:
+        short = min(imbalance["parts"], key=lambda p: p["diff"])
+        rows.append([InlineKeyboardButton(
+            text=(f"Rebalance with its other half "
+                  f"(₹{abs(short['diff']):,.0f} on the wrong side)"),
+            callback_data="corb",
+        )])
     rows += [
         [InlineKeyboardButton(text="A payment was returned by the bank",
                               callback_data="cob")],
@@ -1808,6 +1819,28 @@ async def correct_pick(call: CallbackQuery, state: FSMContext, repo) -> None:
         f"{trade['reference']} — what needs correcting?",
         reply_markup=InlineKeyboardMarkup(inline_keyboard=rows),
     )
+    await call.answer()
+
+
+@router.callback_query(Correct.action, F.data == "corb")
+async def correct_rebalance(
+    call: CallbackQuery, state: FSMContext, party, repo
+) -> None:
+    """
+    The 16 November fix, as a button.
+
+    No confirmation step on purpose. The pair total cannot change, both
+    halves are re-checked inside the transaction, and the whole move is one
+    audit entry per order. A second tap would add ceremony to something that
+    is already impossible to get wrong, and ceremony is what makes him stop
+    using a tool and message me instead.
+    """
+    data = await state.get_data()
+    ok, msg = await repo.rebalance_split_pair(
+        data["trade_id"], actor_party_id=party["id"]
+    )
+    await state.clear()
+    await call.message.edit_text(msg)
     await call.answer()
 
 

@@ -3196,6 +3196,164 @@ class Repo:
 
                 return True, f"{ref} split into {ref} and {new_ref}.", detail
 
+    # The largest gap this will close on its own. Above it, something other
+    # than a transposed rupee has happened and the payment itself should be
+    # moved with /correct, where the UTR is named and the trail says which
+    # payment went where.
+    REBALANCE_LIMIT_INR = Decimal("1000")
+
+    async def split_pair_imbalance(
+        self, trade_id: int,
+    ) -> Optional[dict]:
+        """
+        Is this order one of a split pair that is out by a few rupees, with
+        the other half out by the same the other way?
+
+        Returns the makings of the offer, or None when this is not that
+        situation — which is almost always.
+
+            if you can think of something to add for me to do instances like
+            this — Bridge, 16 November 2026
+
+        He is describing the hour he had just spent. BRAV81 expected
+        ₹3,549,394 and held ₹3,549,393; BRAV82 expected ₹3,549,393 and held
+        ₹3,549,394. The pair was exactly right and neither order was, and
+        fixing it took me a hand-written transaction.
+
+        WHAT MAKES IT SAFE TO OFFER AT ALL
+
+        The pair total. Both halves are moved to what they actually hold, so
+        their sum is unchanged — the money is not being written off, it is
+        being put on the side it landed on. If the two do not already sum to
+        the pair's expected total then money is genuinely missing or extra,
+        this is not a transposition, and the offer is not made.
+        """
+        async with self.pool.acquire() as conn:
+            row = await conn.fetchrow(
+                """
+                WITH pair AS (
+                    SELECT t.id, t.reference, t.inr_expected,
+                           COALESCE((SELECT sum(p.amount_inr) FROM payments p
+                                     WHERE p.trade_id = t.id), 0) AS paid
+                      FROM trades t
+                     WHERE t.id = $1
+                        OR t.id = (SELECT split_from_trade_id FROM trades
+                                    WHERE id = $1)
+                        OR t.split_from_trade_id = $1
+                )
+                SELECT json_agg(json_build_object(
+                           'id', id, 'reference', reference,
+                           'expected', inr_expected, 'paid', paid)) AS parts,
+                       count(*) AS n,
+                       sum(inr_expected) AS expected_total,
+                       sum(paid) AS paid_total
+                  FROM pair
+                """,
+                trade_id,
+            )
+
+        if row is None or row["n"] != 2:
+            return None
+        if row["expected_total"] != row["paid_total"]:
+            return None
+
+        import json
+        parts = json.loads(row["parts"])
+        for p in parts:
+            p["expected"] = Decimal(str(p["expected"]))
+            p["paid"] = Decimal(str(p["paid"]))
+            p["diff"] = p["paid"] - p["expected"]
+
+        if all(p["diff"] == 0 for p in parts):
+            return None
+        if any(abs(p["diff"]) > self.REBALANCE_LIMIT_INR for p in parts):
+            return None
+
+        return {"parts": parts, "total": Decimal(str(row["paid_total"]))}
+
+    async def rebalance_split_pair(
+        self, trade_id: int, *, actor_party_id: int,
+    ) -> tuple[bool, str]:
+        """
+        Put each half of a split pair onto the figure it actually holds.
+
+        Re-read and re-checked inside the transaction rather than trusting
+        what the button was drawn from: the screen may have been sitting
+        there for an hour, and a payment arriving in between would change
+        every figure on it.
+        """
+        async with self.pool.acquire() as conn:
+            async with conn.transaction():
+                rows = await conn.fetch(
+                    """
+                    SELECT t.id, t.reference, t.inr_expected,
+                           COALESCE((SELECT sum(p.amount_inr) FROM payments p
+                                     WHERE p.trade_id = t.id), 0) AS paid
+                      FROM trades t
+                     WHERE t.id = $1
+                        OR t.id = (SELECT split_from_trade_id FROM trades
+                                    WHERE id = $1)
+                        OR t.split_from_trade_id = $1
+                     ORDER BY t.id
+                     FOR UPDATE
+                    """,
+                    trade_id,
+                )
+
+                if len(rows) != 2:
+                    return False, (
+                        "That order is not one half of a split, so there is "
+                        "nothing to rebalance it against."
+                    )
+
+                expected_total = sum(r["inr_expected"] for r in rows)
+                paid_total = sum(r["paid"] for r in rows)
+                if expected_total != paid_total:
+                    return False, (
+                        f"The two halves hold ₹{paid_total:,.0f} between "
+                        f"them against ₹{expected_total:,.0f} expected. "
+                        "That is not a rupee on the wrong side — something "
+                        "is genuinely short or over, so nothing has been "
+                        "changed."
+                    )
+
+                diffs = [r["paid"] - r["inr_expected"] for r in rows]
+                if all(d == 0 for d in diffs):
+                    return False, "Both halves already match. Nothing to do."
+                if any(abs(d) > self.REBALANCE_LIMIT_INR for d in diffs):
+                    return False, (
+                        "The gap is too big to be a rounding crossover. Move "
+                        "the payment itself with /correct instead, so the "
+                        "trail says which one moved."
+                    )
+
+                for r in rows:
+                    await conn.execute(
+                        "UPDATE trades SET inr_expected = $2 WHERE id = $1",
+                        r["id"], r["paid"],
+                    )
+                    await self.audit(
+                        conn, actor_party_id=actor_party_id,
+                        action="trade.split_pair_rebalanced",
+                        entity_type="trade", entity_id=r["id"],
+                        detail={
+                            "reference": r["reference"],
+                            "was": r["inr_expected"], "now": r["paid"],
+                            "pair_total": paid_total,
+                            "why": "the two halves of a split were a few "
+                                   "rupees apart and the client paid them "
+                                   "the other way round; each half moved to "
+                                   "what it holds, pair total unchanged",
+                        },
+                    )
+
+                a, b = rows
+                return True, (
+                    f"{a['reference']} and {b['reference']} now match what "
+                    f"they hold. Together they are still ₹{paid_total:,.0f}, "
+                    "the same as before."
+                )
+
     async def live_trades_on_account(
         self, *, client_id: int, account_number: str, ifsc: str,
     ) -> list[asyncpg.Record]:
