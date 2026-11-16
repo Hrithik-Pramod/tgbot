@@ -650,15 +650,48 @@ async def split_start(call: CallbackQuery, state: FSMContext, repo) -> None:
     # state rather than adding to it, so a half-built allocation cannot be
     # applied to a trade whose total is about to change underneath it.
     await state.set_state(Split.amount)
-    await state.update_data(split_trade_id=trade_id, split_total=str(total))
+    await state.update_data(
+        split_trade_id=trade_id, split_total=str(total),
+        split_total_inr=str(trade["inr_expected"]),
+        # USDT unless he says otherwise, which is how it has always worked.
+        split_unit="usdt",
+    )
 
     # edit_text, not answer: the message being replaced is the account list,
     # whose buttons belong to Confirm.account — a state we have just left. Left
     # on screen they would be taps that reach nothing, which is the fault
     # /cancel carried for three days.
     await call.message.edit_text(
-        f"{trade['reference']} holds {fmt_usdt_plain(total)} USDT.\n\n"
+        f"{trade['reference']} holds {fmt_usdt_plain(total)} USDT, "
+        f"₹{fmt_inr(trade['inr_expected'])}.\n\n"
         "How much should the FIRST order be? Send just the number in USDT.\n"
+        "The rest becomes a second order you can send whenever you like.",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+            # Splitting on the rupee figure, so he can pick a round one.
+            #
+            # 16 November 2026: halving 66,843.569 USDT gave ₹3,549,394 and
+            # ₹3,549,393. Both collect into the same account, nothing on a
+            # slip says which is which, and the client paid them the wrong
+            # way round. Two adjacent figures are a transposition waiting to
+            # happen; ₹3,550,000 and ₹3,548,787 are not.
+            [InlineKeyboardButton(text="Enter it in ₹ instead",
+                                  callback_data="spinr")],
+            [InlineKeyboardButton(text="Leave it as one order",
+                                  callback_data="spno")],
+        ]),
+    )
+    await call.answer()
+
+
+@router.callback_query(Split.amount, F.data == "spinr")
+async def split_in_rupees(call: CallbackQuery, state: FSMContext) -> None:
+    data = await state.get_data()
+    await state.update_data(split_unit="inr")
+    total_inr = to_decimal(data["split_total_inr"])
+    await call.message.edit_text(
+        f"That order is ₹{fmt_inr(total_inr)} in total.\n\n"
+        "How much should the FIRST order be? Send just the number in "
+        "rupees — a round figure is easiest to collect against.\n"
         "The rest becomes a second order you can send whenever you like.",
         reply_markup=InlineKeyboardMarkup(inline_keyboard=[[
             InlineKeyboardButton(text="Leave it as one order",
@@ -682,28 +715,35 @@ async def split_amount_typed(
     message: Message, state: FSMContext, party, repo
 ) -> None:
     data = await state.get_data()
-    total = to_decimal(data["split_total"])
+    in_rupees = data.get("split_unit") == "inr"
+    total = to_decimal(
+        data["split_total_inr"] if in_rupees else data["split_total"]
+    )
+    unit = "rupees" if in_rupees else "USDT"
+    example = "3550000" if in_rupees else "4000"
 
     try:
         first = to_decimal(message.text or "")
     except MoneyError:
         await message.answer(
-            "I could not read that as an amount. Send just the number of USDT "
-            "for the first order — for example 4000."
+            f"I could not read that as an amount. Send just the number of "
+            f"{unit} for the first order — for example {example}."
         )
         return
 
     if first <= 0 or first >= total:
+        shown = (f"₹{fmt_inr(total)}" if in_rupees
+                 else f"{fmt_usdt_plain(total)} USDT")
         await message.answer(
-            f"The first order has to be between 0 and "
-            f"{fmt_usdt_plain(total)} USDT, so that there is a second one. "
-            "Send a different number."
+            f"The first order has to be between 0 and {shown}, so that "
+            "there is a second one. Send a different number."
         )
         return
 
     ok, msg, detail = await repo.split_trade(
-        trade_id=data["split_trade_id"], first_usdt=first,
+        trade_id=data["split_trade_id"],
         actor_party_id=party["id"],
+        **({"first_inr": first} if in_rupees else {"first_usdt": first}),
     )
     await state.clear()
 

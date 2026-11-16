@@ -99,8 +99,15 @@ def _trade(**over):
         "supplier_label_at_trade": "VENDOR AS NAMED AT THE TIME",
         "usdt_received": D("10000"),
         "inr_expected": usdt_to_inr(D("10000"), SUPPLY),
-        "usdt_owed_client": D("9861.65"),
-        "margin_usdt": D("138.35"),
+        # Consistent with inr_expected and SELL, which it had not been:
+        # 1,062,000 / 107.7 is 9860.72, not 9861.65. It never showed while
+        # each half was priced from scratch, and it showed the moment the
+        # second half became the remainder — the pair now inherits whatever
+        # the parent says, so a parent that disagrees with itself hands the
+        # disagreement to its children. A real trade is written consistently
+        # at the point the deposit lands; this fixture was not.
+        "usdt_owed_client": D("9860.72"),
+        "margin_usdt": D("139.28"),
         "nominated_account_id": 12,
         "split_from_trade_id": None,
         "instructed_at": None,
@@ -659,7 +666,11 @@ class TestOneQuestionAndTwoOrders:
         )
         kb = call.message.edited[0].get("reply_markup")
         datas = [b.callback_data for row in kb.inline_keyboard for b in row]
-        assert datas == ["spno"]
+        # spinr joined it on 16 November 2026 — see the rupee-splitting
+        # tests. What this test is about is that no "cfa:" survives: every
+        # button on this screen must belong to the state we just entered.
+        assert datas == ["spinr", "spno"]
+        assert not any(d.startswith("cfa:") for d in datas)
 
     @pytest.mark.asyncio
     async def test_the_number_he_sends_becomes_the_first_order(self):

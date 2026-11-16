@@ -2907,7 +2907,9 @@ class Repo:
             )
 
     async def split_trade(
-        self, *, trade_id: int, first_usdt: Decimal, actor_party_id: int,
+        self, *, trade_id: int, actor_party_id: int,
+        first_usdt: Optional[Decimal] = None,
+        first_inr: Optional[Decimal] = None,
     ) -> tuple[bool, str, Optional[dict]]:
         """
         Carve one order into two, the Bridge choosing where the line falls.
@@ -2938,15 +2940,56 @@ class Repo:
             sum(deposits on parent) = parent.usdt_received
                                     + sum(children.usdt_received)
 
+        WHERE THE LINE IS DRAWN — USDT OR INR
+
+        first_usdt splits on the deposit. first_inr splits on what the client
+        will be asked to pay, and is used VERBATIM as the first part's
+        inr_expected.
+
+        The second is for picking a round figure, and it exists because of
+        16 November 2026. A 66,843.569 USDT deposit halved into orders of
+        ₹3,549,394 and ₹3,549,393 — a rupee apart. Both halves collect into
+        the same account, so nothing on a slip says which is which, and the
+        client paid them the other way round:
+
+            1 dollar over on 1 trade, another 1 dollar under ... it was the
+            first split trade i have done
+            — Bridge
+
+        Nothing was lost; the pair summed exactly. But one order sat open a
+        rupee short while its twin sat a rupee over, and no amount of care at
+        the desk prevents that when the two figures are adjacent. Asked for a
+        round number he gets ₹3,550,000 and ₹3,548,787, which cannot be
+        transposed by accident.
+
         WHY BOTH PARTS ARE PRICED AT THE PARENT'S OWN RATES
 
         The snapshot on the trade row, never the current rate. The USDT
         arrived once, under one deal, and a rate change between the deposit
         landing and the Bridge splitting it must not make half of it worth
-        more than the other half. Each part is priced independently from its
-        own USDT rather than the second being the first subtracted from the
+        more than the other half.
+
+        THE SECOND PART IS THE REMAINDER, NOT A SECOND CALCULATION
+
+        This used to read: "Each part is priced independently from its own
+        USDT rather than the second being the first subtracted from the
         total, because a difference of rounded figures is not the rounding of
-        the difference.
+        the difference."
+
+        True about rounding, and the wrong invariant to protect. Pricing both
+        halves independently means three roundings — the parent's, the
+        first's and the second's — and the two children need not add back to
+        the parent. usdt_received is already the remainder and conserves; INR
+        and the client's USDT were not and did not. On 16 November they
+        happened to land exactly, which is luck, not design: the second
+        part's USDT is itself rounded to 2dp from a deposit carried to 6, so
+        up to half a rupee of drift is available on every split.
+
+        So the first part is priced from its own figure and is exactly right,
+        and the second part takes what is left of every column. The second
+        part's implied rate is then off by a fraction of a cent, which nobody
+        can see. A split that does not add up is visible, and he was looking
+        at it.
 
         WHAT IT REFUSES
 
@@ -2964,7 +3007,8 @@ class Repo:
           an amount of nothing, or     a part of zero is not a part, and a
           the whole thing              part of everything is not a split
         """
-        from core.money import inr_to_usdt, round_usdt, usdt_to_inr
+        from core.money import (inr_to_usdt, round_inr, round_usdt,
+                                usdt_to_inr)
 
         async with self.pool.acquire() as conn:
             async with conn.transaction():
@@ -3023,28 +3067,63 @@ class Repo:
                         "trade. Use /correct to move the payment first."
                     ), None
 
-                total = Decimal(t["usdt_received"])
-                first = round_usdt(Decimal(first_usdt))
-
-                if first <= 0:
-                    return False, "The first part has to be more than zero.", None
-                if first >= total:
+                if (first_usdt is None) == (first_inr is None):
                     return False, (
-                        f"{ref} holds {total:f} USDT in total. The first part "
-                        "has to be less than that, or there is no second part."
+                        "Split by USDT or by INR, not both and not neither."
                     ), None
 
-                second = round_usdt(total - first)
-
+                total = Decimal(t["usdt_received"])
                 supply, sell = t["supply_rate"], t["sell_rate"]
 
-                first_inr = usdt_to_inr(first, supply)
+                # The parent's own figures, which the two parts must add back
+                # to. Taken from the row rather than recomputed: the row is
+                # what every other reader has been using.
+                parent_inr = Decimal(t["inr_expected"])
+                parent_owed = Decimal(t["usdt_owed_client"])
+                parent_margin = Decimal(t["margin_usdt"])
+
+                if first_inr is not None:
+                    first_inr = round_inr(Decimal(first_inr))
+                    if first_inr <= 0:
+                        return False, (
+                            "The first part has to be more than zero."
+                        ), None
+                    if first_inr >= parent_inr:
+                        return False, (
+                            f"{ref} is ₹{parent_inr:,.0f} in total. The first "
+                            "part has to be less than that, or there is no "
+                            "second part."
+                        ), None
+                    first = round_usdt(first_inr / Decimal(supply))
+                else:
+                    first = round_usdt(Decimal(first_usdt))
+                    if first <= 0:
+                        return False, (
+                            "The first part has to be more than zero."
+                        ), None
+                    if first >= total:
+                        return False, (
+                            f"{ref} holds {total:f} USDT in total. The first "
+                            "part has to be less than that, or there is no "
+                            "second part."
+                        ), None
+                    first_inr = usdt_to_inr(first, supply)
+
                 first_owed = inr_to_usdt(first_inr, sell)
                 first_margin = round_usdt(first - first_owed)
 
-                second_inr = usdt_to_inr(second, supply)
-                second_owed = inr_to_usdt(second_inr, sell)
-                second_margin = round_usdt(second - second_owed)
+                # Everything left over, so the pair conserves by construction
+                # rather than by the three roundings happening to agree.
+                second = round_usdt(total - first)
+                second_inr = parent_inr - first_inr
+                second_owed = parent_owed - first_owed
+                second_margin = parent_margin - first_margin
+
+                if second <= 0 or second_inr <= 0 or second_owed <= 0:
+                    return False, (
+                        "That leaves nothing for the second part. Choose a "
+                        "smaller first part."
+                    ), None
 
                 new_ref = await self.next_reference(conn, t["supplier_id"])
 
