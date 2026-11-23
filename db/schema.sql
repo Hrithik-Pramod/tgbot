@@ -539,6 +539,33 @@ CREATE INDEX audit_log_entity_idx ON audit_log (entity_type, entity_id, created_
 CREATE INDEX audit_log_time_idx   ON audit_log (created_at DESC);
 
 
+-- ------------------------------------------------- commission settlements
+-- Which commission has been paid, so a settled day stops showing in the
+-- next total. A row per TRADE rather than a date range: a deal instructed
+-- at 23:58 and settled at 00:02 belongs to neither day under any rule
+-- simple enough to state, and commission reverses on cancellation, so a
+-- settled day can change afterwards. Naming the trades removes both
+-- questions. See migrate-019.
+
+CREATE TABLE commission_settlements (
+    id              BIGSERIAL PRIMARY KEY,
+    trade_id        BIGINT      NOT NULL REFERENCES trades(id),
+    introducer_id   BIGINT      NOT NULL REFERENCES parties(id),
+    -- Copied from the trade on purpose: this records a payment MADE, and
+    -- must still read as what was handed over even if the trade is later
+    -- repriced and introducer_usdt changes.
+    usdt            NUMERIC(20, 6) NOT NULL CHECK (usdt > 0),
+    settled_by      BIGINT      REFERENCES parties(id),
+    settled_at      TIMESTAMPTZ NOT NULL DEFAULT now(),
+
+    -- Confirming twice must not record the same commission as paid twice.
+    CONSTRAINT commission_settlements_trade_once UNIQUE (trade_id)
+);
+
+CREATE INDEX commission_settlements_introducer_idx
+    ON commission_settlements (introducer_id, settled_at DESC);
+
+
 -- ---------------------------------------------------------------- monitor cursor
 -- Lets the wallet monitor resume from where it stopped rather than rescanning
 -- from genesis or, worse, silently skipping the gap after a restart.

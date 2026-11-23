@@ -60,6 +60,12 @@ class WalletLink(StatesGroup):
     payout = State()
 
 
+class AddIntroducer(StatesGroup):
+    label = State()
+    chat = State()
+    vendor = State()
+
+
 class AddVendor(StatesGroup):
     label = State()
     prefix = State()
@@ -955,6 +961,210 @@ async def walletremove_cancel(call: CallbackQuery) -> None:
 # The chat id used to be the hard part — there was no way to read it from
 # inside the product. Adding the supplier bot to the new group now posts it
 # to the Bridge channel (see bot/auth.py), so the two steps join up.
+
+@router.message(Command("comms"))
+async def cmd_comms(message: Message, repo) -> None:
+    """
+    What is owed to each introducer, and a button to settle it.
+
+        we have a report similar to the utr statement, 1. XXXX Comms,
+        2 XXXX Comms, and a total
+        — Bridge, 23 November 2026
+
+    Counted when the deal is SENT, which is his answer and not the obvious
+    one — so an unpaid deal is already in here. Cancelled deals drop out,
+    which means a day can change after he has looked at it. That is the
+    trade-off he chose, and the reason a settlement names the trades it
+    covers rather than a date.
+    """
+    rows = await repo.commission_due()
+    if not rows:
+        await message.answer("No commission outstanding.")
+        return
+
+    by_introducer: dict = {}
+    for r in rows:
+        by_introducer.setdefault(
+            (r["introducer_id"], r["introducer"]), []).append(r)
+
+    lines, buttons = [], []
+    grand = Decimal(0)
+    for (introducer_id, label), deals in by_introducer.items():
+        subtotal = sum(d["introducer_usdt"] for d in deals)
+        grand += subtotal
+        lines.append(f"{label}")
+        for n, d in enumerate(deals, 1):
+            when = d["instructed_at"].strftime("%d %b")
+            flag = "  (CANCELLED)" if d["status"] == "cancelled" else ""
+            lines.append(
+                f"  {n}. {when}  {d['reference']}  "
+                f"{fmt_usdt_plain(d['introducer_usdt'])} USDT{flag}"
+            )
+        lines += [f"  Subtotal  {fmt_usdt_plain(subtotal)} USDT", ""]
+        buttons.append([InlineKeyboardButton(
+            text=f"Settle {label} — {fmt_usdt_plain(subtotal)} USDT",
+            callback_data=f"comm:{introducer_id}",
+        )])
+
+    lines.append(f"Total owed   {fmt_usdt_plain(grand)} USDT")
+
+    # A cancelled deal still listed means commission was counted when it
+    # was sent and has since reversed. Said out loud rather than netted
+    # off, so a settled day that later changed can be pointed at.
+    if any(d["status"] == "cancelled" for deals in by_introducer.values()
+           for d in deals):
+        lines += [
+            "",
+            "Deals marked CANCELLED were counted when sent and have since "
+            "been cancelled. Settle only what you mean to pay.",
+        ]
+
+    await message.answer(
+        "\n".join(lines),
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons),
+    )
+
+
+@router.callback_query(F.data.startswith("comm:"))
+async def comms_settle(call: CallbackQuery, party, repo) -> None:
+    """
+    Not state-gated. The total can sit on screen while he goes and sends
+    the USDT, and a button that died in the meantime would leave him
+    reconciling by memory — which is what the settlement record exists to
+    prevent.
+
+    Idempotent by construction: commission_settlements has one row per
+    trade, so a second tap records nothing twice.
+    """
+    introducer_id = int(call.data.split(":", 1)[1])
+    ok, msg, _ = await repo.settle_commission(
+        introducer_id=introducer_id, actor_party_id=party["id"]
+    )
+    await call.message.answer(msg)
+    await call.answer()
+
+
+@router.message(Command("addintroducer"))
+async def cmd_addintroducer(message: Message, state: FSMContext, repo) -> None:
+    """
+    Register an introducer's group and attach it to the vendor they brought.
+
+        For the link I'd add /addintroducer on UI Control, same as
+        /addvendor — register their group, pick the vendor.
+        Ok, I think that is a good idea
+        — 23 November 2026
+
+    No wallet and no prefix: an introducer receives nothing through the bot
+    and opens no deals. They are a reader of one vendor's book.
+    """
+    suppliers = await repo.list_parties("supplier")
+    if not suppliers:
+        await message.answer(
+            "There are no vendors registered, so there is nobody for an "
+            "introducer to have introduced."
+        )
+        return
+
+    await state.set_state(AddIntroducer.label)
+    await message.answer(
+        "Registering an introducer.\n\n"
+        "What are they called? This is for your own screens — the vendor "
+        "and the client never see it."
+    )
+
+
+@router.message(AddIntroducer.label)
+async def addintroducer_label(message: Message, state: FSMContext) -> None:
+    label = (message.text or "").strip()
+    if len(label) < 2:
+        await message.answer("Give it a name of at least two characters.")
+        return
+    await state.update_data(label=label)
+    await state.set_state(AddIntroducer.chat)
+    await message.answer(
+        "What is the introducer group's chat id?\n\n"
+        "Create the group, add @pt_introducer_desk_bot to it, and it will "
+        "post the id here. It starts with a minus sign."
+    )
+
+
+@router.message(AddIntroducer.chat)
+async def addintroducer_chat(
+    message: Message, state: FSMContext, repo
+) -> None:
+    raw = (message.text or "").strip()
+    try:
+        chat_id = int(raw)
+    except ValueError:
+        await message.answer(
+            "That is not a chat id. It is a number, usually beginning with "
+            "-100. Add the introducer bot to the group and I will post it "
+            "here."
+        )
+        return
+
+    # Same rule as a vendor group: access is granted by membership of a
+    # group the Bridge controls, never by a private chat with one person.
+    if chat_id >= 0:
+        await message.answer(
+            "That is a personal chat, not a group. Access is granted by "
+            "group membership, so an introducer has to be a group you "
+            "administer."
+        )
+        return
+
+    await state.update_data(chat_id=chat_id)
+    suppliers = await repo.list_parties("supplier")
+    await state.set_state(AddIntroducer.vendor)
+    await message.answer(
+        "Which vendor did they introduce?",
+        reply_markup=_party_keyboard(suppliers, "ai_sup"),
+    )
+
+
+@router.callback_query(AddIntroducer.vendor, F.data.startswith("ai_sup:"))
+async def addintroducer_vendor(
+    call: CallbackQuery, state: FSMContext, party, repo
+) -> None:
+    supplier_id = int(call.data.split(":", 1)[1])
+    data = await state.get_data()
+
+    # Refused before the party is created, so a rejected attempt does not
+    # leave an orphan introducer sitting in the book.
+    existing = await repo.introducer_for_supplier(supplier_id)
+    if existing is not None:
+        await state.clear()
+        await call.message.edit_text(
+            f"That vendor already has an introducer ({existing['label']}). "
+            "One per vendor — remove or change that one first."
+        )
+        await call.answer()
+        return
+
+    try:
+        introducer_id = await repo.add_party(
+            role="introducer", label=data["label"], display_name=None,
+            telegram_chat_id=data["chat_id"], telegram_user_id=None,
+            actor_party_id=party["id"],
+        )
+    except Exception as exc:
+        await state.clear()
+        await call.message.edit_text(
+            f"Could not register that group: {exc}\n\nNothing was changed."
+        )
+        await call.answer()
+        return
+
+    ok, msg = await repo.set_introducer(
+        supplier_id=supplier_id, introducer_id=introducer_id,
+        actor_party_id=party["id"],
+    )
+    await state.clear()
+    await call.message.edit_text(
+        msg if ok else f"{msg}\n\nThe group was registered but not attached."
+    )
+    await call.answer()
+
 
 @router.message(Command("addvendor"))
 async def cmd_addvendor(message: Message, state: FSMContext, repo) -> None:

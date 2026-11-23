@@ -55,6 +55,8 @@ MENUS: dict[str, list[tuple[str, str]]] = {
         ("collect",      "choose which order a shared account fills next"),
         ("correct",      "reopen a completed trade or remove a payment"),
         ("addvendor",    "register a new vendor group"),
+        ("addintroducer","register an introducer and their vendor"),
+        ("comms",        "commission owed to introducers"),
         ("wallet",       "show wallets and which pairing they serve"),
         ("walletadd",    "register a new wallet address"),
         ("walletlink",   "set where a pairing pays the client"),

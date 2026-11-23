@@ -1167,6 +1167,113 @@ class Repo:
                 introducer_id, limit,
             )
 
+    async def commission_due(self) -> list[asyncpg.Record]:
+        """
+        What is owed to each introducer, and the deals behind it.
+
+            Does /comms show you one combined total, or broken down per
+            introducer? — Broken down, but for the 1 right now, we have a
+            report similar to the utr statement, 1. XXXX Comms, 2 XXXX
+            Comms, and a total.
+            — Bridge, 23 November 2026
+
+        WHEN IT COUNTS
+
+        At the moment the trade is sent, not when the client pays — his
+        answer, asked directly. So an unpaid deal is already in the total,
+        and a deal cancelled tomorrow comes back out of it.
+
+        That cuts both ways and he chose it knowingly, which is why the
+        caller shows cancelled reversals separately rather than quietly
+        netting them off: a settled day that later changed has to be
+        visible, or the figure he paid against and the figure the ledger
+        holds drift apart with nothing to point at.
+
+        Only trades not already settled. A day marked settled stops showing
+        — "Day as settled so after midnight clock resets" — which is what
+        commission_settlements records.
+        """
+        async with self.pool.acquire() as conn:
+            return await conn.fetch(
+                """
+                SELECT i.id AS introducer_id, i.label AS introducer,
+                       s.label AS vendor,
+                       t.id AS trade_id, t.reference, t.usdt_received,
+                       t.introducer_usdt, t.status,
+                       t.instructed_at, t.opened_at
+                  FROM trades t
+                  JOIN parties s ON s.id = t.supplier_id
+                  JOIN parties i ON i.id = s.introducer_id
+                 WHERE t.introducer_usdt > 0
+                   AND t.instructed_at IS NOT NULL
+                   AND NOT EXISTS (
+                         SELECT 1 FROM commission_settlements cs
+                          WHERE cs.trade_id = t.id)
+                 ORDER BY i.label, t.instructed_at
+                """
+            )
+
+    async def settle_commission(
+        self, *, introducer_id: int, actor_party_id: int,
+    ) -> tuple[bool, str, Decimal]:
+        """
+        Mark everything currently owed to one introducer as settled.
+
+            Day as settled so after midnight clock resets
+            — Bridge, 23 November 2026
+
+        A row per trade, not a date range. Dates are the obvious design and
+        the wrong one: a trade instructed at 23:58 and settled at 00:02
+        belongs to neither day under any rule simple enough to state, and
+        the day he actually pays rarely lines up with the day the deal was
+        sent. Naming the trades removes the question.
+
+        Cancelled trades are deliberately still settleable. If he has paid
+        on it, the payment happened, and pretending otherwise would make
+        the next total wrong in the other direction.
+        """
+        async with self.pool.acquire() as conn:
+            async with conn.transaction():
+                rows = await conn.fetch(
+                    """
+                    SELECT t.id, t.introducer_usdt
+                      FROM trades t
+                      JOIN parties s ON s.id = t.supplier_id
+                     WHERE s.introducer_id = $1
+                       AND t.introducer_usdt > 0
+                       AND t.instructed_at IS NOT NULL
+                       AND NOT EXISTS (
+                             SELECT 1 FROM commission_settlements cs
+                              WHERE cs.trade_id = t.id)
+                     FOR UPDATE OF t
+                    """,
+                    introducer_id,
+                )
+                if not rows:
+                    return False, "Nothing is outstanding for them.", Decimal(0)
+
+                total = sum(r["introducer_usdt"] for r in rows)
+                for r in rows:
+                    await conn.execute(
+                        """
+                        INSERT INTO commission_settlements
+                            (trade_id, introducer_id, usdt, settled_by)
+                        VALUES ($1, $2, $3, $4)
+                        """,
+                        r["id"], introducer_id, r["introducer_usdt"],
+                        actor_party_id,
+                    )
+                await self.audit(
+                    conn, actor_party_id=actor_party_id,
+                    action="commission.settled", entity_type="party",
+                    entity_id=introducer_id,
+                    detail={"trades": len(rows), "usdt": total},
+                )
+                return True, (
+                    f"{len(rows)} deal(s) marked settled, "
+                    f"{total} USDT."
+                ), total
+
     async def introducer_for_supplier(
         self, supplier_id: int,
     ) -> Optional[asyncpg.Record]:
