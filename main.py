@@ -17,6 +17,7 @@ from aiogram.fsm.storage.memory import MemoryStorage
 
 from bot import (bridge_bot, bridge_trade, client_bot, membership, sending,
                  supplier_bot)
+from bot import introducer_bot as introducer_bot_mod
 from bot.auth import ChatRoleMiddleware
 from bot.escape import CommandEscapeMiddleware
 from bot.labels import run_label_sync
@@ -116,13 +117,36 @@ async def main() -> None:
     # to. See bot/labels.py.
     bots_by_role = {"bridge": bridge, "supplier": supplier, "client": client}
 
+    # The fourth bot exists only if its token does.
+    #
+    # The introducer group is a later addition and its token is created by
+    # hand in BotFather. Requiring it would mean the whole desk refuses to
+    # start until somebody has done that — a feature nobody is using yet
+    # able to take settlement offline. Absent, this block does not run and
+    # the other three behave exactly as they always have.
+    introducer_bot = None
+    if config.introducer_bot_token:
+        introducer_bot = Bot(config.introducer_bot_token, default=default)
+        sending.install(introducer_bot)
+        notifier.introducer_bot = introducer_bot
+        dispatchers.append(
+            (build_dispatcher([membership.build_router(),
+                               introducer_bot_mod.router],
+                              repo, notifier, "introducer", config),
+             introducer_bot)
+        )
+        bots_by_role["introducer"] = introducer_bot
+        log.info("introducer bot is configured and will poll")
+    else:
+        log.info("no INTRODUCER_BOT_TOKEN set; the introducer bot is off")
+
     # Before polling starts, so the menu is right the moment anyone types a
     # slash. /issue was live for eight days and invisible the whole time
     # because this call did not exist (Bridge, 19 September 2026: "dont see -
     # /issue?").
     await publish_menus(bots_by_role)
 
-    log.info("starting three bots and the deposit monitor")
+    log.info("starting %d bots and the deposit monitor", len(dispatchers))
     try:
         await asyncio.gather(
             *[dp.start_polling(b, handle_signals=False) for dp, b in dispatchers],

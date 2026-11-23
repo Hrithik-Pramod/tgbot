@@ -1087,6 +1087,86 @@ class Repo:
                 )
                 return rate_id
 
+    # ------------------------------------------------- the introducer's view
+    #
+    # Three queries, all scoped by the introducer's OWN id through the vendor
+    # that names them. An introducer never passes an id of anything — the
+    # party comes from the chat the command arrived in, so there is nothing
+    # to tamper with and no way to read another vendor's book.
+    #
+    # None of them select the sell rate, the margin, or the client. Asked
+    # what the introducer should see, the Bridge said: "They can see utr
+    # progress as well. But the rest no" (23 November 2026).
+
+    async def introducer_live_trades(
+        self, introducer_id: int,
+    ) -> list[asyncpg.Record]:
+        """Deals collecting right now on the vendor they introduced."""
+        async with self.pool.acquire() as conn:
+            return await conn.fetch(
+                """
+                SELECT t.id, t.opened_at, t.usdt_received, t.inr_expected,
+                       t.introducer_usdt,
+                       COALESCE((SELECT sum(p.amount_inr) FROM payments p
+                                 WHERE p.trade_id = t.id), 0) AS paid_inr
+                  FROM trades t
+                  JOIN parties s ON s.id = t.supplier_id
+                 WHERE s.introducer_id = $1
+                   AND t.status IN ('open', 'awaiting_payment')
+                 ORDER BY t.opened_at
+                """,
+                introducer_id,
+            )
+
+    async def introducer_commission(
+        self, introducer_id: int, *, days: int = 30,
+    ) -> list[asyncpg.Record]:
+        """
+        What they have earned, newest first.
+
+        Cancelled deals are excluded: commission reverses when a trade is
+        cancelled (Bridge, 23 November 2026), and the cleanest way to say
+        that is not to count them at all.
+        """
+        async with self.pool.acquire() as conn:
+            return await conn.fetch(
+                """
+                SELECT t.id, t.opened_at, t.usdt_received, t.introducer_usdt
+                  FROM trades t
+                  JOIN parties s ON s.id = t.supplier_id
+                 WHERE s.introducer_id = $1
+                   AND t.status <> 'cancelled'
+                   AND t.introducer_usdt > 0
+                   AND t.opened_at > now() - ($2::text || ' days')::interval
+                 ORDER BY t.opened_at DESC
+                """,
+                introducer_id, str(days),
+            )
+
+    async def introducer_recent_payments(
+        self, introducer_id: int, *, limit: int = 30,
+    ) -> list[asyncpg.Record]:
+        """
+        The UTRs against their vendor's deals.
+
+        Deliberately carries no beneficiary account: the vendor's banking is
+        the vendor's, and the introducer's interest is in whether the money
+        is arriving, not where it lands.
+        """
+        async with self.pool.acquire() as conn:
+            return await conn.fetch(
+                """
+                SELECT p.utr, p.amount_inr, p.created_at
+                  FROM payments p
+                  JOIN trades t ON t.id = p.trade_id
+                  JOIN parties s ON s.id = t.supplier_id
+                 WHERE s.introducer_id = $1
+                 ORDER BY p.created_at DESC
+                 LIMIT $2
+                """,
+                introducer_id, limit,
+            )
+
     async def introducer_for_supplier(
         self, supplier_id: int,
     ) -> Optional[asyncpg.Record]:

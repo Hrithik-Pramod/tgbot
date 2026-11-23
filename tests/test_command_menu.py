@@ -30,13 +30,18 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from bot import bridge_bot, bridge_trade, client_bot, supplier_bot  # noqa: E402
+from bot import (bridge_bot, bridge_trade, client_bot,  # noqa: E402
+                 introducer_bot, supplier_bot)
 from bot.menu import MENUS, publish_menus  # noqa: E402
 
 MODULES = {
     "bridge": (bridge_bot, bridge_trade),
     "supplier": (supplier_bot,),
     "client": (client_bot,),
+    # 23 November 2026. The fourth role exists only when its token does, but
+    # its menu and its handlers must agree whether or not it is switched on —
+    # the day the token is added is the worst day to discover they do not.
+    "introducer": (introducer_bot,),
 }
 
 
@@ -181,8 +186,11 @@ class TestTheMenusStayApart:
             if s is not None and c is not None:
                 assert s is not c, f"/{name} is the same function on both bots"
 
-    def test_all_three_roles_have_a_menu(self):
-        assert set(MENUS) == {"bridge", "supplier", "client"}
+    def test_every_role_has_a_menu(self):
+        """
+        Was "all three". The introducer joined on 23 November 2026.
+        """
+        assert set(MENUS) == {"bridge", "supplier", "client", "introducer"}
 
 
 class TestTheEntriesAreUsable:

@@ -73,6 +73,11 @@ MENUS: dict[str, list[tuple[str, str]]] = {
         ("history",        "deals you finished in the last few days"),
         ("statement",      "90 days of UTRs and values as a CSV"),
     ],
+    "introducer": [
+        ("progress",  "deals collecting now on your vendor"),
+        ("earned",    "your commission, last 30 days"),
+        ("utrs",      "payments received on your vendor's deals"),
+    ],
     "client": [
         ("accounts", "the accounts you can pay for this trade"),
         ("add",      "log a payment with its UTR"),

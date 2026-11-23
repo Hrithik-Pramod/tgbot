@@ -30,6 +30,10 @@ class Notifier:
         self.bridge_bot = bridge_bot
         self.supplier_bot = supplier_bot
         self.client_bot = client_bot
+        # Set by main.py only when INTRODUCER_BOT_TOKEN is present. Every
+        # send to an introducer checks it first, so the desk runs normally
+        # when the fourth bot does not exist.
+        self.introducer_bot = None
         self.repo = repo
         self.config = config
 
