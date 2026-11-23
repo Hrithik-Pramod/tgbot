@@ -61,7 +61,8 @@ from typing import Any, Optional
 
 from aiogram import Bot
 from aiogram.client.session.middlewares.base import BaseRequestMiddleware
-from aiogram.exceptions import TelegramRetryAfter
+from aiogram.exceptions import (TelegramNetworkError, TelegramRetryAfter,
+                                TelegramServerError)
 
 log = logging.getLogger(__name__)
 
@@ -78,6 +79,36 @@ MAX_ATTEMPTS = 6
 # not fix, and holding the chat's queue for minutes would stall everything
 # behind it.
 MAX_WAIT = 90.0
+
+# TELEGRAM BEING BROKEN IS ALSO TEMPORARY.
+#
+#     notification are now not coming through when trades are added / one
+#     just got added / and i didnt get it on UI control / all function
+#     stopped
+#     — Bridge, 16 November 2026, 22:51
+#
+# Telegram's own API was returning 502 and resetting connections:
+#
+#     TelegramServerError: Bad Gateway
+#     ClientConnectorError: Cannot connect to host api.telegram.org:443
+#
+# Nothing was wrong here — the deposit landed at 22:50 and was written to
+# the ledger normally. What was lost was the one message saying so:
+#
+#     22:51:32 ERROR bot.notifier: failed to notify bridge channel
+#
+# The pacer already waited out "slow down" and delivered. It did not wait
+# out "Bad Gateway", which is every bit as temporary, so that notification
+# was thrown away after a single attempt while the outage ran for minutes.
+#
+# A retried send CAN duplicate: the request may have reached Telegram and
+# only the reply been lost. For a notice to the desk a duplicate is a
+# nuisance and a miss is a gap in what he can see, so the trade is worth
+# taking — and only for messages, never for getUpdates, which the
+# dispatcher retries on its own schedule. Two retriers on one call would
+# fight each other.
+SERVER_ERROR_ATTEMPTS = 4
+SERVER_ERROR_BACKOFF = 1.5
 
 
 def _chat_of(method: Any) -> Optional[Any]:
@@ -131,9 +162,25 @@ class PacedSender(BaseRequestMiddleware):
 
     async def _with_retry(self, make_request, bot: Bot, method, chat):
         last: Optional[TelegramRetryAfter] = None
+        outage = 0
         for attempt in range(1, self.max_attempts + 1):
             try:
                 return await make_request(bot, method)
+            except (TelegramServerError, TelegramNetworkError) as exc:
+                # Telegram is down or unreachable, not refusing us. Only for
+                # a message to a chat: getUpdates has the dispatcher's own
+                # retry and must not be wrapped in a second one.
+                outage += 1
+                if chat is None or outage >= SERVER_ERROR_ATTEMPTS:
+                    raise
+                wait = SERVER_ERROR_BACKOFF * (2 ** (outage - 1))
+                log.warning(
+                    "%s to chat %s failed with %s; retrying in %.1fs "
+                    "(%d/%d)",
+                    type(method).__name__, chat, type(exc).__name__, wait,
+                    outage, SERVER_ERROR_ATTEMPTS,
+                )
+                await asyncio.sleep(wait)
             except TelegramRetryAfter as exc:
                 last = exc
                 wait = float(exc.retry_after)

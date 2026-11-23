@@ -113,10 +113,105 @@ def margin_usdt(usdt_in, supply_rate, sell_rate) -> Decimal:
     Bridge margin in USDT, which is where it sits per answer A3.
 
     Received from supplier, minus what is owed onward to the client.
+
+    This is the WHOLE spread and stays that way. Where an introducer takes
+    part of it, split_three_ways is what divides it — see there.
     """
     inr = usdt_to_inr(usdt_in, supply_rate)
     owed = inr_to_usdt(inr, sell_rate)
     return round_usdt(to_decimal(usdt_in) - owed)
+
+
+class Division(NamedTuple):
+    """How one deposit divides. The three always sum to usdt_in."""
+    inr_expected: Decimal        # what the client sends, and the vendor gets
+    client_usdt: Decimal         # what goes out to the client
+    introducer_usdt: Decimal     # the introducer's commission
+    bridge_usdt: Decimal         # what is left, which is the desk's
+
+
+def split_three_ways(usdt_in, supply_rate, buy_rate, sell_rate) -> Division:
+    """
+    Divide a deposit between the client, the introducer and the desk.
+
+    THE THREE RATES (Bridge, 23 November 2026)
+
+        Supply is the rate the supplier is providing
+        Buy is the rate I enter including the introducers fee
+        Sell rate is what I sell to the client for
+
+        the difference between the supply and buy is a margin we do not
+        receive, this is available on a separate telegram channel for the
+        introducer
+
+    His own worked example, on 10,000 USDT at 106.20 / 107.20 / 108.20:
+
+        106.2*10000 = 1062000
+        1062000/107.2 = 9906.7164
+        1062000/108.2 = 9815.1571
+        Total spread is 10000-9815.1571 = 184.8429 USDT
+        USDT For Introducer is 10000-9906.7164 = 93.2836
+        Remaining commission for partners = 184.8429-93.2836 = 91.5593
+
+    So the commission is USDT, not INR — a slice of the spread, measured by
+    applying the buy rate where the sell rate would otherwise go. Nothing
+    the client or the vendor sees changes: inr_expected is still the supply
+    rate, and the client is still owed at the sell rate.
+
+    NO INTRODUCER IS buy == supply
+
+    Then 1062000/106.2 is 10000 exactly, the introducer's share is zero, and
+    the desk keeps the whole 184.84 — which is what margin_usdt returns
+    today. Every vendor without an introducer therefore runs down this same
+    path with buy set equal to supply, and there is no second code path to
+    forget to update. That is the reason buy_rate defaults to supply_rate
+    rather than to NULL.
+
+    THE DESK TAKES THE REMAINDER
+
+    Three figures rounded to 2dp from one deposit will not add up on their
+    own, and a commission report that does not reconcile to the deposit is
+    worse than no report. So the client's share and the introducer's share
+    are each computed properly, and the desk's is whatever is left.
+
+    He chose the same thing himself without being asked: "Remaining
+    commission for partners" is a subtraction, not a third calculation. It
+    is also the lesson from the split of 16 November, applied at the
+    design stage this time rather than after a rupee went missing.
+    """
+    usdt = to_decimal(usdt_in)
+
+    # Checked on the RATE, not on the rounded share.
+    #
+    # The first version raised when the introducer's share came out
+    # negative, which looked equivalent and is not. With buy == supply —
+    # every vendor that has no introducer at all — inr is rounded UP to
+    # whole rupees, so inr / supply can exceed the deposit by a fraction of
+    # a cent and the share lands at -0.01. That is rounding, not a rate
+    # error, and raising on it would have refused ordinary deposits: the
+    # real ones carry three decimals (66,843.569 on 16 November) and a
+    # search found it in seconds.
+    if to_decimal(buy_rate) < to_decimal(supply_rate):
+        # Paying the introducer out of the vendor's money rather than out of
+        # the spread is not the deal, and is almost certainly a typo at
+        # /specialrate.
+        raise MoneyError("the buy rate cannot be below the supply rate")
+
+    inr = usdt_to_inr(usdt, supply_rate)
+
+    client = inr_to_usdt(inr, sell_rate)
+    at_buy = inr_to_usdt(inr, buy_rate)
+
+    # Floored, for the rounding case above. A genuine negative is already
+    # impossible: buy is not below supply.
+    introducer = max(round_usdt(usdt - at_buy), Decimal("0.00"))
+
+    return Division(
+        inr_expected=inr,
+        client_usdt=client,
+        introducer_usdt=introducer,
+        bridge_usdt=round_usdt(usdt - client - introducer),
+    )
 
 
 # --------------------------------------------------------------------------

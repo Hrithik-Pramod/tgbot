@@ -164,11 +164,46 @@ CREATE TABLE rates (
     client_id       BIGINT      NOT NULL REFERENCES parties(id),
     supply_rate     NUMERIC(20, 6) NOT NULL CHECK (supply_rate > 0),
     sell_rate       NUMERIC(20, 6) NOT NULL CHECK (sell_rate  > 0),
+
+    -- The introducer's share of the spread, as a rate between the two.
+    -- buy = supply means no introducer, and that is the default: the
+    -- arithmetic then gives the introducer nothing and the desk the whole
+    -- spread, which is what a deal without an introducer has always done.
+    -- See core.money.split_three_ways and migrate-016.
+    buy_rate        NUMERIC(20, 6) NOT NULL,
+    CONSTRAINT rates_buy_between
+        CHECK (buy_rate >= supply_rate AND buy_rate <= sell_rate),
     set_by          BIGINT      NOT NULL REFERENCES parties(id),
     created_at      TIMESTAMPTZ NOT NULL DEFAULT now()
 );
 
 CREATE INDEX rates_current_idx ON rates (supplier_id, client_id, created_at DESC);
+
+-- "NO INTRODUCER MEANS buy = supply", WRITTEN WHERE IT CANNOT BE BYPASSED.
+--
+-- A DEFAULT cannot reference another column of the same row, so without
+-- this every INSERT into rates and trades would have to remember to name
+-- buy_rate. The seed scripts in deploy/ do not, reset-uat does not, and
+-- neither did eighty-two existing tests the day the column was added --
+-- which is the evidence that "remember to name it" is not a workable rule.
+--
+-- A BEFORE INSERT trigger runs before the NOT NULL check, so the column
+-- stays NOT NULL and no writer has to know about it. See migrate-016 and
+-- core.money.split_three_ways.
+CREATE OR REPLACE FUNCTION buy_rate_defaults_to_supply()
+RETURNS trigger AS $$
+BEGIN
+    IF NEW.buy_rate IS NULL THEN
+        NEW.buy_rate := NEW.supply_rate;
+    END IF;
+    RETURN NEW;
+END;
+$$ LANGUAGE plpgsql;
+
+CREATE TRIGGER rates_buy_rate_default
+    BEFORE INSERT ON rates
+    FOR EACH ROW EXECUTE FUNCTION buy_rate_defaults_to_supply();
+
 
 
 -- ---------------------------------------------------------------- trades
@@ -188,6 +223,15 @@ CREATE TABLE trades (
     -- calculation - a later rate change must not silently rewrite history.
     supply_rate     NUMERIC(20, 6) NOT NULL,
     sell_rate       NUMERIC(20, 6) NOT NULL,
+    -- And the buy rate, for the same reason and with more force: commission
+    -- is settled daily and signed off, so the day the fee moves from ₹1 to
+    -- ₹1.50 every figure already paid must still read as it was paid.
+    --
+    -- Deliberately WITHOUT the rates_buy_between constraint. A trade is a
+    -- historic record and has to stay readable even if a rate was once set
+    -- in a way that is no longer permitted. Bad rates are refused where
+    -- they are entered, not where they are remembered.
+    buy_rate        NUMERIC(20, 6) NOT NULL,
 
     -- The vendor's name AS IT WAS when the trade was done.
     --
@@ -304,6 +348,12 @@ CREATE INDEX trades_unannounced_idx ON trades (opened_at)
 
 CREATE INDEX trades_supplier_idx ON trades (supplier_id, opened_at DESC);
 CREATE INDEX trades_client_idx   ON trades (client_id, opened_at DESC);
+
+-- Same reasoning as on rates: a trade written by any path at all gets
+-- buy = supply unless somebody has deliberately set otherwise.
+CREATE TRIGGER trades_buy_rate_default
+    BEFORE INSERT ON trades
+    FOR EACH ROW EXECUTE FUNCTION buy_rate_defaults_to_supply();
 
 -- Per-supplier deal counter backing the SUPA1, SUPA2, ... sequence (E2).
 CREATE TABLE supplier_counters (

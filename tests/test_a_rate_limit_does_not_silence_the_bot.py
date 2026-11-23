@@ -43,6 +43,7 @@ never again takes the handler down with it.
 """
 
 import asyncio
+import contextlib
 import inspect
 import sys
 import time
@@ -53,7 +54,26 @@ import pytest
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
-from aiogram.exceptions import TelegramRetryAfter  # noqa: E402
+from aiogram.exceptions import (TelegramNetworkError,  # noqa: E402
+                                TelegramRetryAfter, TelegramServerError)
+
+
+@contextlib.contextmanager
+def _fast_sleep():
+    """
+    The outage backoff is seconds long on purpose. A test that really
+    waited it would take half a minute and nobody would run the suite.
+    """
+    real = asyncio.sleep
+
+    async def quick(_s):
+        await real(0)
+
+    asyncio.sleep = quick
+    try:
+        yield
+    finally:
+        asyncio.sleep = real
 
 from bot import client_bot, sending  # noqa: E402
 from bot.sending import PacedSender  # noqa: E402
@@ -208,6 +228,109 @@ class TestTheWaitAppliesToTheWholeChat:
         for _ in range(3):
             await p(_refuses(0), bot=None, method=_NoChat())
         assert time.monotonic() - started < 1
+
+
+class TestTelegramBeingDownIsAlsoWaitedOut:
+    """
+    16 November 2026, 22:51. Telegram's own API returned 502 and reset
+    connections for minutes:
+
+        TelegramServerError: Bad Gateway
+        ClientConnectorError: Cannot connect to host api.telegram.org:443
+
+    The deposit landed at 22:50 and went on the ledger normally. The message
+    saying so did not:
+
+        ERROR bot.notifier: failed to notify bridge channel
+
+        notification are now not coming through when trades are added / one
+        just got added / and i didnt get it on UI control
+        — Bridge
+
+    The pacer waited out "slow down" and delivered; it threw this away after
+    one attempt. Both are temporary and both deserve the same patience.
+    """
+
+    @staticmethod
+    def _breaks(times, exc, record=None):
+        state = {"calls": 0}
+
+        async def make_request(bot, method):
+            state["calls"] += 1
+            if state["calls"] <= times:
+                raise exc
+            return "sent"
+
+        make_request.state = state
+        return make_request
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("exc", [
+        TelegramServerError(method=None, message="Bad Gateway"),
+        TelegramNetworkError(method=None, message="Connection reset by peer"),
+    ])
+    async def test_a_message_survives_a_short_outage(self, exc):
+        p = PacedSender(interval=0)
+        send = self._breaks(2, exc)
+        with _fast_sleep():
+            assert await p(send, bot=None, method=_Method(-100)) == "sent"
+        assert send.state["calls"] == 3
+
+    @pytest.mark.asyncio
+    async def test_it_gives_up_on_a_long_one(self):
+        """
+        Bounded, so a dead Telegram cannot hold a chat's queue for ever.
+        """
+        p = PacedSender(interval=0)
+        send = self._breaks(99, TelegramServerError(method=None, message="x"))
+        with _fast_sleep():
+            with pytest.raises(TelegramServerError):
+                await p(send, bot=None, method=_Method(-100))
+        assert send.state["calls"] == sending.SERVER_ERROR_ATTEMPTS
+
+    @pytest.mark.asyncio
+    async def test_polling_is_left_to_the_dispatcher(self):
+        """
+        getUpdates has no chat and aiogram retries it on its own schedule —
+        visible in the 16 November log as "tryings = 11". A second retrier
+        wrapped round it would fight that backoff.
+        """
+        p = PacedSender(interval=0)
+        send = self._breaks(99, TelegramServerError(method=None, message="x"))
+        with _fast_sleep():
+            with pytest.raises(TelegramServerError):
+                await p(send, bot=None, method=_NoChat())
+        assert send.state["calls"] == 1
+
+    @pytest.mark.asyncio
+    async def test_a_bad_request_is_not_retried(self):
+        """
+        "query is too old" and friends are permanent. Retrying them wastes
+        the chat's turn and changes nothing.
+        """
+        from aiogram.exceptions import TelegramBadRequest
+        p = PacedSender(interval=0)
+        send = self._breaks(99, TelegramBadRequest(method=None, message="no"))
+        with pytest.raises(TelegramBadRequest):
+            await p(send, bot=None, method=_Method(-100))
+        assert send.state["calls"] == 1
+
+    @pytest.mark.asyncio
+    async def test_the_backoff_grows(self):
+        waited = []
+
+        async def fake_sleep(s): waited.append(s)
+
+        p = PacedSender(interval=0)
+        send = self._breaks(99, TelegramServerError(method=None, message="x"))
+        orig = asyncio.sleep
+        asyncio.sleep = fake_sleep
+        try:
+            with pytest.raises(TelegramServerError):
+                await p(send, bot=None, method=_Method(-100))
+        finally:
+            asyncio.sleep = orig
+        assert waited == sorted(waited) and len(set(waited)) == len(waited)
 
 
 class TestNothingCanBypassIt:
