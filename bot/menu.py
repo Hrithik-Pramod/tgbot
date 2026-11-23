@@ -46,7 +46,8 @@ MENUS: dict[str, list[tuple[str, str]]] = {
     "bridge": [
         ("issue",        "send the payment instruction to the client"),
         ("reprice",      "move an open trade onto the current rate"),
-        ("setrate",      "set the buy and sell rate for a pairing"),
+        ("setrate",      "set the supply and sell rate for a pairing"),
+        ("specialrate",  "three rates, for a vendor with an introducer"),
         ("viewrate",     "show every rate in force"),
         ("progress",     "every group's trading position on one screen"),
         ("summary",      "open trades for one supplier"),

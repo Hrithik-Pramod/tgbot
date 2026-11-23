@@ -32,6 +32,11 @@ class SetRate(StatesGroup):
     supplier = State()
     client = State()
     supply_rate = State()
+    # Only reached from /specialrate, for a vendor who has an introducer.
+    # The same flow serves both commands rather than a second copy of it:
+    # two rate flows would drift, and the one that drifted would be the one
+    # used less often — which is the one handling commission.
+    buy_rate = State()
     sell_rate = State()
     confirm = State()
 
@@ -87,12 +92,79 @@ async def cmd_setrate(message: Message, state: FSMContext, repo) -> None:
         await message.answer("No suppliers are registered yet.")
         return
     await state.set_state(SetRate.supplier)
+    await state.update_data(special=False)
     await message.answer("Which supplier?", reply_markup=_party_keyboard(suppliers, "sr_sup"))
+
+
+@router.message(Command("specialrate"))
+async def cmd_specialrate(message: Message, state: FSMContext, repo) -> None:
+    """
+    Three rates instead of two, for a vendor who has an introducer.
+
+        I have a command call /specialrate / For this one it asked for 3
+        things / Supply / Buy / Sell rate
+        — Bridge, 23 November 2026
+
+    Supply is what the vendor is paid at, buy is supply plus the
+    introducer's fee, sell is what the client buys at. The gap between
+    supply and buy is the commission, and it comes out of the desk's spread
+    rather than off the vendor or onto the client — see
+    core.money.split_three_ways.
+    """
+    suppliers = await repo.list_parties("supplier")
+    if not suppliers:
+        await message.answer("No suppliers are registered yet.")
+        return
+    await state.set_state(SetRate.supplier)
+    await state.update_data(special=True)
+    await message.answer(
+        "Which supplier? (this sets supply, buy and sell)",
+        reply_markup=_party_keyboard(suppliers, "sr_sup"),
+    )
 
 
 @router.callback_query(SetRate.supplier, F.data.startswith("sr_sup:"))
 async def setrate_supplier(call: CallbackQuery, state: FSMContext, repo) -> None:
-    await state.update_data(supplier_id=int(call.data.split(":", 1)[1]))
+    supplier_id = int(call.data.split(":", 1)[1])
+    await state.update_data(supplier_id=supplier_id)
+
+    # THE TWO COMMANDS REFUSE EACH OTHER'S VENDORS.
+    #
+    # Without this, setting a rate for a vendor who has an introducer with
+    # plain /setrate would write buy = supply and the commission would stop
+    # accruing — silently, because every figure the desk sees would still
+    # look right. It was his own worry:
+    #
+    #     Yes I think that is a good idea, but need to think how to set a
+    #     supplier/introducer on UI Control — Bridge, 23 November 2026
+    #
+    # And the other way round is just as wrong: /specialrate on a vendor
+    # with nobody to pay would quietly carve a slice of the spread for an
+    # introducer who does not exist.
+    data = await state.get_data()
+    introducer = await repo.introducer_for_supplier(supplier_id)
+
+    if introducer is not None and not data.get("special"):
+        await state.clear()
+        await call.message.edit_text(
+            f"That vendor has an introducer ({introducer['label']}), so its "
+            "rates include a buy rate. Use /specialrate instead — /setrate "
+            "would drop the buy rate and the commission would stop accruing "
+            "without anything looking wrong."
+        )
+        await call.answer()
+        return
+
+    if introducer is None and data.get("special"):
+        await state.clear()
+        await call.message.edit_text(
+            "That vendor has no introducer, so there is no buy rate to set. "
+            "Use /setrate, or /addintroducer first if one should be "
+            "attached."
+        )
+        await call.answer()
+        return
+
     clients = await repo.list_parties("client")
     if not clients:
         await call.message.edit_text("No clients are registered yet.")
@@ -116,8 +188,15 @@ async def setrate_client(call: CallbackQuery, state: FSMContext, repo) -> None:
     if current:
         age = float(current["age_hours"])
         stale = "  (STALE)" if age > 24 else ""
+        buy_line = ""
+        # Shown only when it is actually doing something. For every other
+        # pairing buy equals supply and printing it would be a third
+        # identical number to read past.
+        if current["buy_rate"] != current["supply_rate"]:
+            buy_line = f"Current buy rate:    {fmt_rate(current['buy_rate'])}\n"
         note = (
             f"Current supply rate: {fmt_rate(current['supply_rate'])}\n"
+            f"{buy_line}"
             f"Current sell rate:   {fmt_rate(current['sell_rate'])}\n"
             f"Set {age:.1f} hours ago{stale}\n\n"
         )
@@ -140,6 +219,43 @@ async def setrate_supply(message: Message, state: FSMContext) -> None:
         await message.answer("Rate must be greater than zero.")
         return
     await state.update_data(supply_rate=str(rate))
+
+    data = await state.get_data()
+    if data.get("special"):
+        await state.set_state(SetRate.buy_rate)
+        await message.answer(
+            "Enter the buy rate — supply plus the introducer's fee "
+            "(INR per 1 USDT):"
+        )
+        return
+
+    await state.set_state(SetRate.sell_rate)
+    await message.answer("Enter the sell rate (INR per 1 USDT):")
+
+
+@router.message(SetRate.buy_rate)
+async def setrate_buy(message: Message, state: FSMContext) -> None:
+    try:
+        rate = to_decimal(message.text or "")
+    except MoneyError:
+        await message.answer("I could not read that as a rate. Send just the number.")
+        return
+
+    data = await state.get_data()
+    supply = to_decimal(data["supply_rate"])
+
+    # Below supply would pay the introducer out of the vendor's money
+    # instead of out of the spread, which is not the arrangement. Refused
+    # here, where he can retype it, rather than at the database.
+    if rate < supply:
+        await message.answer(
+            f"The buy rate cannot be below the supply rate "
+            f"({fmt_rate(supply)}). The introducer's fee comes out of your "
+            "spread, not out of the vendor's money. Send it again."
+        )
+        return
+
+    await state.update_data(buy_rate=str(rate))
     await state.set_state(SetRate.sell_rate)
     await message.answer("Enter the sell rate (INR per 1 USDT):")
 
@@ -157,6 +273,17 @@ async def setrate_sell(message: Message, state: FSMContext) -> None:
 
     data = await state.get_data()
     supply = to_decimal(data["supply_rate"])
+    buy = to_decimal(data["buy_rate"]) if data.get("buy_rate") else None
+
+    # Above sell, the introducer would take more than the whole spread and
+    # the desk would owe more than it earned.
+    if buy is not None and rate < buy:
+        await message.answer(
+            f"The sell rate cannot be below the buy rate ({fmt_rate(buy)}). "
+            "The introducer would be taking more than the whole spread. "
+            "Send it again."
+        )
+        return
 
     await state.update_data(sell_rate=str(rate))
     await state.set_state(SetRate.confirm)
@@ -169,14 +296,35 @@ async def setrate_sell(message: Message, state: FSMContext) -> None:
             "\n\nWARNING: the sell rate is not above the supply rate. "
             "This trade would run at a loss. Check before confirming."
         )
+    elif buy is not None and rate == buy:
+        warning = (
+            "\n\nWARNING: the sell rate equals the buy rate, so the "
+            "introducer takes the entire spread and you keep nothing. "
+            "Check before confirming."
+        )
+
+    lines = [f"Supply rate: {fmt_rate(supply)}"]
+    if buy is not None:
+        lines.append(f"Buy rate:    {fmt_rate(buy)}")
+    lines.append(f"Sell rate:   {fmt_rate(rate)}")
+
+    if buy is not None:
+        # The figure he is actually deciding, shown as money rather than as
+        # a rate: the fee per 1,000 USDT is what he can sense-check against
+        # what he agreed with the introducer.
+        per_1000 = (buy - supply) * 1000
+        lines += [
+            "",
+            f"Introducer takes ₹{fmt_inr(per_1000)} per 1,000 USDT, "
+            "out of your spread.",
+        ]
 
     kb = InlineKeyboardMarkup(inline_keyboard=[[
         InlineKeyboardButton(text="Confirm", callback_data="sr_yes"),
         InlineKeyboardButton(text="Cancel", callback_data="sr_no"),
     ]])
     await message.answer(
-        f"Supply rate: {fmt_rate(supply)}\nSell rate: {fmt_rate(rate)}\n\n"
-        f"Is this correct?{warning}",
+        "\n".join(lines) + f"\n\nIs this correct?{warning}",
         reply_markup=kb,
     )
 
@@ -189,10 +337,19 @@ async def setrate_confirm(call: CallbackQuery, state: FSMContext, party, repo) -
         client_id=data["client_id"],
         supply_rate=to_decimal(data["supply_rate"]),
         sell_rate=to_decimal(data["sell_rate"]),
+        # None for an ordinary pairing, which set_rate stores as the supply
+        # rate — "no introducer" written as a figure rather than an absence.
+        buy_rate=(to_decimal(data["buy_rate"])
+                  if data.get("buy_rate") else None),
         set_by=party["id"],
     )
     await state.clear()
-    await call.message.edit_text("Rate is set in the system.")
+    await call.message.edit_text(
+        "Rate is set in the system."
+        + (" The introducer's share applies from the next deposit; trades "
+           "already open keep the rates they were struck at."
+           if data.get("buy_rate") else "")
+    )
     await call.answer()
 
 
