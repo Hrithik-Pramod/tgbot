@@ -77,7 +77,7 @@ MENUS: dict[str, list[tuple[str, str]]] = {
     ],
     "introducer": [
         ("progress",  "deals collecting now on your vendor"),
-        ("earned",    "your commission, last 30 days"),
+        ("earned",    "your commission today"),
         ("utrs",      "payments received on your vendor's deals"),
     ],
     "client": [

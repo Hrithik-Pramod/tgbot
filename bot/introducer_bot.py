@@ -76,7 +76,7 @@ async def cmd_progress(message: Message, party, repo) -> None:
     if not trades:
         await message.answer(
             "Nothing is collecting at the moment.\n\n"
-            "Use /earned for what you have been credited so far."
+            "Use /earned for today's commission."
         )
         return
 
@@ -90,18 +90,26 @@ async def cmd_progress(message: Message, party, repo) -> None:
 @router.message(Command("earned"))
 async def cmd_earned(message: Message, party, repo) -> None:
     """
-    The running total he asked for, and what is behind it.
+    Today's commission, and what is behind it.
 
         a running report of his commission (nice to have)
+
+        ANd - No commission in the last 30 days. - this should be today not
+        30 days
+        - Bridge, 23 November 2026
+
+    Today runs from midnight GMT, the same boundary the settlement uses. A
+    rolling window would show the introducer a figure that never matches
+    the one being settled against.
     """
-    rows = await repo.introducer_commission(party["id"], days=30)
+    rows = await repo.introducer_commission_today(party["id"])
     if not rows:
-        await message.answer("No commission in the last 30 days.")
+        await message.answer("No commission today.")
         return
 
-    lines = ["Your commission, last 30 days.", ""]
+    lines = ["Your commission today.", ""]
     for n, r in enumerate(rows, 1):
-        when = r["opened_at"].strftime("%d %b")
+        when = r["instructed_at"].strftime("%H:%M")
         lines.append(
             f"{n}.  {when}   {fmt_usdt_plain(r['usdt_received'])} USDT "
             f"→ {fmt_usdt_plain(r['introducer_usdt'])} USDT"

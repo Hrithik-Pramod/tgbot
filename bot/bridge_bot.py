@@ -93,9 +93,14 @@ def _party_keyboard(parties, prefix: str) -> InlineKeyboardMarkup:
 
 @router.message(Command("setrate"))
 async def cmd_setrate(message: Message, state: FSMContext, repo) -> None:
-    suppliers = await repo.list_parties("supplier")
+    # Only vendors this command can actually act on. One with an introducer
+    # needs three rates and belongs to /specialrate.
+    suppliers = await repo.list_suppliers_by_introducer(with_introducer=False)
     if not suppliers:
-        await message.answer("No suppliers are registered yet.")
+        await message.answer(
+            "Every registered vendor has an introducer, so their rates are "
+            "set with /specialrate."
+        )
         return
     await state.set_state(SetRate.supplier)
     await state.update_data(special=False)
@@ -117,9 +122,16 @@ async def cmd_specialrate(message: Message, state: FSMContext, repo) -> None:
     rather than off the vendor or onto the client — see
     core.money.split_three_ways.
     """
-    suppliers = await repo.list_parties("supplier")
+    # Only vendors who actually have an introducer.
+    #
+    #     1 note, when i choose special rate, all accounts show, not just
+    #     the one that has introducer on it — Bridge, 23 November 2026
+    suppliers = await repo.list_suppliers_by_introducer(with_introducer=True)
     if not suppliers:
-        await message.answer("No suppliers are registered yet.")
+        await message.answer(
+            "No vendor has an introducer yet. Attach one with "
+            "/addintroducer first, or use /setrate."
+        )
         return
     await state.set_state(SetRate.supplier)
     await state.update_data(special=True)
@@ -229,9 +241,10 @@ async def setrate_supply(message: Message, state: FSMContext) -> None:
     data = await state.get_data()
     if data.get("special"):
         await state.set_state(SetRate.buy_rate)
+        # "(INR per 1 USDT)" removed at his request, 23 November 2026. He
+        # sets rates every day and does not need the unit spelled out.
         await message.answer(
-            "Enter the buy rate — supply plus the introducer's fee "
-            "(INR per 1 USDT):"
+            "Enter the buy rate — supply plus the introducer's fee:"
         )
         return
 
@@ -314,16 +327,10 @@ async def setrate_sell(message: Message, state: FSMContext) -> None:
         lines.append(f"Buy rate:    {fmt_rate(buy)}")
     lines.append(f"Sell rate:   {fmt_rate(rate)}")
 
-    if buy is not None:
-        # The figure he is actually deciding, shown as money rather than as
-        # a rate: the fee per 1,000 USDT is what he can sense-check against
-        # what he agreed with the introducer.
-        per_1000 = (buy - supply) * 1000
-        lines += [
-            "",
-            f"Introducer takes ₹{fmt_inr(per_1000)} per 1,000 USDT, "
-            "out of your spread.",
-        ]
+    # The "Introducer takes ₹X per 1,000 USDT" line was here and he asked
+    # for it to go (23 November 2026). It was meant as a sense-check against
+    # what he had agreed; he reads the three rates directly and did not want
+    # a fourth figure to check them against.
 
     kb = InlineKeyboardMarkup(inline_keyboard=[[
         InlineKeyboardButton(text="Confirm", callback_data="sr_yes"),

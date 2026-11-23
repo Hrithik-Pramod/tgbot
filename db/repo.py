@@ -1118,29 +1118,48 @@ class Repo:
                 introducer_id,
             )
 
-    async def introducer_commission(
-        self, introducer_id: int, *, days: int = 30,
+    async def introducer_commission_today(
+        self, introducer_id: int,
     ) -> list[asyncpg.Record]:
         """
-        What they have earned, newest first.
+        What they have earned TODAY, newest first.
 
-        Cancelled deals are excluded: commission reverses when a trade is
-        cancelled (Bridge, 23 November 2026), and the cleanest way to say
-        that is not to count them at all.
+            ANd - No commission in the last 30 days. - this should be today
+            not 30 days
+            — Bridge, 23 November 2026
+
+        Today means since midnight GMT, which is the same boundary the
+        settlement runs on — he asked for GMT there deliberately:
+
+            Yes for this one, as I will not be trading I will be sleeping,
+            so end of day 100%
+
+        A rolling 30 days would have shown the introducer a figure that
+        never matches the one being settled against, which is how two
+        people end up reconciling different numbers.
+
+        Counted from instructed_at, not opened_at: commission is earned
+        when the deal is SENT, so a deal opened yesterday and sent this
+        morning is today's.
+
+        Cancelled deals are excluded — commission reverses on cancellation.
         """
         async with self.pool.acquire() as conn:
             return await conn.fetch(
                 """
-                SELECT t.id, t.opened_at, t.usdt_received, t.introducer_usdt
+                SELECT t.id, t.opened_at, t.instructed_at, t.usdt_received,
+                       t.introducer_usdt
                   FROM trades t
                   JOIN parties s ON s.id = t.supplier_id
                  WHERE s.introducer_id = $1
                    AND t.status <> 'cancelled'
                    AND t.introducer_usdt > 0
-                   AND t.opened_at > now() - ($2::text || ' days')::interval
-                 ORDER BY t.opened_at DESC
+                   AND t.instructed_at IS NOT NULL
+                   AND t.instructed_at >= date_trunc('day', now() AT TIME ZONE 'UTC')
+                                          AT TIME ZONE 'UTC'
+                 ORDER BY t.instructed_at DESC
                 """,
-                introducer_id, str(days),
+                introducer_id,
             )
 
     async def introducer_recent_payments(
@@ -1273,6 +1292,32 @@ class Repo:
                     f"{len(rows)} deal(s) marked settled, "
                     f"{total} USDT."
                 ), total
+
+    async def list_suppliers_by_introducer(
+        self, *, with_introducer: bool,
+    ) -> list[asyncpg.Record]:
+        """
+        Vendors that have an introducer, or vendors that do not.
+
+            1 note, when i choose special rate, all accounts show, not just
+            the one that has introducer on it
+            — Bridge, 23 November 2026
+
+        Both commands refused the wrong vendor already, but only AFTER he
+        had picked one — which is a list of ten where nine are mistakes
+        waiting to be made. Offering only what the command can act on is
+        better than explaining the refusal well.
+        """
+        async with self.pool.acquire() as conn:
+            return await conn.fetch(
+                f"""
+                SELECT id, label FROM parties
+                 WHERE role = 'supplier' AND is_active
+                   AND introducer_id IS {'NOT NULL' if with_introducer
+                                         else 'NULL'}
+                 ORDER BY label
+                """
+            )
 
     async def introducer_for_supplier(
         self, supplier_id: int,

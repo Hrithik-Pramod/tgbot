@@ -211,10 +211,18 @@ class TestTheSellStepKnowsAboutTheBuy:
         assert "Supply rate" in said and "Buy rate" in said and "Sell rate" in said
 
     @pytest.mark.asyncio
-    async def test_it_shows_the_fee_as_money(self):
+    async def test_it_does_not_add_a_fourth_figure(self):
         """
-        ₹1,000 per 1,000 USDT is what he can check against what he agreed
-        with the introducer. A rate of 107.20 is not.
+        REMOVED at his request, 23 November 2026, after the first live run:
+
+            Also remove this - Introducer takes ₹500 per 1,000 USDT, out of
+            your spread.
+
+        It was added so he could sense-check the fee against what he had
+        agreed with the introducer. He reads the three rates directly and
+        did not want a derived figure sitting under them — a number on a
+        confirmation screen is something else to verify, and he is the one
+        verifying it every day.
         """
         state = _State({"special": True, "supply_rate": "106.20",
                         "buy_rate": "107.20"})
@@ -222,8 +230,10 @@ class TestTheSellStepKnowsAboutTheBuy:
         msg.text = "108.20"
         await bridge_bot.setrate_sell(msg, state)
         said = msg.sent[0]["text"]
-        assert "1,000" in said and "per 1,000 USDT" in said
-        assert "out of your spread" in said
+        assert "per 1,000 USDT" not in said
+        assert "out of your spread" not in said
+        # The three rates themselves stay.
+        assert "106.2" in said and "107.2" in said and "108.2" in said
 
     @pytest.mark.asyncio
     async def test_sell_equal_to_buy_warns_that_he_keeps_nothing(self):
@@ -283,3 +293,98 @@ class TestItIsReachable:
     def test_it_is_not_offered_to_anybody_else(self):
         for role in ("supplier", "client"):
             assert not any(c == "specialrate" for c, _ in menu.MENUS[role])
+
+
+class TestEachCommandOffersOnlyWhatItCanActOn:
+    """
+        1 note, when i choose special rate, all accounts show, not just the
+        one that has introducer on it
+        — Bridge, 23 November 2026, after the first live run
+
+    Both commands already refused the wrong vendor — but only after he had
+    picked one. A list of ten where nine are mistakes waiting to happen is
+    not fixed by explaining the refusal well.
+    """
+
+    class _FilteringRepo:
+        def __init__(self, with_intro, without):
+            self.with_intro = with_intro
+            self.without = without
+            self.asked = []
+
+        async def list_suppliers_by_introducer(self, *, with_introducer):
+            self.asked.append(with_introducer)
+            return self.with_intro if with_introducer else self.without
+
+        async def list_parties(self, role):
+            raise AssertionError(
+                "the unfiltered list is what showed every vendor"
+            )
+
+    @pytest.mark.asyncio
+    async def test_specialrate_lists_only_vendors_with_an_introducer(self):
+        repo = self._FilteringRepo(
+            with_intro=[{"id": 5, "label": "HAS ONE"}],
+            without=[{"id": 6, "label": "HAS NONE"}])
+        msg = _Msg()
+        await bridge_bot.cmd_specialrate(msg, _State(), repo)
+        datas = [b.text for row in
+                 msg.sent[0]["reply_markup"].inline_keyboard for b in row]
+        assert datas == ["HAS ONE"]
+        assert repo.asked == [True]
+
+    @pytest.mark.asyncio
+    async def test_setrate_lists_only_vendors_without_one(self):
+        repo = self._FilteringRepo(
+            with_intro=[{"id": 5, "label": "HAS ONE"}],
+            without=[{"id": 6, "label": "HAS NONE"}])
+        msg = _Msg()
+        await bridge_bot.cmd_setrate(msg, _State(), repo)
+        datas = [b.text for row in
+                 msg.sent[0]["reply_markup"].inline_keyboard for b in row]
+        assert datas == ["HAS NONE"]
+        assert repo.asked == [False]
+
+    @pytest.mark.asyncio
+    async def test_specialrate_with_no_introducers_says_what_to_do(self):
+        repo = self._FilteringRepo(with_intro=[], without=[{"id": 6, "label": "X"}])
+        msg = _Msg()
+        await bridge_bot.cmd_specialrate(msg, _State(), repo)
+        said = msg.sent[0]["text"]
+        assert "/addintroducer" in said and "/setrate" in said
+
+    @pytest.mark.asyncio
+    async def test_setrate_with_every_vendor_introduced_says_so(self):
+        repo = self._FilteringRepo(with_intro=[{"id": 5, "label": "X"}], without=[])
+        msg = _Msg()
+        await bridge_bot.cmd_setrate(msg, _State(), repo)
+        assert "/specialrate" in msg.sent[0]["text"]
+
+    def test_the_refusal_after_picking_is_still_there(self):
+        """
+        Filtering the list is the convenience. The refusal is the guard,
+        and it stays — a stale screen scrolled back to can still carry a
+        vendor that has since gained an introducer.
+        """
+        src = inspect.getsource(bridge_bot.setrate_supplier)
+        assert "introducer_for_supplier" in src
+        assert "/specialrate" in src and "/addintroducer" in src
+
+
+class TestTheBuyPromptIsPlain:
+    @pytest.mark.asyncio
+    async def test_it_does_not_spell_out_the_unit(self):
+        """
+            on message - Enter the buy rate - supply plus the introducer's
+            fee (INR per 1 USDT): - remove
+            — Bridge, 23 November 2026
+
+        He sets rates daily and does not need the unit restated.
+        """
+        state = _State({"special": True})
+        msg = _Msg()
+        msg.text = "106.20"
+        await bridge_bot.setrate_supply(msg, state)
+        said = msg.sent[0]["text"]
+        assert "INR per 1 USDT" not in said
+        assert "buy rate" in said and "introducer's fee" in said
