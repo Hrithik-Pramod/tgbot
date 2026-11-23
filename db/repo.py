@@ -1046,17 +1046,34 @@ class Repo:
     async def set_rate(
         self, *, supplier_id: int, client_id: int,
         supply_rate: Decimal, sell_rate: Decimal, set_by: int,
+        buy_rate: Optional[Decimal] = None,
     ) -> int:
-        """Append-only, so historic trades stay reproducible."""
+        """
+        Append-only, so historic trades stay reproducible.
+
+        buy_rate is the introducer's share of the spread and defaults to the
+        supply rate, which means no introducer — see
+        core.money.split_three_ways. /setrate leaves it alone and
+        /specialrate supplies it, and a vendor WITH an introducer is refused
+        by /setrate entirely so the buy rate cannot be dropped by using the
+        wrong command.
+        """
         async with self.pool.acquire() as conn:
             async with conn.transaction():
                 rate_id = await conn.fetchval(
                     """
-                    INSERT INTO rates (supplier_id, client_id, supply_rate, sell_rate, set_by)
-                    VALUES ($1, $2, $3, $4, $5)
+                    INSERT INTO rates (supplier_id, client_id, supply_rate,
+                                       sell_rate, buy_rate, set_by)
+                    VALUES ($1, $2, $3, $4, $5, $6)
                     RETURNING id
                     """,
-                    supplier_id, client_id, supply_rate, sell_rate, set_by,
+                    supplier_id, client_id, supply_rate, sell_rate,
+                    # Defaulted here rather than as COALESCE($5, $3) in the
+                    # SQL: reusing $3 in two places left Postgres deducing
+                    # two types for it ("text versus numeric") and every
+                    # integration test failed on the insert.
+                    supply_rate if buy_rate is None else buy_rate,
+                    set_by,
                 )
                 await self.audit(
                     conn, actor_party_id=set_by, action="rate.set",
@@ -1064,9 +1081,101 @@ class Repo:
                     detail={
                         "supplier_id": supplier_id, "client_id": client_id,
                         "supply_rate": supply_rate, "sell_rate": sell_rate,
+                        "buy_rate": buy_rate if buy_rate is not None
+                        else supply_rate,
                     },
                 )
                 return rate_id
+
+    async def introducer_for_supplier(
+        self, supplier_id: int,
+    ) -> Optional[asyncpg.Record]:
+        """
+        The introducer who brought this vendor in, if there is one.
+
+        Read on every deposit and before every rate change, so it is one
+        indexed column read rather than a join through a side table. One
+        introducer per vendor (Bridge, 23 November 2026) is a fact of the
+        schema here, not a rule anybody has to remember.
+        """
+        async with self.pool.acquire() as conn:
+            return await conn.fetchrow(
+                """
+                SELECT i.id, i.label, i.telegram_chat_id, i.is_active
+                  FROM parties s
+                  JOIN parties i ON i.id = s.introducer_id
+                 WHERE s.id = $1
+                """,
+                supplier_id,
+            )
+
+    async def set_introducer(
+        self, *, supplier_id: int, introducer_id: int, actor_party_id: int,
+    ) -> tuple[bool, str]:
+        """
+        Attach an introducer to a vendor.
+
+        The database refuses a party that is not an introducer and a vendor
+        that introduces itself — see the trigger in migrate-017. Those are
+        caught rather than duplicated here, because a check written twice is
+        a check that disagrees with itself eventually.
+
+        Replacing an existing introducer is allowed and recorded. It does
+        NOT restate commission already earned: every trade carries its own
+        buy rate, so what was settled stays settled.
+        """
+        async with self.pool.acquire() as conn:
+            async with conn.transaction():
+                supplier = await conn.fetchrow(
+                    "SELECT id, label, role, introducer_id FROM parties "
+                    "WHERE id = $1", supplier_id,
+                )
+                if supplier is None:
+                    return False, "That vendor no longer exists."
+                if supplier["role"] != "supplier":
+                    return False, f"{supplier['label']} is not a vendor."
+
+                introducer = await conn.fetchrow(
+                    "SELECT id, label, role FROM parties WHERE id = $1",
+                    introducer_id,
+                )
+                if introducer is None:
+                    return False, "That introducer no longer exists."
+
+                was = supplier["introducer_id"]
+                try:
+                    await conn.execute(
+                        "UPDATE parties SET introducer_id = $2 WHERE id = $1",
+                        supplier_id, introducer_id,
+                    )
+                except asyncpg.RaiseError as exc:
+                    # The trigger's own words are better than anything this
+                    # layer would invent.
+                    return False, str(exc)
+
+                await self.audit(
+                    conn, actor_party_id=actor_party_id,
+                    action="party.introducer_set", entity_type="party",
+                    entity_id=supplier_id,
+                    detail={
+                        "vendor": supplier["label"],
+                        "introducer": introducer["label"],
+                        "introducer_id": introducer_id,
+                        "replaced_introducer_id": was,
+                    },
+                )
+
+                if was is not None and was != introducer_id:
+                    return True, (
+                        f"{introducer['label']} is now the introducer for "
+                        f"{supplier['label']}, replacing the previous one. "
+                        "Commission already settled is unchanged — every "
+                        "trade keeps the buy rate it was struck at."
+                    )
+                return True, (
+                    f"{introducer['label']} is now the introducer for "
+                    f"{supplier['label']}. Set the rates with /specialrate."
+                )
 
     async def current_rate(
         self, supplier_id: int, client_id: int
@@ -1074,7 +1183,7 @@ class Repo:
         async with self.pool.acquire() as conn:
             return await conn.fetchrow(
                 """
-                SELECT id, supply_rate, sell_rate, created_at,
+                SELECT id, supply_rate, sell_rate, buy_rate, created_at,
                        EXTRACT(EPOCH FROM (now() - created_at)) / 3600 AS age_hours
                 FROM rates
                 WHERE supplier_id = $1 AND client_id = $2

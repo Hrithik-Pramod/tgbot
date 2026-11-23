@@ -15,7 +15,12 @@ BEGIN;
 
 -- ---------------------------------------------------------------- enums
 
-CREATE TYPE party_role AS ENUM ('bridge', 'supplier', 'client');
+-- 'introducer' added 23 November 2026: the party who brought a vendor in
+-- and takes a share of the spread. Same shape as the other three — its own
+-- group, its own bot, its own view of the book — so it is a role, not a
+-- flag. See migrate-017.
+CREATE TYPE party_role AS ENUM ('bridge', 'supplier', 'client',
+                               'introducer');
 CREATE TYPE trade_status AS ENUM ('open', 'awaiting_payment', 'completed', 'cancelled');
 CREATE TYPE deposit_status AS ENUM ('detected', 'confirmed', 'unallocated', 'orphaned');
 
@@ -45,13 +50,55 @@ CREATE TABLE parties (
     is_active       BOOLEAN     NOT NULL DEFAULT TRUE,
     created_at      TIMESTAMPTZ NOT NULL DEFAULT now(),
 
+    -- Which introducer brought this vendor in, if any. One per vendor
+    -- (Bridge, 23 November 2026), which is why it is a column on the vendor
+    -- rather than a table: "one per vendor" becomes a fact of the schema
+    -- instead of a rule somebody enforces. Two vendors may still name the
+    -- same introducer — not asked for, and free to leave possible.
+    introducer_id   BIGINT      REFERENCES parties(id),
+
     CONSTRAINT parties_label_unique UNIQUE (label),
     -- One chat maps to exactly one party. Without this, a chat registered twice
     -- would make the party a command resolves to ambiguous.
-    CONSTRAINT parties_chat_unique UNIQUE (telegram_chat_id)
+    CONSTRAINT parties_chat_unique UNIQUE (telegram_chat_id),
+    -- Only a supplier may carry one. That the party NAMED is actually an
+    -- introducer is the other half, and a CHECK cannot see another row, so
+    -- it is the trigger below. See migrate-017.
+    CONSTRAINT parties_introducer_shape
+        CHECK (introducer_id IS NULL OR role = 'supplier')
 );
 
 CREATE INDEX parties_chat_idx ON parties (telegram_chat_id) WHERE is_active;
+
+CREATE INDEX parties_introducer_idx
+    ON parties (introducer_id) WHERE introducer_id IS NOT NULL;
+
+-- The half of parties_introducer_shape that a CHECK cannot express. Without
+-- it any party could be named as an introducer, the Bridge included, which
+-- would route commission quietly to the desk.
+CREATE OR REPLACE FUNCTION introducer_must_be_an_introducer()
+RETURNS trigger AS $$
+DECLARE
+    named_role party_role;
+BEGIN
+    IF NEW.introducer_id IS NULL THEN
+        RETURN NEW;
+    END IF;
+    IF NEW.introducer_id = NEW.id THEN
+        RAISE EXCEPTION 'a vendor cannot introduce itself';
+    END IF;
+    SELECT role INTO named_role FROM parties WHERE id = NEW.introducer_id;
+    IF named_role IS DISTINCT FROM 'introducer' THEN
+        RAISE EXCEPTION
+            'party % is %, not an introducer', NEW.introducer_id, named_role;
+    END IF;
+    RETURN NEW;
+END;
+$$ LANGUAGE plpgsql;
+
+CREATE TRIGGER parties_introducer_is_an_introducer
+    BEFORE INSERT OR UPDATE OF introducer_id ON parties
+    FOR EACH ROW EXECUTE FUNCTION introducer_must_be_an_introducer();
 
 
 -- ---------------------------------------------------------------- bank accounts

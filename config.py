@@ -89,12 +89,26 @@ class Config:
     # while testing on 9 September 2026: transfers of 0.00001 and 0.000101.
     min_deposit_amount: Decimal
 
+    # OPTIONAL, and that is the point. Last in the list because a dataclass
+    # field with a default may not precede one without.
+    #
+    # The introducer bot is a fourth Telegram identity and its token is
+    # created by hand in BotFather. Making it required would mean the whole
+    # settlement bot refuses to start until that has happened — a feature
+    # nobody is using yet able to take the desk offline.
+    #
+    # Absent, the fourth dispatcher is never built and every introducer
+    # command simply does not exist; the other three bots run exactly as
+    # before. See main.py.
+    introducer_bot_token: str | None = None
+
     @classmethod
     def from_env(cls) -> "Config":
         return cls(
             bridge_bot_token=_req("BRIDGE_BOT_TOKEN"),
             supplier_bot_token=_req("SUPPLIER_BOT_TOKEN"),
             client_bot_token=_req("CLIENT_BOT_TOKEN"),
+            introducer_bot_token=_opt("INTRODUCER_BOT_TOKEN", "") or None,
             bridge_user_id=int(_opt("BRIDGE_USER_ID", "0")),
             strict_bridge_user=_opt("STRICT_BRIDGE_USER", "false").lower()
             in ("1", "true", "yes"),
