@@ -301,6 +301,14 @@ CREATE TABLE trades (
     usdt_owed_client NUMERIC(20, 6) NOT NULL DEFAULT 0,
     margin_usdt     NUMERIC(20, 6) NOT NULL DEFAULT 0,
 
+    -- The introducer's share of the spread, in USDT. Zero when the vendor
+    -- has no introducer, which is a real zero and not an unknown — hence
+    -- NOT NULL DEFAULT 0, so no sum over this column ever needs a COALESCE
+    -- that somebody can forget. margin_usdt is now the DESK's share; the
+    -- two together are the whole spread. See migrate-018.
+    introducer_usdt NUMERIC(20, 6) NOT NULL DEFAULT 0
+        CHECK (introducer_usdt >= 0),
+
     -- One account per trade, nominated by the supplier when they send
     -- (client decision, 7 Sep 2026). Null until the supplier runs /send;
     -- the Bridge can still override it at confirmation.

@@ -1613,3 +1613,130 @@ class TestDepositConfirmation:
         assert await repo.flag_unconfirmed(stale[0]["id"])
         assert not await repo.flag_unconfirmed(stale[0]["id"])
         assert await repo.unconfirmed_deposits(15) == []
+
+
+# ------------------------------------------------- the introducer (23 Nov)
+
+class TestABuyRateRidesWithTheRate:
+    @pytest.mark.asyncio
+    async def test_it_defaults_to_the_supply_rate(self, world, repo):
+        """
+        No introducer is written as buy == supply, not as NULL — so the
+        same arithmetic serves every vendor and there is no branch to
+        forget. /setrate never mentions it.
+        """
+        rate_id = await repo.set_rate(
+            supplier_id=world["supplier"], client_id=world["client"],
+            supply_rate=D("100.00"), sell_rate=D("102.00"),
+            set_by=world["bridge"])
+        async with repo.pool.acquire() as conn:
+            got = await conn.fetchrow(
+                "SELECT supply_rate, buy_rate FROM rates WHERE id = $1", rate_id)
+        assert got["buy_rate"] == got["supply_rate"] == D("100.000000")
+
+    @pytest.mark.asyncio
+    async def test_it_is_stored_when_given(self, world, repo):
+        rate_id = await repo.set_rate(
+            supplier_id=world["supplier"], client_id=world["client"],
+            supply_rate=D("106.20"), sell_rate=D("108.20"),
+            buy_rate=D("107.20"), set_by=world["bridge"])
+        async with repo.pool.acquire() as conn:
+            got = await conn.fetchval(
+                "SELECT buy_rate FROM rates WHERE id = $1", rate_id)
+        assert got == D("107.200000")
+
+    @pytest.mark.asyncio
+    async def test_the_database_refuses_a_buy_outside_the_spread(
+            self, world, repo):
+        """
+        Below supply pays the introducer out of the vendor's money; above
+        sell pays more than the whole spread. Both are typos, and both are
+        cheaper to refuse here than to find in a commission report.
+        """
+        import asyncpg
+        for bad in (D("105.00"), D("109.00")):
+            with pytest.raises(asyncpg.CheckViolationError):
+                await repo.set_rate(
+                    supplier_id=world["supplier"], client_id=world["client"],
+                    supply_rate=D("106.20"), sell_rate=D("108.20"),
+                    buy_rate=bad, set_by=world["bridge"])
+
+    @pytest.mark.asyncio
+    async def test_every_trade_starts_with_no_commission(self, world, repo):
+        async with repo.pool.acquire() as conn:
+            default = await conn.fetchval(
+                "SELECT column_default FROM information_schema.columns "
+                "WHERE table_name = 'trades' AND column_name = 'introducer_usdt'")
+            nullable = await conn.fetchval(
+                "SELECT is_nullable FROM information_schema.columns "
+                "WHERE table_name = 'trades' AND column_name = 'introducer_usdt'")
+        assert default is not None and default.startswith("0")
+        assert nullable == "NO", (
+            "NULL would mean every sum over this column needs a COALESCE, "
+            "and the day one is forgotten the total reads as nothing"
+        )
+
+
+class TestOnlyAnIntroducerCanIntroduce:
+    @pytest.mark.asyncio
+    async def test_a_real_introducer_is_attached(self, world, repo):
+        introducer = await repo.add_party(
+            role="introducer", label="Introducer A", display_name=None,
+            telegram_chat_id=-1099, telegram_user_id=None,
+            actor_party_id=world["bridge"])
+        ok, msg = await repo.set_introducer(
+            supplier_id=world["supplier"], introducer_id=introducer,
+            actor_party_id=world["bridge"])
+        assert ok, msg
+        found = await repo.introducer_for_supplier(world["supplier"])
+        assert found["id"] == introducer
+        assert found["label"] == "Introducer A"
+
+    @pytest.mark.asyncio
+    async def test_a_client_cannot_be_named_as_one(self, world, repo):
+        """
+        The half a CHECK constraint cannot express, because it is about
+        another row. Without it any party could be named — the Bridge
+        included, which would route commission quietly to the desk.
+        """
+        ok, msg = await repo.set_introducer(
+            supplier_id=world["supplier"], introducer_id=world["client"],
+            actor_party_id=world["bridge"])
+        assert not ok
+        assert "not an introducer" in msg
+
+    @pytest.mark.asyncio
+    async def test_the_bridge_cannot_be_named_as_one(self, world, repo):
+        ok, msg = await repo.set_introducer(
+            supplier_id=world["supplier"], introducer_id=world["bridge"],
+            actor_party_id=world["bridge"])
+        assert not ok and "not an introducer" in msg
+
+    @pytest.mark.asyncio
+    async def test_a_vendor_cannot_introduce_itself(self, world, repo):
+        ok, msg = await repo.set_introducer(
+            supplier_id=world["supplier"], introducer_id=world["supplier"],
+            actor_party_id=world["bridge"])
+        assert not ok
+        assert "introduce itself" in msg or "not an introducer" in msg
+
+    @pytest.mark.asyncio
+    async def test_an_introducer_cannot_be_hung_on_a_client(
+            self, world, repo):
+        """
+        The half a CHECK CAN express: only a supplier carries one.
+        """
+        import asyncpg
+        introducer = await repo.add_party(
+            role="introducer", label="Introducer B", display_name=None,
+            telegram_chat_id=-1098, telegram_user_id=None,
+            actor_party_id=world["bridge"])
+        async with repo.pool.acquire() as conn:
+            with pytest.raises(asyncpg.CheckViolationError):
+                await conn.execute(
+                    "UPDATE parties SET introducer_id = $2 WHERE id = $1",
+                    world["client"], introducer)
+
+    @pytest.mark.asyncio
+    async def test_a_vendor_without_one_reports_nothing(self, world, repo):
+        assert await repo.introducer_for_supplier(world["supplier"]) is None

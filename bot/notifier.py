@@ -14,7 +14,8 @@ from decimal import Decimal
 from aiogram import Bot
 from aiogram.types import LinkPreviewOptions
 
-from core.money import fmt_inr, inr_to_usdt, margin_usdt, usdt_to_inr
+from core.money import (fmt_inr, inr_to_usdt, margin_usdt,
+                        split_three_ways, usdt_to_inr)
 from core.summary import (
     CLIENT_CLOSING_SUMMARY, Payment, render_completion_notice,
     render_deposit_notification, render_supplier_summary, render_trade_summary,
@@ -596,17 +597,24 @@ class Notifier:
                     trade_id = await conn.fetchval(
                         """
                         INSERT INTO trades (reference, supplier_id, client_id, wallet_id,
-                                            rate_id, supply_rate, sell_rate, status,
+                                            rate_id, supply_rate, sell_rate,
+                                            buy_rate, status,
                                             nominated_account_id,
                                             supplier_label_at_trade)
-                        VALUES ($1, $2, $3, $4, $5, $6, $7, 'open', $8,
+                        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, 'open', $9,
                                 -- Pinned here rather than passed in, so a
                                 -- caller cannot open a trade without it.
                                 (SELECT label FROM parties WHERE id = $2))
                         RETURNING id
                         """,
                         reference, supplier_id, client_id, wallet["id"],
-                        rate["id"], rate["supply_rate"], rate["sell_rate"], nominated,
+                        rate["id"], rate["supply_rate"], rate["sell_rate"],
+                        # Snapshotted with the other two, for the reason the
+                        # schema gives: a later rate change must not rewrite
+                        # history. It matters more here than for the other
+                        # two, because commission is settled daily and
+                        # signed off.
+                        rate["buy_rate"], nominated,
                     )
                     running_usdt = amount_usdt
                 else:
@@ -616,24 +624,35 @@ class Notifier:
 
                 # Recompute from the running total, never incrementally - a
                 # sum of rounded parts is not the rounding of the sum.
-                inr_expected = usdt_to_inr(running_usdt, trade["supply_rate"] if trade else rate["supply_rate"])
+                #
+                # All three rates come from the TRADE once it exists, and
+                # from the rate row only when opening it. A second deposit
+                # topping up an open trade must be priced at what that trade
+                # was struck at, including its buy rate.
+                supply = trade["supply_rate"] if trade else rate["supply_rate"]
                 sell = trade["sell_rate"] if trade else rate["sell_rate"]
-                usdt_owed = inr_to_usdt(inr_expected, sell)
-                margin = margin_usdt(
-                    running_usdt,
-                    trade["supply_rate"] if trade else rate["supply_rate"],
-                    sell,
-                )
+                buy = trade["buy_rate"] if trade else rate["buy_rate"]
+
+                # One division, three shares, guaranteed to sum to the
+                # deposit. With no introducer buy equals supply, the
+                # introducer's share is zero and margin is what it has
+                # always been. See core.money.split_three_ways.
+                division = split_three_ways(running_usdt, supply, buy, sell)
+                inr_expected = division.inr_expected
+                usdt_owed = division.client_usdt
+                margin = division.bridge_usdt
 
                 await conn.execute(
                     """
                     UPDATE trades
                     SET usdt_received = $2, inr_expected = $3,
                         usdt_owed_client = $4, margin_usdt = $5,
+                        introducer_usdt = $6,
                         status = 'awaiting_payment'
                     WHERE id = $1
                     """,
                     trade_id, running_usdt, inr_expected, usdt_owed, margin,
+                    division.introducer_usdt,
                 )
                 await conn.execute(
                     "UPDATE deposits SET trade_id = $2 WHERE id = $1",
