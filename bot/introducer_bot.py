@@ -71,20 +71,65 @@ def _vendor_line(t) -> str:
 @router.message(Command("progress"))
 async def cmd_progress(message: Message, party, repo) -> None:
     """
-    What is live right now on the vendor they introduced.
+    What is live right now, and what has already finished today.
+
+    IT USED TO SHOW ONLY THE LIVE ONES, AND THAT READ AS A MISSING TRADE
+
+    Twice inside 24 hours, on 25 and 26 November 2026:
+
+        please check this, it is missing a trade here — the introducer
+        It's now only showing 1 not 3 — Bridge
+
+    Both times nothing was missing. A deal that finishes collecting leaves
+    the live list, which is correct and is also indistinguishable, on a
+    phone, from a deal the bot never recorded. The first time it cost an
+    evening of checking; the fix for that one was the timezone, and this
+    screen then did the same thing again the next day.
+
+    So the finished ones stay on the screen until the commission day rolls
+    over, and the screen carries the day's total — the same figure /earned
+    reports, from the same query, so the two can never disagree.
     """
-    trades = await repo.introducer_live_trades(party["id"])
-    if not trades:
+    live = await repo.introducer_live_trades(party["id"])
+    today = await repo.introducer_commission_today(party["id"])
+
+    # Finished = today's commission rows that are not still collecting.
+    # Taken from the /earned query rather than a third one of its own: a
+    # second definition of "today" is a second number to reconcile, which
+    # is the whole problem this screen is fixing.
+    live_ids = {t["id"] for t in live}
+    done = [r for r in today if r["id"] not in live_ids]
+
+    if not live and not done:
         await message.answer(
-            "Nothing is collecting at the moment.\n\n"
+            "Nothing is collecting at the moment, and nothing has "
+            "completed today.\n\n"
             "Use /earned for today's commission."
         )
         return
 
-    lines = ["Live deals on your vendor.", ""]
-    lines += [_vendor_line(t) for t in trades]
-    total = sum(t["introducer_usdt"] for t in trades)
-    lines += ["", f"Commission on these: {fmt_usdt_plain(total)} USDT"]
+    lines = []
+    if live:
+        lines += ["Live deals on your vendor.", ""]
+        lines += [_vendor_line(t) for t in live]
+    else:
+        lines += ["Nothing is collecting at the moment.", ""]
+
+    if done:
+        lines += ["", "Completed today.", ""]
+        for r in done:
+            lines.append(
+                f"{fmt_when(r['opened_at'])}   "
+                f"{fmt_usdt_plain(r['usdt_received'])} USDT   collected   "
+                f"commission {fmt_usdt_plain(r['introducer_usdt'])} USDT"
+            )
+
+    total = sum(r["introducer_usdt"] for r in today)
+    lines += [
+        "",
+        f"Commission today: {fmt_usdt_plain(total)} USDT "
+        f"(counted to midnight GMT)",
+    ]
     await message.answer("\n".join(lines))
 
 
