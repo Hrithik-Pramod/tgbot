@@ -45,7 +45,7 @@ import inspect
 import io
 import re
 import sys
-from datetime import datetime
+from datetime import datetime, timezone
 from decimal import Decimal as D
 from pathlib import Path
 
@@ -93,11 +93,19 @@ STATEMENT = _sql(Repo.vendor_statement_rows)
 SELECT = STATEMENT[STATEMENT.index("SELECT"):STATEMENT.index("FROM trades")]
 
 
+# Aware, in UTC, exactly as asyncpg returns a timestamptz. They were naive
+# until 25 November, which meant this file could not tell a converted
+# timestamp from an unconverted one — and unconverted is what showed the
+# introducer "17:36" for a deal opened at 23:06.
+def _utc(*args):
+    return datetime(*args, tzinfo=timezone.utc)
+
+
 ROWS = [
     {"reference": "REF1", "status": "completed",
-     "opened_at": datetime(2026, 11, 1, 9, 30),
-     "completed_at": datetime(2026, 11, 1, 18, 4),
-     "paid_at": datetime(2026, 11, 1, 14, 22),
+     "opened_at": _utc(2026, 11, 1, 9, 30),
+     "completed_at": _utc(2026, 11, 1, 18, 4),
+     "paid_at": _utc(2026, 11, 1, 14, 22),
      "utr": "BKIDR10000000000001", "amount_inr": D("200000"),
      "beneficiary": "EKTA TRADERS"},
     {"reference": "REF2", "status": "open",
@@ -141,8 +149,11 @@ class TestTheEconomicsAreNotThere:
         assert "p.created_at AS paid_at" in STATEMENT
         rows = list(csv.reader(io.StringIO(
             render_vendor_statement_csv(ROWS).decode("utf-8-sig"))))
+        # 14:22 UTC is 19:52 in Asia/Kolkata, which is the whole point:
+        # the vendor reconciles against their own bank statement, in their
+        # own time.
         assert rows[1][VENDOR_STATEMENT_COLUMNS.index("Paid")] == \
-            "2026-11-01 14:22"
+            "2026-11-01 19:52"
 
     def test_the_payment_date_is_not_the_trade_date(self):
         """

@@ -14,6 +14,7 @@ from decimal import Decimal
 from aiogram import Bot
 from aiogram.types import LinkPreviewOptions
 
+from core.clock import fmt_when
 from core.money import (fmt_inr, inr_to_usdt, margin_usdt,
                         split_three_ways, usdt_to_inr)
 from core.summary import (
@@ -83,7 +84,7 @@ class Notifier:
         from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup
 
         rows = [[InlineKeyboardButton(
-            text=(f"{t['reference']} · {t['opened_at']:%d %b %H:%M} · "
+            text=(f"{t['reference']} · {fmt_when(t['opened_at'])} · "
                   f"₹{fmt_inr(t['outstanding'])} left"),
             callback_data=f"hp:{held_id}:{t['id']}",
         )] for t in trades]
@@ -161,7 +162,7 @@ class Notifier:
                 )
                 body = (
                     f"Account ...{h['account_number'][-4:]}\n"
-                    f"Asked {h['asked_at']:%d %b %H:%M}\n\n"
+                    f"Asked {fmt_when(h['asked_at'])}\n\n"
                 )
                 rows = [[InlineKeyboardButton(
                     text=(f"{t['reference']} · {t['vendor']} · "
@@ -206,7 +207,7 @@ class Notifier:
                 body = (
                     f"Written as \"{typed}\", which matches no registered "
                     "account.\n"
-                    f"Asked {h['asked_at']:%d %b %H:%M}\n\n"
+                    f"Asked {fmt_when(h['asked_at'])}\n\n"
                 )
                 rows = [[InlineKeyboardButton(
                     text=(f"{t['reference']} · {t['vendor']} · "

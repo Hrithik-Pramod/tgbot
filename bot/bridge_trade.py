@@ -23,6 +23,7 @@ import csv
 import io
 import logging
 from decimal import Decimal
+from core.clock import fmt_when
 
 from aiogram import F, Router
 from aiogram.filters import Command
@@ -532,7 +533,7 @@ async def confirm_final(call: CallbackQuery, state: FSMContext, party, repo, not
     if prior:
         already = "\n".join(
             f"  {fmt_usdt_plain(p['amount_usdt'])} USDT   "
-            f"{p['detected_at']:%d %b %H:%M}   {p['tx_hash'][:12]}…"
+            f"{fmt_when(p['detected_at'])}   {p['tx_hash'][:12]}…"
             for p in prior
         )
         await call.message.answer(
@@ -1063,7 +1064,7 @@ async def cancel_pick(call: CallbackQuery, state: FSMContext, repo) -> None:
     if paid_out and trade["paid_inr"] == 0:
         already = "\n".join(
             f"  {fmt_usdt_plain(p['amount_usdt'])} USDT   "
-            f"{p['detected_at']:%d %b %H:%M}"
+            f"{fmt_when(p['detected_at'])}"
             for p in paid_out
         )
         note += (
@@ -1170,7 +1171,7 @@ async def _finish_cancel(target, state: FSMContext, party, repo, reason: str) ->
     ]
     lines += [
         f"  {fmt_usdt_plain(d['amount_usdt'])} USDT   "
-        f"{d['detected_at']:%d %b %H:%M}"
+        f"{fmt_when(d['detected_at'])}"
         for d in stranded
     ]
     lines += [
@@ -2005,8 +2006,8 @@ async def cmd_export(message: Message, repo) -> None:
     for r in rows:
         writer.writerow([
             r["reference"], r["status"],
-            r["opened_at"].strftime("%Y-%m-%d %H:%M") if r["opened_at"] else "",
-            r["completed_at"].strftime("%Y-%m-%d %H:%M") if r["completed_at"] else "",
+            fmt_when(r["opened_at"], "%Y-%m-%d %H:%M"),
+            fmt_when(r["completed_at"], "%Y-%m-%d %H:%M"),
             r["supplier"], r["client"],
             r["supply_rate"], r["sell_rate"], r["usdt_received"], r["inr_expected"],
             r["usdt_owed_client"], r["margin_usdt"],
@@ -2062,9 +2063,9 @@ def render_vendor_statement_csv(rows) -> bytes:
     for r in rows:
         writer.writerow([
             r["reference"], r["status"],
-            r["opened_at"].strftime("%Y-%m-%d %H:%M") if r["opened_at"] else "",
-            r["completed_at"].strftime("%Y-%m-%d %H:%M") if r["completed_at"] else "",
-            r["paid_at"].strftime("%Y-%m-%d %H:%M") if r["paid_at"] else "",
+            fmt_when(r["opened_at"], "%Y-%m-%d %H:%M"),
+            fmt_when(r["completed_at"], "%Y-%m-%d %H:%M"),
+            fmt_when(r["paid_at"], "%Y-%m-%d %H:%M"),
             r["utr"] or "", r["amount_inr"] or "", r["beneficiary"] or "",
         ])
     return buf.getvalue().encode("utf-8-sig")

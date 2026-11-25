@@ -21,6 +21,7 @@ from aiogram.types import (BufferedInputFile, CallbackQuery,
 # by the same function. See cmd_statement.
 from bot.bridge_trade import render_vendor_statement_csv
 from core.money import fmt_inr
+from core.clock import fmt_when
 from core.summary import render_mini_statement, render_own_accounts
 
 log = logging.getLogger(__name__)
@@ -249,7 +250,7 @@ async def cmd_history(message: Message, party, repo) -> None:
     lines = ["Deals you finished recently.", ""]
     rows = []
     for n, t in enumerate(trades, 1):
-        when = t["completed_at"].strftime("%d %b")
+        when = fmt_when(t["completed_at"], "%d %b")
         lines.append(f"{n}.  {when}  ₹{fmt_inr(t['paid_inr'])} collected")
         rows.append([InlineKeyboardButton(
             text=f"Statement — {when}, ₹{fmt_inr(t['paid_inr'])}",

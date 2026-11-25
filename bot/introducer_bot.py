@@ -44,6 +44,7 @@ from aiogram.filters import Command
 from aiogram.types import Message
 
 from core.money import fmt_inr, fmt_usdt_plain, pct_collected
+from core.clock import fmt_when
 
 log = logging.getLogger(__name__)
 router = Router()
@@ -56,7 +57,7 @@ def _vendor_line(t) -> str:
     Numbered rather than named: the deal reference belongs to the desk and
     the vendor, and nothing here needs it.
     """
-    when = t["opened_at"].strftime("%d %b %H:%M") if t["opened_at"] else ""
+    when = fmt_when(t["opened_at"])
     usdt = fmt_usdt_plain(t["usdt_received"])
     if not t["inr_expected"]:
         return f"{when}   {usdt} USDT   awaiting payment instructions"
@@ -107,9 +108,14 @@ async def cmd_earned(message: Message, party, repo) -> None:
         await message.answer("No commission today.")
         return
 
-    lines = ["Your commission today.", ""]
+    # The window is stated because the two do not line up: times are shown
+    # in local time, the day is counted to midnight GMT (his choice — "I
+    # will be sleeping, so end of day 100%"). A deal just after 05:30 local
+    # therefore starts a new commission day. Saying so costs one line and
+    # saves the argument about whose figure is right.
+    lines = ["Your commission today (counted to midnight GMT).", ""]
     for n, r in enumerate(rows, 1):
-        when = r["instructed_at"].strftime("%H:%M")
+        when = fmt_when(r["instructed_at"], "%H:%M")
         lines.append(
             f"{n}.  {when}   {fmt_usdt_plain(r['usdt_received'])} USDT "
             f"→ {fmt_usdt_plain(r['introducer_usdt'])} USDT"
@@ -133,6 +139,6 @@ async def cmd_utrs(message: Message, party, repo) -> None:
 
     lines = ["Payments received on your vendor's deals.", ""]
     for r in rows:
-        when = r["created_at"].strftime("%d %b %H:%M")
+        when = fmt_when(r["created_at"])
         lines.append(f"{when}   {r['utr']}   ₹{fmt_inr(r['amount_inr'])}")
     await message.answer("\n".join(lines))

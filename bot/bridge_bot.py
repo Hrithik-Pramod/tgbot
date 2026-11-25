@@ -17,6 +17,7 @@ from aiogram.fsm.state import State, StatesGroup
 from aiogram.types import CallbackQuery, InlineKeyboardButton, InlineKeyboardMarkup, Message
 
 from decimal import Decimal
+from core.clock import fmt_when
 
 from core.money import (
     MoneyError, fmt_inr, fmt_rate, fmt_usdt, fmt_usdt_plain, pct_collected,
@@ -1001,7 +1002,7 @@ async def cmd_comms(message: Message, repo) -> None:
         grand += subtotal
         lines.append(f"{label}")
         for n, d in enumerate(deals, 1):
-            when = d["instructed_at"].strftime("%d %b")
+            when = fmt_when(d["instructed_at"], "%d %b")
             flag = "  (CANCELLED)" if d["status"] == "cancelled" else ""
             lines.append(
                 f"  {n}. {when}  {d['reference']}  "

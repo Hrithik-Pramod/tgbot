@@ -817,11 +817,17 @@ class TestTheSameUsdtIsNeverBilledTwice:
         assert "return False" in guard[:1200]
 
 
-class _When:
-    """A detected_at that survives the %d %b %H:%M the cancel notice uses."""
-
-    def __format__(self, spec):
-        return "01 Oct 14:00"
+# A real timestamp, as the database hands one over: aware, in UTC.
+#
+# This was a stub whose only trick was __format__, from when the cancel
+# notice interpolated the datetime directly. Since 25 November every
+# timestamp goes through core.clock.fmt_when, which converts to the desk's
+# timezone and therefore needs a genuine datetime — and a stub that cannot
+# be converted would let a timezone bug through unnoticed, which is the
+# exact bug fmt_when exists to fix.
+def _When():
+    from datetime import datetime, timezone
+    return datetime(2026, 10, 1, 14, 0, tzinfo=timezone.utc)
 
 
 # ----------------------------------------------------------------------
