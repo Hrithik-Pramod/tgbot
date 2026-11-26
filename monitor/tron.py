@@ -96,6 +96,86 @@ ESCALATE_AFTER_FAILURES = 5
 # already have acted on the detection notice.
 UNCONFIRMED_ALERT_MINUTES = 15
 
+class UpstreamError(RuntimeError):
+    """
+    The API answered, and the answer was not data.
+
+    WHAT IT COST — 26 NOVEMBER 2026
+
+    37,843 USDT landed on a monitored wallet at 23:04 and no trade opened.
+    Sixteen minutes later the monitor's cursor was still a day behind, the
+    poll timestamp was current, and consecutive_errors was 0 — a wallet
+    being watched perfectly and seeing nothing.
+
+        a trade was sent but the bot was set to monitor wrong wallet
+
+    The wallet was right. TronScan was rate-limiting us, and it does that
+    with HTTP 200 and a body of:
+
+        {"Error": "request rate exceeded the allowed_rps(3), and the query
+                   server is suspended for 54 s..."}
+
+    raise_for_status() passes on a 200. payload.get("token_transfers", [])
+    on a body with no such key returns []. So a throttled response was
+    indistinguishable from a quiet wallet, the cursor advanced, the error
+    count stayed at zero, the TronGrid fallback was never tried and nobody
+    was told. The monitor reported success for not looking.
+
+    incoming_transfers already said this must not happen:
+
+        If both fail the exception propagates so the caller can back off -
+        returning an empty list here would look identical to "no deposits",
+        which would silently hide a broken monitor.
+
+    The intent was right and only the HTTP status was being checked. A
+    200 is not an answer; a parsed body with the expected key is.
+
+    WHY A THROTTLE IS A FAILURE AND NOT A RETRY
+
+    It raises, which puts it down the same path as a timeout: TronGrid is
+    tried, the failure counter rises, backoff applies, and after
+    ESCALATE_AFTER_FAILURES the Bridge is told. An empty list does none of
+    those things. The whole point of the fallback is that it engages when
+    the primary stops answering — and until now the one way the primary
+    fails in practice was the one way the fallback never engaged.
+    """
+
+
+def _rows(payload: Any, key: str, *, source: str) -> list:
+    """
+    The list of records from an API body, or an exception.
+
+    An absent key is an error, not an empty result. That distinction is the
+    whole fix: a body carrying the key with an empty list means "nothing
+    arrived", and a body without it means "this is not a transfer list".
+    Collapsing the two is what hid a 37,843 USDT deposit.
+    """
+    if not isinstance(payload, dict):
+        raise UpstreamError(
+            f"{source} returned {type(payload).__name__}, not an object"
+        )
+
+    # TronScan's throttle and TronGrid's errors both come back 200 with this.
+    for field in ("Error", "error"):
+        if payload.get(field):
+            raise UpstreamError(f"{source}: {payload[field]}")
+
+    if key not in payload:
+        raise UpstreamError(
+            f"{source} returned no {key!r} — keys were "
+            f"{sorted(payload)[:8]}"
+        )
+
+    rows = payload[key]
+    if rows is None:
+        return []
+    if not isinstance(rows, list):
+        raise UpstreamError(
+            f"{source} returned {key!r} as {type(rows).__name__}, not a list"
+        )
+    return rows
+
+
 # How long a supplier's claim to have sent can go unanswered by an actual
 # deposit before the Bridge is told. Chosen by the client on 11 September 2026:
 # long enough that a slow confirmation is not reported as a no-show, short
@@ -223,7 +303,7 @@ class TronClient:
         payload = resp.json()
 
         out = []
-        for item in payload.get("token_transfers", []):
+        for item in _rows(payload, "token_transfers", source="TronScan"):
             if (item.get("to_address") or "").strip() != address:
                 continue  # outgoing, or an unrelated leg
             if item.get("finalResult") not in (None, "SUCCESS"):
@@ -265,7 +345,7 @@ class TronClient:
         payload = resp.json()
 
         out = []
-        for item in payload.get("data", []):
+        for item in _rows(payload, "data", source="TronGrid"):
             if (item.get("to") or "").strip() != address:
                 continue
             out.append({
@@ -303,7 +383,7 @@ class TronClient:
         payload = resp.json()
 
         out = []
-        for item in payload.get("data", []):
+        for item in _rows(payload, "data", source="TronScan (TRX)"):
             # This endpoint carries TRC10 tokens as well as native TRX. Only
             # TRX is money here; a TRC10 token with a similar amount would
             # otherwise open a trade against something worthless.
@@ -351,7 +431,7 @@ class TronClient:
         payload = resp.json()
 
         out = []
-        for item in payload.get("data", []):
+        for item in _rows(payload, "data", source="TronGrid (TRX)"):
             rets = item.get("ret") or []
             if rets and rets[0].get("contractRet") not in (None, "SUCCESS"):
                 continue
