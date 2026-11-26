@@ -138,7 +138,8 @@ SELECT id, role, label, telegram_chat_id, is_active
  WHERE role = 'bridge';
 
 \echo
-\echo 'Send /help in the new control group. It should answer immediately.'
+\echo 'Send /progress in the new control group. It should answer immediately.'
+\echo 'There is no /help command — do not test with one.'
 \echo 'Parties are read per message, so no restart is needed.'
 \echo
 \echo 'NOTE: notifications now go to the new group. Anything the bot sent to'
