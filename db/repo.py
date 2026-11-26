@@ -448,6 +448,29 @@ class Repo:
         """
         Backs /wallet. Shows the internal-to-client linkage the brief calls
         "very important for routing and calculations".
+
+        RETIRED VENDORS ARE NOT LISTED
+
+            also remove the ones i mention, leave skates, uncle, raj 2.0
+            and cloud
+            cloud is not showing of list of wallets
+            — Bridge, 27 November 2026, 00:34
+
+        Two complaints, one cause. This filtered retired WALLETS and not
+        retired VENDORS, so eight vendors switched off the previous evening
+        still had their addresses on the screen — and Cloud, which had just
+        been switched back on, had none, because its only address was
+        retired hours earlier.
+
+        So the screen showed five vendors that cannot trade and omitted the
+        one that can. /walletlink and /walletchange read this same list,
+        which means a retired vendor's address could also be linked or
+        changed from a picker it had no business being in.
+
+        The rows are not deleted. A wallet carries the history of every
+        deposit attributed through it, and an address that received real
+        money is not something to remove because its vendor stopped
+        trading. Reactivating the vendor brings its addresses back.
         """
         async with self.pool.acquire() as conn:
             return await conn.fetch(
@@ -464,6 +487,13 @@ class Repo:
                 LEFT JOIN parties o ON o.id = w.owner_party_id
                 LEFT JOIN wallets p ON p.id = w.payout_wallet_id
                 WHERE w.retired_at IS NULL
+                  -- Every party the wallet names must still be active. A
+                  -- NULL join is not a failure: an internal wallet has no
+                  -- owner and an external one has no supplier, so each
+                  -- clause has to pass when its party is absent.
+                  AND (w.supplier_id IS NULL OR s.is_active)
+                  AND (w.client_id IS NULL OR c.is_active)
+                  AND (w.owner_party_id IS NULL OR o.is_active)
                 ORDER BY w.is_internal DESC, w.id
                 """
             )
