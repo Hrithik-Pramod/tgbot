@@ -29,8 +29,29 @@ router = Router()
 
 # Indian IFSC: 4 letters, then 0, then 6 alphanumerics.
 IFSC_RE = re.compile(r"^[A-Z]{4}0[A-Z0-9]{6}$")
-# Indian account numbers run roughly 9-18 digits across banks.
-ACCOUNT_RE = re.compile(r"^\d{9,18}$")
+# Account numbers. Digits across most Indian banks, but NOT only digits.
+#
+#     its That does not look like an account number. Indian account numbers
+#     are 9 to 18 digits. on UNcle — Bridge, 26 November 2026, 22:03
+#
+# The old rule was ^\d{9,18}$ and it refused two real things:
+#
+#   - virtual collection accounts, which payment aggregators issue with a
+#     letter prefix identifying the merchant. They are what a desk collecting
+#     at volume is given, so refusing them refuses the normal case.
+#   - the shorter numbers some banks still carry, below nine digits.
+#
+# A validator here is only meant to catch a fat finger — a phone number, half
+# an IFSC, a pasted sentence. It is not the authority on what a bank issues,
+# and it cannot be: the desk has the paperwork and the bot does not. When the
+# two disagree about a real account, the bot is wrong, and it had no way to
+# be overruled.
+#
+# So: 8 to 20 characters, letters and digits only, at least one digit. Wide
+# enough for anything a bank issues, narrow enough to still catch rubbish.
+# Nothing is silently accepted either way — the number is echoed back on
+# saving and /account_remove takes it off.
+ACCOUNT_RE = re.compile(r"^(?=.*\d)[A-Z0-9]{8,20}$")
 
 
 class AddAccount(StatesGroup):
@@ -65,11 +86,30 @@ async def account_name(message: Message, state: FSMContext) -> None:
 
 @router.message(AddAccount.number)
 async def account_number(message: Message, state: FSMContext) -> None:
-    number = re.sub(r"[\s-]+", "", message.text or "")
+    # Upper-cased, because a virtual account's letters are a prefix the bank
+    # prints in capitals and a phone keyboard does not. Stored as typed
+    # otherwise would make the same account two accounts, and
+    # others_sharing_account compares the stored text — so "yesb12345" and
+    # "YESB12345" would stop looking like the same beneficiary, which is the
+    # one comparison that must never quietly fail.
+    number = re.sub(r"[\s-]+", "", (message.text or "")).upper()
     if not ACCOUNT_RE.match(number):
         await message.answer(
-            "That does not look like an account number. "
-            "Indian account numbers are 9 to 18 digits."
+            "That does not look like an account number. It should be 8 to 20 "
+            "letters or digits, with at least one digit.\n\n"
+            "Spaces and dashes are fine, I strip them."
+        )
+        return
+
+    # The one thing widening the rule let through. An IFSC is eleven
+    # alphanumerics containing digits, so it now satisfies the pattern above —
+    # and the very next question asks for the IFSC, which is exactly when
+    # somebody pastes it one field early. Stored as an account number it would
+    # be a beneficiary that matches nothing, found only when a payment to it
+    # could not be placed.
+    if IFSC_RE.match(number):
+        await message.answer(
+            "That is an IFSC, not an account number. I ask for the IFSC next."
         )
         return
     await state.update_data(account_number=number)
