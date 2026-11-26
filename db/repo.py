@@ -2113,10 +2113,30 @@ class Repo:
 
     async def current_rates(self) -> list[asyncpg.Record]:
         """
-        The rate in force for every pairing, newest per pairing.
+        The rate in force for every pairing that can still trade.
 
         Backs /viewrate — the Bridge asked to be able to see what is set without
         starting to change it.
+
+        RETIRED VENDORS ARE NOT LISTED
+
+            and please remove all of the following — IndoLondon - November,
+            BIG BOSS, New Alpha, Superman, India, Tata Mahalaxmi, Cloud,
+            PCompany ... only leave Uncle and Raj 2.0
+            — Bridge, 26 November 2026, 23:20
+
+        Eight vendors were retired that evening and their rates stayed on
+        this screen, eight of them flagged "← CHECK THIS" because they were
+        months old. A screen of rates nobody can trade on reads as eight
+        things to fix, and the two that matter are lost in it.
+
+        The ROWS are not deleted. Rates are append-only and every historical
+        trade was priced off one — deleting them would quietly rewrite what
+        a completed deal was worth. Retiring a vendor already stops the rate
+        being used; this stops it being shown.
+
+        Reactivating a vendor brings its rate back with it, which is the
+        correct behaviour: the rate was never withdrawn, only the vendor.
         """
         async with self.pool.acquire() as conn:
             return await conn.fetch(
@@ -2132,6 +2152,10 @@ class Repo:
                 FROM rates r
                 JOIN parties s ON s.id = r.supplier_id
                 JOIN parties c ON c.id = r.client_id
+                 -- Both ends. A rate to a client that has been switched off
+                 -- cannot be traded either, and listing it would be the same
+                 -- fault from the other side.
+                WHERE s.is_active AND c.is_active
                 ORDER BY r.supplier_id, r.client_id, r.created_at DESC
                 """
             )
