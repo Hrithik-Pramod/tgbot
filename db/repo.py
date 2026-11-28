@@ -2985,6 +2985,127 @@ class Repo:
                     detail={"account_id": account_id, "hash": hash_url},
                 )
 
+    async def request_split_on_latest_send(self, supplier_id: int) -> bool:
+        """
+        Mark the claim this vendor has just made as wanting two orders.
+
+            so Hash, the choose account, then split?
+            but not amount, we just offer split 50/50
+            — Bridge, 27 November 2026
+
+        Set on the newest claim from this supplier, because it is written
+        immediately after record_pending_send in the same conversation. Taking
+        the newest rather than passing an id keeps the /send flow from having
+        to carry one through two more screens, where a stale button could
+        point at somebody else's claim after a restart.
+
+        Returns False if there is nothing to mark, which the caller says out
+        loud. A vendor told "noted" about a request that was never stored is
+        the silent non-action this project keeps paying for.
+        """
+        async with self.pool.acquire() as conn:
+            async with conn.transaction():
+                row = await conn.fetchrow(
+                    """
+                    SELECT id FROM pending_sends
+                     WHERE supplier_id = $1
+                     ORDER BY id DESC
+                     LIMIT 1
+                     FOR UPDATE
+                    """,
+                    supplier_id,
+                )
+                if row is None:
+                    return False
+
+                await conn.execute(
+                    "UPDATE pending_sends SET split_requested = TRUE "
+                    "WHERE id = $1",
+                    row["id"],
+                )
+                await self.audit(
+                    conn, actor_party_id=supplier_id,
+                    action="send.split_requested",
+                    entity_type="party", entity_id=supplier_id,
+                    detail={"pending_send_id": row["id"]},
+                )
+                return True
+
+    async def take_split_request(self, supplier_id: int) -> bool:
+        """
+        Claim this vendor's outstanding split request, if they have one.
+
+        Consuming and reading are one statement on purpose. Two polls can see
+        the same deposit, and a read followed by a write would let both decide
+        to split the same order — which split_trade would refuse on the
+        second attempt, but only after the first had already run. Doing it in
+        one UPDATE ... RETURNING means exactly one caller is told yes.
+
+        Oldest first, matching match_pending_send: two sends in quick
+        succession resolve in the order they were made.
+
+        Marked applied BEFORE the split is attempted, deliberately. If the
+        split then refuses — the order was instructed or paid in the
+        meantime — the request is spent rather than retried against the next
+        deposit, which would divide an order the vendor never asked about.
+        A request that could not be honoured is a thing to say once, not to
+        carry forward.
+        """
+        async with self.pool.acquire() as conn:
+            row = await conn.fetchrow(
+                """
+                UPDATE pending_sends
+                   SET split_applied_at = now()
+                 WHERE id = (
+                     SELECT id FROM pending_sends
+                      WHERE supplier_id = $1
+                        AND split_requested
+                        AND split_applied_at IS NULL
+                      ORDER BY created_at, id
+                      LIMIT 1
+                      FOR UPDATE SKIP LOCKED
+                 )
+                RETURNING id
+                """,
+                supplier_id,
+            )
+            return row is not None
+
+    async def deposit_opened_a_fresh_trade(
+        self, deposit_id: int,
+    ) -> Optional[asyncpg.Record]:
+        """
+        The trade this deposit opened, or None if it joined an existing one.
+
+        "Fresh" is asked of the data rather than remembered from the code
+        path: a trade carrying exactly one deposit is one this deposit
+        opened. on_supplier_deposit knows the same thing while it runs, but
+        passing it out would mean the answer depended on nobody changing the
+        control flow there later — and that function has an early return in
+        the middle of it.
+
+        It matters because a deposit that MERGED must never be divided:
+
+            fresh order, so one already there is on its own, this is new
+            — Bridge, 27 November 2026
+
+        Splitting a merged total would move figures the Bridge has already
+        been issuing against.
+        """
+        async with self.pool.acquire() as conn:
+            return await conn.fetchrow(
+                """
+                SELECT t.id AS trade_id, t.supplier_id, t.reference,
+                       t.usdt_received
+                  FROM deposits d
+                  JOIN trades t ON t.id = d.trade_id
+                 WHERE d.id = $1
+                   AND (SELECT count(*) FROM deposits x
+                         WHERE x.trade_id = t.id) = 1
+                """,
+                deposit_id,
+            )
+
     async def match_pending_send(self, *, supplier_id: int, trade_id: int) -> None:
         """
         Tie the oldest outstanding claim from this supplier to a real deposit.

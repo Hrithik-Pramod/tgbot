@@ -512,8 +512,36 @@ CREATE TABLE pending_sends (
     matched_trade_id BIGINT     REFERENCES trades(id),
     -- Set when the Bridge has been told this one never arrived, so they are
     -- told once rather than on every poll.
-    alerted_at      TIMESTAMPTZ
+    alerted_at      TIMESTAMPTZ,
+
+    -- The vendor asked, when they sent, for this deposit to arrive as two
+    -- equal orders rather than one (Bridge, 27 November 2026: "so Hash, the
+    -- choose account, then split? but not amount, we just offer split
+    -- 50/50").
+    --
+    -- It belongs on the claim because that is when it is said: /send is
+    -- typed while the USDT is still in transit, so there is usually no
+    -- order yet to divide.
+    --
+    -- Two columns rather than one flag cleared on use. split_requested
+    -- records what was asked and is never unset; split_applied_at records
+    -- when it was honoured. A single boolean would make "never asked" and
+    -- "asked, and done" indistinguishable the moment it was carried out.
+    split_requested  BOOLEAN    NOT NULL DEFAULT FALSE,
+    split_applied_at TIMESTAMPTZ,
+
+    -- Applied without being asked for would mean a deposit was divided on
+    -- the strength of a row nobody set. See migrate-020.
+    CONSTRAINT pending_sends_split_shape
+        CHECK (split_applied_at IS NULL OR split_requested)
 );
+
+-- The lookup the monitor makes on every fresh order: the oldest outstanding
+-- request for one vendor. Partial, because an applied request is never
+-- looked for again.
+CREATE INDEX pending_sends_split_outstanding
+    ON pending_sends (supplier_id, created_at)
+    WHERE split_requested AND split_applied_at IS NULL;
 
 CREATE INDEX pending_sends_open_idx ON pending_sends (created_at)
     WHERE matched_trade_id IS NULL;

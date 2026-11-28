@@ -568,4 +568,65 @@ async def send_account(call: CallbackQuery, state: FSMContext, party, repo, noti
         await call.message.edit_text(
             "Noted. This will be applied once your deposit is detected."
         )
+
+        # The offer to divide it, and only here.
+        #
+        #     the option i have to split a trade, can i add that to vendor
+        #     side / so Hash, the choose account, then split? / but not
+        #     amount, we just offer split 50/50
+        #     — Bridge, 27 November 2026
+        #
+        # Offered ONLY when nothing of theirs is already open. A deposit
+        # arriving while they have a live order is merged into it rather
+        # than opening a second, and dividing that total would move figures
+        # the Bridge has already been working from:
+        #
+        #     fresh order, so one already there is on its own, this is new
+        #     — Bridge
+        #
+        # So the button is absent in exactly the case where the answer would
+        # have to be no. A button that answers back is the thing /cancel
+        # spent three days doing.
+        await call.message.answer(
+            "Do you want this to arrive as two equal orders?",
+            reply_markup=InlineKeyboardMarkup(inline_keyboard=[[
+                InlineKeyboardButton(
+                    text="Split into 2", callback_data="ssplit:yes"),
+                InlineKeyboardButton(
+                    text="Keep as one", callback_data="ssplit:no"),
+            ]]),
+        )
+    await call.answer()
+
+
+# Not state-gated, and the state is cleared above in any case.
+#
+# The question can sit unanswered while the vendor goes back to their wallet,
+# and a restart in between must not turn the button into silence — the same
+# reasoning as the held-payment prompts, which were made stateless after
+# 22 September. The party comes from the chat through the middleware, so a
+# tap can only ever affect the tapper's own claim.
+@router.callback_query(F.data == "ssplit:yes")
+async def send_split_yes(call: CallbackQuery, party, repo) -> None:
+    ok = await repo.request_split_on_latest_send(party["id"])
+    if ok:
+        await call.message.edit_text(
+            "Noted. Your deposit will arrive as two equal orders.\n\n"
+            "If it lands on top of an order you already have open, it joins "
+            "that one instead and is not divided."
+        )
+    else:
+        # Said out loud rather than swallowed. A vendor told "noted" about a
+        # request that was never stored would find out when the money
+        # arrived whole, and by then the order is live.
+        await call.message.edit_text(
+            "I could not attach that to your send. Run /send again and "
+            "choose the account, then ask for the split."
+        )
+    await call.answer()
+
+
+@router.callback_query(F.data == "ssplit:no")
+async def send_split_no(call: CallbackQuery, party, repo) -> None:
+    await call.message.edit_text("Noted. It will arrive as one order.")
     await call.answer()

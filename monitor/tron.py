@@ -60,6 +60,7 @@ from typing import Any, Optional
 
 import httpx
 
+from core.money import round_usdt
 from core.summary import render_payout_notice, tx_link
 
 log = logging.getLogger(__name__)
@@ -980,3 +981,64 @@ class DepositMonitor:
             amount_usdt=transfer["amount"],
             tx_hash=transfer["tx_hash"],
         )
+
+        await self._apply_vendor_split(deposit_id)
+
+    async def _apply_vendor_split(self, deposit_id: int) -> None:
+        """
+        Carry out a split the vendor asked for when they sent.
+
+            so Hash, the choose account, then split?
+            but not amount, we just offer split 50/50
+            — Bridge, 27 November 2026
+
+        AFTER the notification, deliberately. The deposit announcement states
+        what arrived on chain, which is one amount and is true either way;
+        running the split first would have it quote half of what was sent.
+        The Bridge works from the order rather than that message —
+
+            no, as for me it will make no difference, i use the instruction
+            of the order
+
+        — so the orders being right matters and the announcement naming the
+        whole deposit is correct.
+
+        Wrapped whole, like every other sweep step. A split that fails must
+        not stop the monitor: the deposit is recorded and the order exists,
+        which is the part that cannot be recovered by hand.
+        """
+        try:
+            fresh = await self.repo.deposit_opened_a_fresh_trade(deposit_id)
+            if fresh is None:
+                # Merged into an order already open. Not ours to divide, and
+                # any outstanding request stays outstanding for the deposit
+                # that does open one.
+                return
+
+            if not await self.repo.take_split_request(fresh["supplier_id"]):
+                return
+
+            total = Decimal(fresh["usdt_received"])
+            first = round_usdt(total / 2)
+
+            ok, msg, detail = await self.repo.split_trade(
+                trade_id=fresh["trade_id"],
+                actor_party_id=fresh["supplier_id"],
+                first_usdt=first,
+            )
+            if ok:
+                log.info(
+                    "vendor split applied: %s %s USDT became %s %s + %s %s",
+                    fresh["reference"], total,
+                    detail["first"]["reference"], detail["first"]["usdt"],
+                    detail["second"]["reference"], detail["second"]["usdt"],
+                )
+            else:
+                # Spent rather than retried — see take_split_request. Said
+                # here so a refusal is findable, since by design nobody is
+                # notified about a split.
+                log.warning(
+                    "vendor split refused on %s: %s", fresh["reference"], msg,
+                )
+        except Exception:
+            log.exception("could not apply vendor split for deposit %s", deposit_id)
